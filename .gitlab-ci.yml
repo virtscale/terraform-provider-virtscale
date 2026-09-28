@@ -32,7 +32,7 @@ test:
     - unzip -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$(go env GOPATH)/bin"
     - chmod +x "$(go env GOPATH)/bin/tofu"
   script:
-    - test -z "$(gofmt -l .)"
+    - test -z "$(gofmt -l $(git ls-files '*.go'))"   # tracked files only: the restored GOMODCACHE lives under .cache/
     - go vet ./...
     - go build ./...
     - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v
