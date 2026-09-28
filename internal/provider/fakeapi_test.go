@@ -442,10 +442,11 @@ func (f *fakeAPI) listPublicIps(w http.ResponseWriter, _ *http.Request) {
 // advancePublicIp moves ip one step through pending -> allocated,
 // associating -> associated (or -> error, when the vm being associated has a
 // name starting "ipfail-", simulating an edge that refuses the bind), and
-// disassociating -> allocated (clearing vm_id). It is a no-op in any other
-// state, so repeated GETs after convergence are stable. Releasing is handled
-// by the caller (listPublicIps) since it removes the entry rather than
-// mutating it.
+// disassociating -> allocated, clearing vm_id (or -> error, when the vm being
+// disassociated has a name starting "ipdisfail-", simulating an edge that
+// refuses to release the binding). It is a no-op in any other state, so
+// repeated GETs after convergence are stable. Releasing is handled by the
+// caller (listPublicIps) since it removes the entry rather than mutating it.
 func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 	switch ip.State {
 	case "pending":
@@ -464,6 +465,14 @@ func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 		}
 		ip.State = "associated"
 	case "disassociating":
+		if ip.VmID != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok && strings.HasPrefix(vm.Name, "ipdisfail-") {
+				errMsg := "the edge could not release this binding"
+				ip.State = "error"
+				ip.Error = &errMsg
+				return
+			}
+		}
 		ip.State = "allocated"
 		ip.VmID = nil
 	}

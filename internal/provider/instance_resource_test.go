@@ -234,13 +234,30 @@ resource "virtscale_instance" "test" {
 	})
 }
 
-// TestAccInstanceResource_ImageDrift covers Finding 1: creating with the
-// fake's "alias-" image affordance -- whose echoed glance_id diverges from
-// the submitted image id -- must not crash the apply with "Provider produced
-// inconsistent result", and the divergence must surface as drift (a
-// non-empty plan, via image's RequiresReplace) on the very next plan rather
-// than being silently absorbed.
-func TestAccInstanceResource_ImageDrift(t *testing.T) {
+// TestAccInstanceResource_ImageAliasNoPerpetualDiff covers Finding N1 (plan
+// D4). The old TestAccInstanceResource_ImageDrift asserted the opposite of
+// what this test asserts: it required ExpectNonEmptyPlan immediately after
+// apply, treating the fake's "alias-" image affordance (whose echoed
+// glance_id diverges from the submitted image id) as drift that forces a
+// replace. That fix traded Finding 1's apply-time crash for a perpetual
+// replace loop -- accepting the replace never converged, because the new
+// create hit the same systematic divergence every time. Per D4, image is a
+// create-time input that neither Create nor Read ever overwrites from the
+// API -- there is no image-drift detection in v0 -- so the divergence no
+// longer surfaces as drift at all. This is a two-cycle test: step 1 applies
+// and must already converge with an empty plan (old assertion: non-empty;
+// new assertion: empty from the very first apply); step 2 re-applies the
+// identical config and asserts the plan is still empty, proving the replace
+// loop cannot recur. image_name -- new in this fix -- carries what the API
+// actually reports running, unaffected by any of this. Step 3 confirms
+// import still works for this same divergent image: per D4, import is the
+// one case where Read does seed image, from vm.Image.GlanceID rather than
+// the originally configured value, since there is no prior state to
+// preserve -- so image is expected to differ after import for this
+// specific, aliased resource and is ignored here (only here;
+// TestAccInstanceResource_Lifecycle keeps verifying image for the normal,
+// non-diverging case).
+func TestAccInstanceResource_ImageAliasNoPerpetualDiff(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", "test-org")
 
 	resource.Test(t, resource.TestCase{
@@ -249,18 +266,30 @@ func TestAccInstanceResource_ImageDrift(t *testing.T) {
 		CheckDestroy:             testAccCheckInstanceDestroy(fake),
 		Steps: []resource.TestStep{
 			{
-				// The divergence is visible starting with the very first
-				// post-apply refresh, so ExpectNonEmptyPlan belongs on this
-				// step itself: without it, the test framework's own
-				// consistency check (an implicit refresh + plan after every
-				// apply, expected empty by default) would fail here instead
-				// of exercising what this test is actually about.
-				Config: testAccInstanceConfigImage(fake, "image-drift", 1, "alias-img"),
+				Config: testAccInstanceConfigImage(fake, "image-alias", 1, "alias-img"),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_instance.test", "image", "alias-img"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "image_name", "alias-img"),
 					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
 				),
-				ExpectNonEmptyPlan: true,
+			},
+			{
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectEmptyPlan(),
+					},
+				},
+				Config: testAccInstanceConfigImage(fake, "image-alias", 1, "alias-img"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "image", "alias-img"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "image_name", "alias-img"),
+				),
+			},
+			{
+				ResourceName:            "virtscale_instance.test",
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"image"},
 			},
 		},
 	})

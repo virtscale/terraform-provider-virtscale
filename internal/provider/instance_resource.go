@@ -58,6 +58,7 @@ type instanceResourceModel struct {
 	Name           types.String `tfsdk:"name"`
 	Region         types.String `tfsdk:"region"`
 	Image          types.String `tfsdk:"image"`
+	ImageName      types.String `tfsdk:"image_name"`
 	VCPUs          types.Int64  `tfsdk:"vcpus"`
 	MemoryMB       types.Int64  `tfsdk:"memory_mb"`
 	DiskGB         types.Int64  `tfsdk:"disk_gb"`
@@ -104,11 +105,22 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 			"image": schema.StringAttribute{
-				Required:    true,
-				Description: "The image id to boot from, as listed by the images catalogue.",
+				Required: true,
+				Description: "The image id to boot from, as listed by the images catalogue. A " +
+					"create-time input only: neither Create nor Read ever overwrites it from the " +
+					"API, so it always reflects what was configured (import is the one exception, " +
+					"seeding it once from the observed value since there is no prior state to " +
+					"preserve). There is no image-drift detection in v0 -- see image_name for what " +
+					"the instance is actually running.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
+			},
+			"image_name": schema.StringAttribute{
+				Computed: true,
+				Description: "The human-readable name of the image the instance is currently " +
+					"running, as reported by the API. Informational only -- it does not " +
+					"participate in planning and never forces a replacement.",
 			},
 			"vcpus": schema.Int64Attribute{
 				Required:    true,
@@ -310,11 +322,14 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 		return
 	}
 
-	// image is the one attribute applyVmToModel never touches (see its
-	// comment): only Read may update it, and only from the prior state
-	// value, so a genuine divergence surfaces as drift (image forces
-	// replacement) on the next plan instead of crashing Create's apply.
-	if vm.Image.GlanceID != "" && vm.Image.GlanceID != state.Image.ValueString() {
+	// image is a create-time input (plan D4): Read never overwrites it once
+	// there is a prior value to preserve. The one exception is import, where
+	// state.Image starts empty -- this seeds it once from the observed
+	// glance_id so ImportStateVerify has something to compare against.
+	// There is no image-drift detection in v0 (see the image attribute's own
+	// description); what the instance is actually running is reported
+	// separately via image_name, which applyVmToModel always refreshes.
+	if state.Image.IsNull() || state.Image.ValueString() == "" {
 		state.Image = types.StringValue(vm.Image.GlanceID)
 	}
 
@@ -372,12 +387,15 @@ func (r *InstanceResource) ImportState(ctx context.Context, req resource.ImportS
 // image: Create must leave image at the planned value (the framework's own
 // consistency check aborts the apply with "Provider produced inconsistent
 // result" if a Required, non-Computed attribute changes after apply), and
-// only Read's caller updates image, explicitly, from a genuine glance_id
-// divergence -- see Read.
+// per plan D4 Read never overwrites it either -- only Read's caller seeds it
+// once, on import, when there is no prior value -- see Read. image_name is
+// always refreshed here: it is purely informational and carries no
+// consistency constraint of its own.
 func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.ID = types.StringValue(vm.ID)
 	model.Name = types.StringValue(vm.Name)
 	model.Region = types.StringValue(vm.RegionID)
+	model.ImageName = types.StringValue(vm.Image.Name)
 	model.VCPUs = types.Int64Value(int64(vm.VCPUs))
 	model.MemoryMB = types.Int64Value(int64(vm.MemoryMB))
 	model.DiskGB = types.Int64Value(int64(vm.DiskGB))

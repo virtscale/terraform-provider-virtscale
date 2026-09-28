@@ -157,6 +157,84 @@ resource "virtscale_public_ip" "test" {
 	})
 }
 
+// TestAccPublicIpResource_DisassociateFailsFast covers Finding N2:
+// disassociating an instance whose name starts "ipdisfail-" drives the
+// fake's public IP to state error, and the disassociate wait must fail
+// immediately with the API's own error field rather than polling out the
+// full timeout. This mirrors TestAccPublicIpResource_AssociateFailsFast, but
+// exercises Update's disassociate path (triggered here by clearing
+// instance_id) instead of Create's associate path -- disassociate's
+// fail-fast handling was already in place (Finding 2), it simply had no fake
+// affordance or test driving it into state error at all.
+//
+// Step 3 is an explicit destroy step, not left to the suite's own implicit
+// post-test cleanup: once step 2's disassociate call has genuinely put the
+// fake's public IP into state error, Delete's own guard
+// (`state.State == "associated"`) is false, so destroy releases directly
+// without re-attempting the doomed disassociate -- proving Finding N2's fix
+// doesn't leave the resource permanently stuck. Without a real destroy
+// exercising that path here, a regression that made Delete retry
+// unconditionally would go uncaught.
+func TestAccPublicIpResource_DisassociateFailsFast(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", "test-org")
+
+	withInstanceID := testAccProviderBlock(fake) + `
+resource "virtscale_instance" "test" {
+  name            = "ipdisfail-owner"
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+}
+
+resource "virtscale_public_ip" "test" {
+  region      = "gro"
+  instance_id = virtscale_instance.test.id
+}
+`
+
+	withoutInstanceID := testAccProviderBlock(fake) + `
+resource "virtscale_instance" "test" {
+  name            = "ipdisfail-owner"
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+}
+
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: withInstanceID,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "associated"),
+				),
+			},
+			{
+				Config:      withoutInstanceID,
+				ExpectError: regexp.MustCompile(`could not release`),
+			},
+			{
+				Config:  withoutInstanceID,
+				Destroy: true,
+			},
+		},
+	})
+}
+
 // TestAccPublicIpResource_DisassociateBeforeRelease covers Finding 3:
 // destroying a virtscale_public_ip that is still associated -- with no
 // intervening step that clears instance_id -- must disassociate before it
