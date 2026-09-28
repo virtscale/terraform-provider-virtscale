@@ -32,6 +32,11 @@ type fakeAPI struct {
 	publicIPs        map[string]*client.PublicIp
 	pubIPCreateCount int
 	pubIPNextOctet   int
+
+	// callSeq records, per public IP id, the order "disassociate"/"release"
+	// calls were observed -- used to assert Delete disassociates before it
+	// releases.
+	callSeq map[string][]string
 }
 
 // newFakeAPI starts a fake API server scoped to apiKey/org and registers its
@@ -46,6 +51,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		nextOctet:      10,
 		publicIPs:      make(map[string]*client.PublicIp),
 		pubIPNextOctet: 10,
+		callSeq:        make(map[string][]string),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
@@ -93,6 +99,25 @@ func (f *fakeAPI) PublicIPCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.publicIPs)
+}
+
+// CallSequence reports, in call order, which of "disassociate"/"release"
+// the fake observed for public ip id.
+func (f *fakeAPI) CallSequence(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.callSeq[id]))
+	copy(out, f.callSeq[id])
+	return out
+}
+
+// Vanish removes vm id from the store entirely, so the next GetVm returns a
+// genuine 404 -- unlike deleteVm, which retains the vm in state "deleted".
+// It simulates an out-of-band deletion.
+func (f *fakeAPI) Vanish(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.vms, id)
 }
 
 func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
@@ -215,13 +240,22 @@ func (f *fakeAPI) createVm(w http.ResponseWriter, r *http.Request) {
 	id := fmt.Sprintf("vm-%d", f.createCount)
 	now := time.Now().UTC()
 
+	// An "alias-" prefixed image id simulates a catalogue id (ImageOut.id)
+	// that diverges from the glance_id the API echoes back on the created vm
+	// (VmOut.image.glance_id) -- see Finding 1. Every other image id echoes
+	// back unchanged, matching prior behavior.
+	glanceID := req.Image
+	if strings.HasPrefix(req.Image, "alias-") {
+		glanceID = req.Image + "-glance-uuid"
+	}
+
 	vm := &client.Vm{
 		ID:                id,
 		OrgID:             f.org,
 		RegionID:          req.Region,
 		Name:              req.Name,
 		FQDN:              nil,
-		Image:             client.ImageRef{GlanceID: req.Image, Name: req.Image},
+		Image:             client.ImageRef{GlanceID: glanceID, Name: req.Image},
 		VCPUs:             req.VCPUs,
 		MemoryMB:          req.MemoryMB,
 		DiskGB:            req.DiskGB,
@@ -406,10 +440,12 @@ func (f *fakeAPI) listPublicIps(w http.ResponseWriter, _ *http.Request) {
 }
 
 // advancePublicIp moves ip one step through pending -> allocated,
-// associating -> associated, and disassociating -> allocated (clearing
-// vm_id). It is a no-op in any other state, so repeated GETs after
-// convergence are stable. Releasing is handled by the caller (listPublicIps)
-// since it removes the entry rather than mutating it.
+// associating -> associated (or -> error, when the vm being associated has a
+// name starting "ipfail-", simulating an edge that refuses the bind), and
+// disassociating -> allocated (clearing vm_id). It is a no-op in any other
+// state, so repeated GETs after convergence are stable. Releasing is handled
+// by the caller (listPublicIps) since it removes the entry rather than
+// mutating it.
 func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 	switch ip.State {
 	case "pending":
@@ -418,6 +454,14 @@ func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 		addr := fmt.Sprintf("203.0.113.%d", f.pubIPNextOctet)
 		ip.Address = &addr
 	case "associating":
+		if ip.VmID != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok && strings.HasPrefix(vm.Name, "ipfail-") {
+				errMsg := "the edge could not bind this address"
+				ip.State = "error"
+				ip.Error = &errMsg
+				return
+			}
+		}
 		ip.State = "associated"
 	case "disassociating":
 		ip.State = "allocated"
@@ -483,6 +527,7 @@ func (f *fakeAPI) disassociatePublicIp(w http.ResponseWriter, rawID string) {
 	}
 
 	ip.State = "disassociating"
+	f.callSeq[id] = append(f.callSeq[id], "disassociate")
 
 	op := client.Operation{
 		ID:           id + "-disassociate",
@@ -513,6 +558,7 @@ func (f *fakeAPI) releasePublicIp(w http.ResponseWriter, rawID string) {
 	}
 
 	ip.State = "releasing"
+	f.callSeq[id] = append(f.callSeq[id], "release")
 
 	op := client.Operation{
 		ID:           id + "-release",

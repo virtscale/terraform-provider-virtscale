@@ -120,6 +120,82 @@ resource "virtscale_public_ip" "second" {
 	})
 }
 
+// TestAccPublicIpResource_AssociateFailsFast covers Finding 2: associating
+// with an instance whose name starts "ipfail-" drives the fake's public IP
+// to state error, and the associate wait must fail immediately with the
+// API's own error field rather than polling out the full timeout.
+func TestAccPublicIpResource_AssociateFailsFast(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", "test-org")
+
+	config := testAccProviderBlock(fake) + `
+resource "virtscale_instance" "test" {
+  name            = "ipfail-owner"
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+}
+
+resource "virtscale_public_ip" "test" {
+  region      = "gro"
+  instance_id = virtscale_instance.test.id
+}
+`
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      config,
+				ExpectError: regexp.MustCompile(`could not bind`),
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_DisassociateBeforeRelease covers Finding 3:
+// destroying a virtscale_public_ip that is still associated -- with no
+// intervening step that clears instance_id -- must disassociate before it
+// releases. Asserted against the fake's own recorded call sequence, not just
+// against the final released state, so a regression in the guard (e.g.
+// deleting it) is caught even though the end state looks identical.
+func TestAccPublicIpResource_DisassociateBeforeRelease(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", "test-org")
+	var ipID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy: func(s *terraform.State) error {
+			seq := fake.CallSequence(ipID)
+			if len(seq) < 2 || seq[0] != "disassociate" || seq[len(seq)-1] != "release" {
+				return fmt.Errorf("expected disassociate before release for %s, got sequence %v", ipID, seq)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPublicIpInstanceAndIpConfig(fake, true),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "associated"),
+					func(s *terraform.State) error {
+						rs, ok := s.RootModule().Resources["virtscale_public_ip.test"]
+						if !ok {
+							return fmt.Errorf("virtscale_public_ip.test not found in state")
+						}
+						ipID = rs.Primary.ID
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
 func testAccImagesDataSourceConfig(fake *fakeAPI) string {
 	return testAccProviderBlock(fake) + `
 data "virtscale_images" "test" {

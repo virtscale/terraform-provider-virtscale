@@ -293,7 +293,9 @@ func (r *PublicIpResource) ImportState(ctx context.Context, req resource.ImportS
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-// associate sends AssociatePublicIp and waits for state "associated".
+// associate sends AssociatePublicIp and waits for state "associated",
+// failing fast -- same message style as Create's allocate-wait -- if the API
+// reports state "error" instead of polling out the full timeout.
 func (r *PublicIpResource) associate(ctx context.Context, id, vmID string) (*client.PublicIp, error) {
 	if _, _, err := r.client.AssociatePublicIp(ctx, id, vmID); err != nil {
 		return nil, errors.New(apiErrorDetail(err))
@@ -302,15 +304,28 @@ func (r *PublicIpResource) associate(ctx context.Context, id, vmID string) (*cli
 	waitCtx, cancel := context.WithTimeout(ctx, publicIpTimeout)
 	defer cancel()
 
-	return r.client.WaitPublicIp(waitCtx, id, pollInterval, func(p *client.PublicIp) (bool, error) {
+	final, waitErr := r.client.WaitPublicIp(waitCtx, id, pollInterval, func(p *client.PublicIp) (bool, error) {
 		if p == nil {
 			return false, nil
 		}
-		return p.State == "associated", nil
+		switch p.State {
+		case "associated":
+			return true, nil
+		case "error":
+			return true, errPublicIpFailed
+		default:
+			return false, nil
+		}
 	})
+	if errors.Is(waitErr, errPublicIpFailed) && final != nil {
+		return final, fmt.Errorf("error=%s", ptrOrEmpty(final.Error))
+	}
+	return final, waitErr
 }
 
-// disassociate sends DisassociatePublicIp and waits for state "allocated".
+// disassociate sends DisassociatePublicIp and waits for state "allocated",
+// failing fast -- same message style as Create's allocate-wait -- if the API
+// reports state "error" instead of polling out the full timeout.
 func (r *PublicIpResource) disassociate(ctx context.Context, id string) (*client.PublicIp, error) {
 	if _, _, err := r.client.DisassociatePublicIp(ctx, id); err != nil {
 		return nil, errors.New(apiErrorDetail(err))
@@ -319,12 +334,23 @@ func (r *PublicIpResource) disassociate(ctx context.Context, id string) (*client
 	waitCtx, cancel := context.WithTimeout(ctx, publicIpTimeout)
 	defer cancel()
 
-	return r.client.WaitPublicIp(waitCtx, id, pollInterval, func(p *client.PublicIp) (bool, error) {
+	final, waitErr := r.client.WaitPublicIp(waitCtx, id, pollInterval, func(p *client.PublicIp) (bool, error) {
 		if p == nil {
 			return false, nil
 		}
-		return p.State == "allocated", nil
+		switch p.State {
+		case "allocated":
+			return true, nil
+		case "error":
+			return true, errPublicIpFailed
+		default:
+			return false, nil
+		}
 	})
+	if errors.Is(waitErr, errPublicIpFailed) && final != nil {
+		return final, fmt.Errorf("error=%s", ptrOrEmpty(final.Error))
+	}
+	return final, waitErr
 }
 
 // applyPublicIpStatusToModel copies id/region/address/state from ip into

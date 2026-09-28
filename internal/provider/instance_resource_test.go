@@ -64,18 +64,25 @@ provider "virtscale" {
 }
 
 func testAccInstanceConfig(fake *fakeAPI, name string, vcpus int) string {
+	return testAccInstanceConfigImage(fake, name, vcpus, "image-1")
+}
+
+// testAccInstanceConfigImage is testAccInstanceConfig with an explicit image
+// id, so a test can exercise a specific image (e.g. Finding 1's "alias-"
+// affordance) without duplicating the rest of the config.
+func testAccInstanceConfigImage(fake *fakeAPI, name string, vcpus int, image string) string {
 	return testAccProviderBlock(fake) + fmt.Sprintf(`
 resource "virtscale_instance" "test" {
   name            = %q
   region          = "gro"
-  image           = "image-1"
+  image           = %q
   vcpus           = %d
   memory_mb       = 1024
   disk_gb         = 10
   storage_pool    = "pool-1"
   network_profile = "net-1"
 }
-`, name, vcpus)
+`, name, image, vcpus)
 }
 
 func testAccCheckInstanceDestroy(fake *fakeAPI) resource.TestCheckFunc {
@@ -222,6 +229,79 @@ resource "virtscale_instance" "test" {
 			{
 				Config:      badConfig,
 				ExpectError: regexp.MustCompile(`the api key is invalid`),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ImageDrift covers Finding 1: creating with the
+// fake's "alias-" image affordance -- whose echoed glance_id diverges from
+// the submitted image id -- must not crash the apply with "Provider produced
+// inconsistent result", and the divergence must surface as drift (a
+// non-empty plan, via image's RequiresReplace) on the very next plan rather
+// than being silently absorbed.
+func TestAccInstanceResource_ImageDrift(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", "test-org")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				// The divergence is visible starting with the very first
+				// post-apply refresh, so ExpectNonEmptyPlan belongs on this
+				// step itself: without it, the test framework's own
+				// consistency check (an implicit refresh + plan after every
+				// apply, expected empty by default) would fail here instead
+				// of exercising what this test is actually about.
+				Config: testAccInstanceConfigImage(fake, "image-drift", 1, "alias-img"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "image", "alias-img"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+				),
+				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_VanishedOutOfBand covers Finding 4: a vm removed
+// out-of-band in a way that surfaces as a genuine 404 (the fake's Vanish
+// affordance, distinct from the normal deleting -> deleted state machine)
+// must be dropped from state by Read, so the next plan proposes a create
+// rather than silently treating the resource as still present.
+func TestAccInstanceResource_VanishedOutOfBand(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", "test-org")
+	var instanceID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "vanish-me", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+					func(s *terraform.State) error {
+						rs, ok := s.RootModule().Resources["virtscale_instance.test"]
+						if !ok {
+							return fmt.Errorf("virtscale_instance.test not found in state")
+						}
+						instanceID = rs.Primary.ID
+						return nil
+					},
+				),
+			},
+			{
+				// PreConfig, not this step's own Check: the framework's
+				// implicit post-apply "plan must be empty" verification for
+				// step 1 runs against the live fake, so vanishing the vm
+				// inside step 1 would trip that check instead of this one.
+				PreConfig:          func() { fake.Vanish(instanceID) },
+				Config:             testAccInstanceConfig(fake, "vanish-me", 1),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
 			},
 		},
 	})

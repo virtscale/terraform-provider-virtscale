@@ -310,6 +310,14 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 		return
 	}
 
+	// image is the one attribute applyVmToModel never touches (see its
+	// comment): only Read may update it, and only from the prior state
+	// value, so a genuine divergence surfaces as drift (image forces
+	// replacement) on the next plan instead of crashing Create's apply.
+	if vm.Image.GlanceID != "" && vm.Image.GlanceID != state.Image.ValueString() {
+		state.Image = types.StringValue(vm.Image.GlanceID)
+	}
+
 	applyVmToModel(&state, vm)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
@@ -360,9 +368,12 @@ func (r *InstanceResource) ImportState(ctx context.Context, req resource.ImportS
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-// applyVmToModel copies observed API state into model. image is special:
-// the configured/prior value is kept unless the observed glance_id differs
-// from it and is non-empty, so an unchanged VM never shows drift.
+// applyVmToModel copies observed API state into model. It never touches
+// image: Create must leave image at the planned value (the framework's own
+// consistency check aborts the apply with "Provider produced inconsistent
+// result" if a Required, non-Computed attribute changes after apply), and
+// only Read's caller updates image, explicitly, from a genuine glance_id
+// divergence -- see Read.
 func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.ID = types.StringValue(vm.ID)
 	model.Name = types.StringValue(vm.Name)
@@ -379,10 +390,6 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 		model.FQDN = types.StringValue(*vm.FQDN)
 	} else {
 		model.FQDN = types.StringNull()
-	}
-
-	if vm.Image.GlanceID != "" && vm.Image.GlanceID != model.Image.ValueString() {
-		model.Image = types.StringValue(vm.Image.GlanceID)
 	}
 
 	model.PrivateIPv4 = types.StringValue(firstIPv4(vm.ObservedAddresses))
