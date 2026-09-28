@@ -1,0 +1,38 @@
+stages:
+  - test
+
+include:
+  - template: Security/Secret-Detection.gitlab-ci.yml
+
+variables:
+  GOFLAGS: "-mod=readonly"
+  GOMODCACHE: "$CI_PROJECT_DIR/.cache/go-mod"
+  TOFU_VERSION: "1.12.5"
+
+test:
+  stage: test
+  image: golang:1.25-bookworm
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .cache/go-mod
+  before_script:
+    # go install github.com/opentofu/opentofu/cmd/tofu@v1.12.5 does not
+    # build: OpenTofu's go.mod carries replace directives, which `go install`
+    # of a module version other than the main module refuses to honour. Fall
+    # back to the official release archive, verified against its own
+    # SHA256SUMS.
+    - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+    - mkdir -p "$(go env GOPATH)/bin"
+    - curl -sSLO "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip"
+    - curl -sSLO "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_SHA256SUMS"
+    - grep " tofu_${TOFU_VERSION}_linux_amd64.zip\$" "tofu_${TOFU_VERSION}_SHA256SUMS" | sha256sum -c -
+    - unzip -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$(go env GOPATH)/bin"
+    - chmod +x "$(go env GOPATH)/bin/tofu"
+  script:
+    - test -z "$(gofmt -l .)"
+    - go vet ./...
+    - go build ./...
+    - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v

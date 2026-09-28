@@ -1,93 +1,132 @@
 # terraform-provider-virtscale
 
-Terraform/OpenTofu provider for the VirtScale customer API (virtscale/virtscale). Mirrors to github.com/virtscale once H1 exists.
+Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virtscale.nl) (`virtscale/virtscale`).
 
-## Getting started
+## Status
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`)
+and is used via `dev_overrides` only -- it is not yet published to a Terraform registry. It will mirror to
+`github.com/virtscale` once that organization exists; registry publication (goreleaser, GPG signing) follows
+from there.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+## What it provides
 
-## Add your files
+- Provider `virtscale`: configured with an API key and an organization id.
+- Resource `virtscale_instance`: a VirtScale compute instance (VM).
+- Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
+  A customer organization's quota is one public IP.
+- Data source `virtscale_images`: the image catalogue for a region.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+See [examples/main.tf](examples/main.tf) for a complete, runnable configuration.
 
+## Build
+
+```bash
+go build -o ~/.terraform.d/plugins/terraform-provider-virtscale .
 ```
-cd existing_repo
-git remote add origin https://gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale.git
-git branch -M main
-git push -uf origin main
+
+or, to install into `$(go env GOBIN)` (or `$(go env GOPATH)/bin` when `GOBIN` is unset):
+
+```bash
+go install .
 ```
 
-## Integrate with your tools
+## Local use (dev_overrides)
 
-* [Set up project integrations](https://gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/-/settings/integrations)
+OpenTofu resolves `source = "virtscale/virtscale"` against `registry.opentofu.org`; a plain Terraform CLI
+resolves the same source string against `registry.terraform.io`. A `dev_overrides` block must list **both**
+hostnames, pointing at the same local build directory, or you'll see `Inconsistent dependency lock file`.
+With `dev_overrides` in effect, `tofu init` / `terraform init` is skipped entirely for that provider.
 
-## Collaborate with your team
+Create a CLI config file, e.g. `~/.tfrc.d/dev.tfrc`:
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+```hcl
+provider_installation {
+  dev_overrides {
+    "registry.opentofu.org/virtscale/virtscale"  = "/path/to/GOBIN"
+    "registry.terraform.io/virtscale/virtscale"  = "/path/to/GOBIN"
+  }
+  direct {}
+}
+```
 
-## Test and Deploy
+Point at it and run from `examples/`:
 
-Use the built-in continuous integration in GitLab.
+```bash
+export TF_CLI_CONFIG_FILE=~/.tfrc.d/dev.tfrc
+export VIRTSCALE_API_KEY=...
+export VIRTSCALE_ORGANIZATION=...
+tofu plan
+```
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+## Authentication
 
-***
+The provider is configured via the `api_key` / `organization` attributes, or -- preferred, so a key never
+lands in a `.tf` file -- the environment:
 
-# Editing this README
+| Attribute      | Environment variable       |
+| -------------- | --------------------------- |
+| `api_key`      | `VIRTSCALE_API_KEY`         |
+| `organization` | `VIRTSCALE_ORGANIZATION`    |
+| `endpoint`     | `VIRTSCALE_ENDPOINT` (defaults to `https://api.virtscale.nl`) |
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+An attribute set in configuration takes precedence over the matching environment variable. A missing
+`api_key` or `organization` (after both are checked) fails `Configure` with a diagnostic naming the missing
+attribute and its environment variable -- never a panic.
 
-## Suggestions for a good README
+## Resources and data sources
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+### `virtscale_instance`
 
-## Name
-Choose a self-explaining name for your project.
+| Attribute         | Type   | Required/Computed | Notes |
+| ----------------- | ------ | ------------------ | ----- |
+| `name`            | string | Required, forces replacement | |
+| `region`          | string | Required, forces replacement | |
+| `image`           | string | Required, forces replacement | Image id from `virtscale_images`. |
+| `vcpus`           | number | Required, forces replacement | |
+| `memory_mb`       | number | Required, forces replacement | |
+| `disk_gb`         | number | Required, forces replacement | |
+| `storage_pool`    | string | Required, forces replacement | |
+| `network_profile` | string | Required, forces replacement | |
+| `ssh_keys`        | list(string) | Optional, forces replacement | |
+| `id`              | string | Computed | |
+| `state`           | string | Computed | |
+| `fqdn`            | string | Computed | Null for a customer account. |
+| `private_ipv4`    | string | Computed | Empty until observed. |
+| `created_at`      | string | Computed | RFC 3339. |
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+### `virtscale_public_ip`
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+| Attribute     | Type   | Required/Computed | Notes |
+| ------------- | ------ | ------------------ | ----- |
+| `region`      | string | Required, forces replacement | |
+| `instance_id` | string | Optional | Associates/disassociates in place; never forces replacement. |
+| `id`          | string | Computed | |
+| `address`     | string | Computed | |
+| `state`       | string | Computed | |
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+### `virtscale_images` (data source)
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+| Attribute | Type   | Required/Computed | Notes |
+| --------- | ------ | ------------------ | ----- |
+| `region`  | string | Required | |
+| `id`      | string | Computed | Set to `region`. |
+| `images`  | list(object) | Computed | Sorted by `name`. Each object: `id`, `name`, `os_distro` (nullable), `os_version` (nullable), `min_disk_gb`, `min_ram_mb`. |
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+## Testing
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+Unit tests (client package) run with plain `go test`. Provider and resource tests are Terraform acceptance
+tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
+`TF_ACC=1` and `tofu` on `PATH`:
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```bash
+TF_ACC=1 \
+TF_ACC_TERRAFORM_PATH=$(command -v tofu) \
+TF_ACC_PROVIDER_NAMESPACE=virtscale \
+TF_ACC_PROVIDER_HOST=registry.terraform.io \
+go test ./... -count=1 -v
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Links
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+- API reference: <https://learn.virtscale.nl>

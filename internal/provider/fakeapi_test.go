@@ -28,6 +28,10 @@ type fakeAPI struct {
 	createCount int
 	lastIdemKey string
 	nextOctet   int
+
+	publicIPs        map[string]*client.PublicIp
+	pubIPCreateCount int
+	pubIPNextOctet   int
 }
 
 // newFakeAPI starts a fake API server scoped to apiKey/org and registers its
@@ -36,10 +40,12 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 	t.Helper()
 
 	f := &fakeAPI{
-		apiKey:    apiKey,
-		org:       org,
-		vms:       make(map[string]*client.Vm),
-		nextOctet: 10,
+		apiKey:         apiKey,
+		org:            org,
+		vms:            make(map[string]*client.Vm),
+		nextOctet:      10,
+		publicIPs:      make(map[string]*client.PublicIp),
+		pubIPNextOctet: 10,
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
@@ -80,6 +86,15 @@ func (f *fakeAPI) VmState(id string) (state string, ok bool) {
 	return vm.State, true
 }
 
+// PublicIPCount reports how many public IPs are currently tracked by the
+// fake. A released public IP is removed entirely (unlike a deleted vm), so
+// this reaching 0 is the destroy signal for public IP tests.
+func (f *fakeAPI) PublicIPCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.publicIPs)
+}
+
 func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	if !f.checkAuth(w, r) {
 		return
@@ -102,6 +117,20 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 		f.getVm(w, strings.TrimPrefix(rest, "compute/vms/"))
 	case strings.HasPrefix(rest, "compute/vms/") && r.Method == http.MethodDelete:
 		f.deleteVm(w, strings.TrimPrefix(rest, "compute/vms/"))
+	case rest == "compute/public-ips" && r.Method == http.MethodPost:
+		f.createPublicIp(w, r)
+	case rest == "compute/public-ips" && r.Method == http.MethodGet:
+		f.listPublicIps(w, r)
+	case strings.HasPrefix(rest, "compute/public-ips/") && strings.HasSuffix(rest, "/associate") && r.Method == http.MethodPost:
+		id := strings.TrimSuffix(strings.TrimPrefix(rest, "compute/public-ips/"), "/associate")
+		f.associatePublicIp(w, r, id)
+	case strings.HasPrefix(rest, "compute/public-ips/") && strings.HasSuffix(rest, "/disassociate") && r.Method == http.MethodPost:
+		id := strings.TrimSuffix(strings.TrimPrefix(rest, "compute/public-ips/"), "/disassociate")
+		f.disassociatePublicIp(w, id)
+	case strings.HasPrefix(rest, "compute/public-ips/") && r.Method == http.MethodDelete:
+		f.releasePublicIp(w, strings.TrimPrefix(rest, "compute/public-ips/"))
+	case rest == "compute/images" && r.Method == http.MethodGet:
+		f.listImages(w, r)
 	default:
 		writeProblem(w, http.StatusNotFound, "not_found", "unknown route")
 	}
@@ -303,6 +332,225 @@ func (f *fakeAPI) deleteVm(w http.ResponseWriter, rawID string) {
 	}
 
 	writeJSON(w, http.StatusAccepted, map[string]any{"vm": vm, "operation": op})
+}
+
+// --- Public IP handlers ------------------------------------------------
+
+type fakePublicIpCreateRequest struct {
+	RegionID string `json:"region_id"`
+}
+
+// createPublicIp allocates a public IP in state "pending", or 422
+// quota_exceeded when the org already has one tracked (this fake enforces a
+// quota of one live public IP, matching the real API).
+func (f *fakeAPI) createPublicIp(w http.ResponseWriter, r *http.Request) {
+	var req fakePublicIpCreateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if len(f.publicIPs) > 0 {
+		writeProblem(w, http.StatusUnprocessableEntity, "quota_exceeded", "the organization's public IP quota (1) is already in use")
+		return
+	}
+
+	f.pubIPCreateCount++
+	id := fmt.Sprintf("pubip-%d", f.pubIPCreateCount)
+	now := time.Now().UTC()
+
+	ip := &client.PublicIp{
+		ID:        id,
+		RegionID:  req.RegionID,
+		Address:   nil,
+		VmID:      nil,
+		State:     "pending",
+		CreatedAt: now,
+	}
+	f.publicIPs[id] = ip
+
+	op := client.Operation{
+		ID:           id + "-allocate",
+		Type:         "allocate_public_ip",
+		State:        "pending",
+		ResourceType: "public_ip",
+		ResourceID:   id,
+		CreatedAt:    now,
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+}
+
+// listPublicIps is the only read path for public IPs (there is no
+// single-item GET, matching the real API); it advances every tracked public
+// IP one step and drops any that just finished releasing, so it doubles as
+// the state machine driver the client's GetPublicIp/WaitPublicIp rely on.
+func (f *fakeAPI) listPublicIps(w http.ResponseWriter, _ *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	items := make([]*client.PublicIp, 0, len(f.publicIPs))
+	for id, ip := range f.publicIPs {
+		if ip.State == "releasing" {
+			delete(f.publicIPs, id)
+			continue
+		}
+		f.advancePublicIp(ip)
+		items = append(items, ip)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+}
+
+// advancePublicIp moves ip one step through pending -> allocated,
+// associating -> associated, and disassociating -> allocated (clearing
+// vm_id). It is a no-op in any other state, so repeated GETs after
+// convergence are stable. Releasing is handled by the caller (listPublicIps)
+// since it removes the entry rather than mutating it.
+func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
+	switch ip.State {
+	case "pending":
+		ip.State = "allocated"
+		f.pubIPNextOctet++
+		addr := fmt.Sprintf("203.0.113.%d", f.pubIPNextOctet)
+		ip.Address = &addr
+	case "associating":
+		ip.State = "associated"
+	case "disassociating":
+		ip.State = "allocated"
+		ip.VmID = nil
+	}
+}
+
+type fakePublicIpAssociateRequest struct {
+	VmID string `json:"vm_id"`
+}
+
+func (f *fakeAPI) associatePublicIp(w http.ResponseWriter, r *http.Request, rawID string) {
+	id, err := url.PathUnescape(rawID)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
+		return
+	}
+
+	var req fakePublicIpAssociateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid request body")
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ip, ok := f.publicIPs[id]
+	if !ok {
+		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		return
+	}
+
+	ip.State = "associating"
+	ip.VmID = &req.VmID
+
+	op := client.Operation{
+		ID:           id + "-associate",
+		Type:         "associate_public_ip",
+		State:        "pending",
+		ResourceType: "public_ip",
+		ResourceID:   id,
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+}
+
+func (f *fakeAPI) disassociatePublicIp(w http.ResponseWriter, rawID string) {
+	id, err := url.PathUnescape(rawID)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ip, ok := f.publicIPs[id]
+	if !ok {
+		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		return
+	}
+
+	ip.State = "disassociating"
+
+	op := client.Operation{
+		ID:           id + "-disassociate",
+		Type:         "disassociate_public_ip",
+		State:        "pending",
+		ResourceType: "public_ip",
+		ResourceID:   id,
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+}
+
+func (f *fakeAPI) releasePublicIp(w http.ResponseWriter, rawID string) {
+	id, err := url.PathUnescape(rawID)
+	if err != nil {
+		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	ip, ok := f.publicIPs[id]
+	if !ok {
+		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		return
+	}
+
+	ip.State = "releasing"
+
+	op := client.Operation{
+		ID:           id + "-release",
+		Type:         "release_public_ip",
+		State:        "pending",
+		ResourceType: "public_ip",
+		ResourceID:   id,
+		CreatedAt:    time.Now().UTC(),
+	}
+
+	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+}
+
+// --- Images handler ------------------------------------------------------
+
+// listImages returns a fixed two-image catalogue for region "gro" and an
+// empty one for any other region; region is required, matching the real
+// API's per-region catalogue.
+func (f *fakeAPI) listImages(w http.ResponseWriter, r *http.Request) {
+	region := r.URL.Query().Get("region")
+	if region == "" {
+		writeProblem(w, http.StatusUnprocessableEntity, "region_required", "region is required")
+		return
+	}
+
+	if region != "gro" {
+		writeJSON(w, http.StatusOK, map[string]any{"items": []client.Image{}, "next_cursor": nil})
+		return
+	}
+
+	debianDistro, debianVersion := "debian", "12"
+	ubuntuDistro, ubuntuVersion := "ubuntu", "22.04"
+	items := []client.Image{
+		{ID: "image-debian-12", Name: "Debian 12", OSDistro: &debianDistro, OSVersion: &debianVersion, MinDiskGB: 10, MinRAMMB: 512},
+		{ID: "image-ubuntu-2204", Name: "Ubuntu 22.04", OSDistro: &ubuntuDistro, OSVersion: &ubuntuVersion, MinDiskGB: 10, MinRAMMB: 512},
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
 }
 
 // --- Direct tests of the fake itself ---------------------------------------

@@ -133,11 +133,13 @@ func (p *VirtscaleProvider) Configure(ctx context.Context, req provider.Configur
 func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewInstanceResource,
+		NewPublicIpResource,
 	}
 }
 
-// DataSources registers the provider's data sources. Empty for now; a later
-// task adds virtscale_images.
+// DataSources registers the provider's data sources.
 func (p *VirtscaleProvider) DataSources(_ context.Context) []func() datasource.DataSource {
-	return []func() datasource.DataSource{}
+	return []func() datasource.DataSource{
+		NewImagesDataSource,
+	}
 }
