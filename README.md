@@ -82,7 +82,7 @@ attribute and its environment variable -- never a panic.
 | ----------------- | ------ | ------------------ | ----- |
 | `name`            | string | Required, forces replacement | |
 | `region`          | string | Required, forces replacement | |
-| `image`           | string | Required, forces replacement | Image id from `virtscale_images`. |
+| `image`           | string | Required, forces replacement | Image id from `virtscale_images`. Set at creation only; the provider does not detect image drift in v0. |
 | `vcpus`           | number | Required, forces replacement | |
 | `memory_mb`       | number | Required, forces replacement | |
 | `disk_gb`         | number | Required, forces replacement | |
@@ -93,6 +93,7 @@ attribute and its environment variable -- never a panic.
 | `state`           | string | Computed | |
 | `fqdn`            | string | Computed | Null for a customer account. |
 | `private_ipv4`    | string | Computed | Empty until observed. |
+| `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. |
 | `created_at`      | string | Computed | RFC 3339. |
 
 ### `virtscale_public_ip`
