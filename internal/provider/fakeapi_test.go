@@ -48,6 +48,9 @@ type fakeAPI struct {
 	publicIPs        map[string]*fakePublicIP
 	pubIPCreateCount int
 	pubIPNextOctet   int
+	// publicIPQuota is QuotaProfile.public_ips: 1 for customer-default,
+	// negative for unlimited.
+	publicIPQuota int
 
 	// callSeq records, per public IP id, the order "disassociate"/"release"
 	// calls were observed -- used to assert Delete disassociates before it
@@ -186,6 +189,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		nextOctet:      10,
 		publicIPs:      make(map[string]*fakePublicIP),
 		pubIPNextOctet: 10,
+		publicIPQuota:  1,
 		callSeq:        make(map[string][]string),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
@@ -244,6 +248,13 @@ func (f *fakeAPI) CallSequence(id string) []string {
 	out := make([]string, len(f.callSeq[id]))
 	copy(out, f.callSeq[id])
 	return out
+}
+
+// SetPublicIPQuota sets the per-region public IP ceiling (negative: unlimited).
+func (f *fakeAPI) SetPublicIPQuota(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publicIPQuota = n
 }
 
 // Vanish removes vm id from the store entirely, so the next GetVm returns a
@@ -857,8 +868,7 @@ func (f *fakeAPI) publicIPAccepted(rc *reqCtx, ip *fakePublicIP, op wireOperatio
 }
 
 // createPublicIp allocates a public IP in state "pending", or 422
-// quota_exceeded when the org already has one tracked (this fake enforces a
-// quota of one live public IP, matching the real API).
+// quota_exceeded at the per-region ceiling (one for customer-default).
 func (f *fakeAPI) createPublicIp(rc *reqCtx) {
 	b := newBodyCheck(rc.r.Body)
 	regionID := b.str("region_id", true, 0, 0)
@@ -870,9 +880,20 @@ func (f *fakeAPI) createPublicIp(rc *reqCtx) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if len(f.publicIPs) > 0 {
-		rc.unprocessable("quota_exceeded", "the organization's public IP quota (1) is already in use")
-		return
+	// edge.py allocate_public_ip_request: this org's rows in this region that
+	// are not in error, against QuotaProfile.public_ips.
+	if f.publicIPQuota >= 0 {
+		used := 0
+		for _, other := range f.publicIPs {
+			if other.RegionID == regionID && other.State != "error" {
+				used++
+			}
+		}
+		if used >= f.publicIPQuota {
+			rc.unprocessable("quota_exceeded", fmt.Sprintf(
+				"public IPs: %d in use plus 1 requested exceeds the limit of %d for this account", used, f.publicIPQuota))
+			return
+		}
 	}
 
 	f.pubIPCreateCount++
@@ -957,6 +978,9 @@ func (f *fakeAPI) advancePublicIp(ip *fakePublicIP) {
 	}
 }
 
+// associatePublicIp is edge.py associate_public_ip_request, gate by gate: the
+// address must be allocated, the vm must exist, be in the same region and be
+// running, and carry no other address.
 func (f *fakeAPI) associatePublicIp(rc *reqCtx, id string) {
 	b := newBodyCheck(rc.r.Body)
 	vmID := b.uuid("vm_id", true)
@@ -972,6 +996,30 @@ func (f *fakeAPI) associatePublicIp(rc *reqCtx, id string) {
 	if !ok {
 		rc.notFound("public_ip")
 		return
+	}
+	if ip.State != "allocated" {
+		rc.conflict("public_ip_not_allocated", fmt.Sprintf("this public IP is %s, so it cannot be associated", ip.State))
+		return
+	}
+	vm, ok := f.vms[vmID]
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	if vm.RegionID != ip.RegionID {
+		rc.unprocessable("region_mismatch", "a public IP can only be associated with a VM in the same region")
+		return
+	}
+	if vm.State != "running" {
+		rc.conflict("vm_not_in_a_state_for_this", "this VM is not running, so a public IP cannot be attached to it")
+		return
+	}
+	for _, other := range f.publicIPs {
+		if other.ID != ip.ID && other.VmID != nil && *other.VmID == vm.ID &&
+			(other.State == "associating" || other.State == "associated") {
+			rc.conflict("public_ip_already_associated", "this VM already has a public IP associated with it")
+			return
+		}
 	}
 
 	ip.State = "associating"
@@ -989,6 +1037,10 @@ func (f *fakeAPI) disassociatePublicIp(rc *reqCtx, id string) {
 		rc.notFound("public_ip")
 		return
 	}
+	if ip.State != "associated" {
+		rc.conflict("public_ip_not_associated", fmt.Sprintf("this public IP is %s, so it cannot be disassociated", ip.State))
+		return
+	}
 
 	ip.State = "disassociating"
 	f.callSeq[id] = append(f.callSeq[id], "disassociate")
@@ -996,6 +1048,8 @@ func (f *fakeAPI) disassociatePublicIp(rc *reqCtx, id string) {
 	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.disassociate", id))
 }
 
+// releasePublicIp accepts a release from allocated, associated or error; the
+// executor disassociates first when the row still names a vm.
 func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1003,6 +1057,12 @@ func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 	ip, ok := f.publicIPs[id]
 	if !ok {
 		rc.notFound("public_ip")
+		return
+	}
+	switch ip.State {
+	case "allocated", "associated", "error":
+	default:
+		rc.conflict("public_ip_not_releasable", fmt.Sprintf("this public IP is %s, so it cannot be released", ip.State))
 		return
 	}
 
@@ -1628,3 +1688,159 @@ func TestFakeAPI_IdempotencyKeyReplaysTheStoredResponse(t *testing.T) {
 type jsonObject map[string]any
 
 func (o jsonObject) get(key string) map[string]any { return o[key].(map[string]any) }
+
+// --- public IP gates (domain/compute/edge.py) -------------------------------
+
+func ipsPath(org string) string { return "/v1/orgs/" + org + "/compute/public-ips" }
+
+// allocateIPVia allocates a public IP in region and returns its id.
+func allocateIPVia(t *testing.T, f *fakeAPI, region string) string {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodPost, ipsPath(f.org), `{"region_id":"`+region+`"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("allocate in %s: status = %d (%s)", region, status, resp)
+	}
+	return decodeObject(t, resp)["public_ip"].(map[string]any)["id"].(string)
+}
+
+// ipStateVia reads a public IP's state through the list, which also advances it.
+func ipStateVia(t *testing.T, f *fakeAPI, id string) string {
+	t.Helper()
+	_, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodGet, ipsPath(f.org), "")
+	for _, it := range decodeObject(t, resp)["items"].([]any) {
+		if m := it.(map[string]any); m["id"] == id {
+			return m["state"].(string)
+		}
+	}
+	return "absent"
+}
+
+func settleIP(t *testing.T, f *fakeAPI, id, want string) {
+	t.Helper()
+	for i := 0; i < 5; i++ {
+		if ipStateVia(t, f, id) == want {
+			return
+		}
+	}
+	t.Fatalf("public ip %s never reached %s (now %s)", id, want, ipStateVia(t, f, id))
+}
+
+func ipAction(t *testing.T, f *fakeAPI, id, action, body string) (int, map[string]any) {
+	t.Helper()
+	method, path := http.MethodPost, ipsPath(f.org)+"/"+id+"/"+action
+	if action == "" {
+		method, path = http.MethodDelete, ipsPath(f.org)+"/"+id
+	}
+	status, _, resp := fakeHTTP(t, f, f.apiKey, method, path, body)
+	return status, decodeObject(t, resp)
+}
+
+func wantProblem(t *testing.T, what string, status int, p map[string]any, wantStatus int, code, detail string) {
+	t.Helper()
+	if status != wantStatus || p["code"] != code {
+		t.Errorf("%s: %d %v, want %d %s (%v)", what, status, p["code"], wantStatus, code, p["detail"])
+		return
+	}
+	if detail != "" && p["detail"] != detail {
+		t.Errorf("%s: detail = %q, want %q", what, p["detail"], detail)
+	}
+}
+
+func TestFakeAPI_PublicIPGatesMatchTheDeployedAPI(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	ipID := allocateIPVia(t, f, "gro")
+	assocBody := `{"vm_id":"` + vmID + `"}`
+
+	// pending: not associable, not releasable, not disassociable.
+	st, p := ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate while pending", st, p, 409, "public_ip_not_allocated", "this public IP is pending, so it cannot be associated")
+	st, p = ipAction(t, f, ipID, "", "")
+	wantProblem(t, "release while pending", st, p, 409, "public_ip_not_releasable", "this public IP is pending, so it cannot be released")
+	st, p = ipAction(t, f, ipID, "disassociate", "")
+	wantProblem(t, "disassociate while pending", st, p, 409, "public_ip_not_associated", "this public IP is pending, so it cannot be disassociated")
+
+	settleIP(t, f, ipID, "allocated")
+
+	// allocated: disassociate has nothing to undo; an unknown or foreign vm is 404.
+	st, p = ipAction(t, f, ipID, "disassociate", "")
+	wantProblem(t, "disassociate while allocated", st, p, 409, "public_ip_not_associated", "this public IP is allocated, so it cannot be disassociated")
+	st, p = ipAction(t, f, ipID, "associate", `{"vm_id":"`+testSomeUUID+`"}`)
+	wantProblem(t, "associate an unknown vm", st, p, 404, "not_found", "no vm matching that identifier is visible to this organization")
+	st, p = ipAction(t, f, testSomeUUID, "associate", assocBody)
+	wantProblem(t, "associate an unknown ip", st, p, 404, "not_found", "no public_ip matching that identifier is visible to this organization")
+
+	// the vm is still pending: not running, so nothing can be attached to it.
+	st, p = ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate to a vm that is not running", st, p, 409, "vm_not_in_a_state_for_this", "this VM is not running, so a public IP cannot be attached to it")
+
+	runVm(t, f, "good-key", vmID)
+	st, _ = ipAction(t, f, ipID, "associate", assocBody)
+	if st != http.StatusAccepted {
+		t.Fatalf("associate to a running vm: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate twice", st, p, 409, "public_ip_not_allocated", "this public IP is associating, so it cannot be associated")
+	settleIP(t, f, ipID, "associated")
+
+	// an associated address can be released directly: the executor disassociates first.
+	st, _ = ipAction(t, f, ipID, "", "")
+	if st != http.StatusAccepted {
+		t.Errorf("release of an associated ip: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, ipID, "", "")
+	wantProblem(t, "release while releasing", st, p, 409, "public_ip_not_releasable", "this public IP is releasing, so it cannot be released")
+	if got := ipStateVia(t, f, ipID); got != "absent" {
+		t.Errorf("after a release the row is gone from the list, got state %q", got)
+	}
+}
+
+func TestFakeAPI_PublicIPRegionAndOneAddressPerVm(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.SetPublicIPQuota(2)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+
+	other := allocateIPVia(t, f, "ams")
+	settleIP(t, f, other, "allocated")
+	st, p := ipAction(t, f, other, "associate", `{"vm_id":"`+vmID+`"}`)
+	wantProblem(t, "associate across regions", st, p, 422, "region_mismatch", "a public IP can only be associated with a VM in the same region")
+
+	first, second := allocateIPVia(t, f, "gro"), allocateIPVia(t, f, "gro")
+	settleIP(t, f, first, "allocated")
+	settleIP(t, f, second, "allocated")
+	if st, _ := ipAction(t, f, first, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("first association: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, second, "associate", `{"vm_id":"`+vmID+`"}`)
+	wantProblem(t, "second address on one vm", st, p, 409, "public_ip_already_associated", "this VM already has a public IP associated with it")
+}
+
+// TestFakeAPI_PublicIPQuotaIsPerRegionAndIgnoresErrorRows pins edge.py
+// allocate_public_ip_request: the count is of this org's rows in this region
+// that are not in error, against QuotaProfile.public_ips (1 for customer-default).
+func TestFakeAPI_PublicIPQuotaIsPerRegionAndIgnoresErrorRows(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	first := allocateIPVia(t, f, "gro")
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, ipsPath(testOrgID), `{"region_id":"gro"}`)
+	wantProblem(t, "second ip in the region", status, decodeObject(t, resp), 422, "quota_exceeded",
+		"public IPs: 1 in use plus 1 requested exceeds the limit of 1 for this account")
+
+	other := allocateIPVia(t, f, "ams") // another region has its own count
+	_ = other
+
+	// A row in error holds no address and does not count: drive the first one
+	// into error (a vm named ipfail-* refuses the bind) and allocate again.
+	vm := `{"name":"ipfail-x","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`
+	vmID := createVmVia(t, f, "good-key", vm).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+	settleIP(t, f, first, "allocated")
+	if st, _ := ipAction(t, f, first, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("associate: status = %d", st)
+	}
+	settleIP(t, f, first, "error")
+	if id := allocateIPVia(t, f, "gro"); id == "" {
+		t.Error("an error row must not count against the quota")
+	}
+}
