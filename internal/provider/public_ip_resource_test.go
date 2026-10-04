@@ -54,7 +54,7 @@ func testAccCheckPublicIpDestroy(fake *fakeAPI) resource.TestCheckFunc {
 // updated in place to allocated with instance_id null, ImportStateVerify,
 // then destroy leaving no public IP in the fake.
 func TestAccPublicIpResource_Lifecycle(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -94,7 +94,7 @@ func TestAccPublicIpResource_Lifecycle(t *testing.T) {
 // TestAccPublicIpResource_QuotaExceeded covers scenario (5): a second
 // allocation while the first is still live fails with quota_exceeded.
 func TestAccPublicIpResource_QuotaExceeded(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	config := testAccProviderBlock(fake) + `
 resource "virtscale_public_ip" "first" {
@@ -125,7 +125,7 @@ resource "virtscale_public_ip" "second" {
 // to state error, and the associate wait must fail immediately with the
 // API's own error field rather than polling out the full timeout.
 func TestAccPublicIpResource_AssociateFailsFast(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	config := testAccProviderBlock(fake) + `
 resource "virtscale_instance" "test" {
@@ -176,7 +176,7 @@ resource "virtscale_public_ip" "test" {
 // exercising that path here, a regression that made Delete retry
 // unconditionally would go uncaught.
 func TestAccPublicIpResource_DisassociateFailsFast(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	withInstanceID := testAccProviderBlock(fake) + `
 resource "virtscale_instance" "test" {
@@ -242,7 +242,7 @@ resource "virtscale_public_ip" "test" {
 // against the final released state, so a regression in the guard (e.g.
 // deleting it) is caught even though the end state looks identical.
 func TestAccPublicIpResource_DisassociateBeforeRelease(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	var ipID string
 
 	resource.Test(t, resource.TestCase{
@@ -285,7 +285,7 @@ data "virtscale_images" "test" {
 // TestAccImagesDataSource covers scenario (6): the data source returns the
 // fake's two gro images, sorted by name.
 func TestAccImagesDataSource(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },

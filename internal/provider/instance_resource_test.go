@@ -107,7 +107,7 @@ func testAccCheckInstanceDestroy(fake *fakeAPI) resource.TestCheckFunc {
 // replace and ending running again, then destroy leaving the fake's copy of
 // the vm in state "deleted".
 func TestAccInstanceResource_Lifecycle(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -151,7 +151,7 @@ func TestAccInstanceResource_Lifecycle(t *testing.T) {
 // with fail- drives the fake to state error, and apply fails with a
 // diagnostic naming the build failure.
 func TestAccInstanceResource_BuildFailure(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -199,9 +199,10 @@ resource "virtscale_instance" "test" {
 }
 
 // TestAccInstanceResource_InvalidAPIKey covers scenario (7): a 401 from the
-// API surfaces the problem+json detail in the diagnostic.
+// API surfaces the problem+json detail in the diagnostic. The detail is the
+// one the deployed API sends for every bad credential (deps.py, 94f5021f).
 func TestAccInstanceResource_InvalidAPIKey(t *testing.T) {
-	fake := newFakeAPI(t, "correct-key", "test-org")
+	fake := newFakeAPI(t, "correct-key", testOrgID)
 
 	badConfig := fmt.Sprintf(`
 provider "virtscale" {
@@ -228,7 +229,7 @@ resource "virtscale_instance" "test" {
 		Steps: []resource.TestStep{
 			{
 				Config:      badConfig,
-				ExpectError: regexp.MustCompile(`the api key is invalid`),
+				ExpectError: regexp.MustCompile(`the presented API token is not valid`),
 			},
 		},
 	})
@@ -258,7 +259,7 @@ resource "virtscale_instance" "test" {
 // TestAccInstanceResource_Lifecycle keeps verifying image for the normal,
 // non-diverging case).
 func TestAccInstanceResource_ImageAliasNoPerpetualDiff(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -301,7 +302,7 @@ func TestAccInstanceResource_ImageAliasNoPerpetualDiff(t *testing.T) {
 // must be dropped from state by Read, so the next plan proposes a create
 // rather than silently treating the resource as still present.
 func TestAccInstanceResource_VanishedOutOfBand(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	var instanceID string
 
 	resource.Test(t, resource.TestCase{
