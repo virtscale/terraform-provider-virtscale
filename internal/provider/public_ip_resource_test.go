@@ -436,3 +436,158 @@ resource "virtscale_public_ip" "test" {
 		t.Errorf("the API refused the request, yet %d public ip(s) exist", fake.PublicIPCount())
 	}
 }
+
+// --- 404s: only "this address is gone" is gone -------------------------------
+
+const testAccBareIpConfigBlock = `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`
+
+func testAccPublicIpIDFromState(dst *string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources["virtscale_public_ip.test"]
+		if !ok {
+			return fmt.Errorf("virtscale_public_ip.test not found in state")
+		}
+		*dst = rs.Primary.ID
+		return nil
+	}
+}
+
+// TestAccPublicIpResource_VanishedOutOfBand: an address released out of band is
+// absent from the API's list, which reads as the public_ip 404 of the shared
+// helper: Read drops it, and the next plan allocates one again.
+func TestAccPublicIpResource_VanishedOutOfBand(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccProviderBlock(fake) + testAccBareIpConfigBlock
+	var first, second string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps: []resource.TestStep{
+			{Config: config, Check: testAccPublicIpIDFromState(&first)},
+			{
+				PreConfig:          func() { fake.VanishPublicIP(first) },
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction("virtscale_public_ip.test", plancheck.ResourceActionCreate)},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					testAccPublicIpIDFromState(&second),
+					func(*terraform.State) error {
+						if second == first {
+							return fmt.Errorf("the address was not allocated again")
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_ReadErrorsThatAreNotTheAddressBeingGoneKeepTheResource:
+// the list that Read searches can fail with a 404 that is not about the address
+// (a mistyped endpoint, a proxy's page, the compute service); that is an error,
+// and the address stays in the state (V4 L4).
+func TestAccPublicIpResource_ReadErrorsThatAreNotTheAddressBeingGoneKeepTheResource(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccProviderBlock(fake) + testAccBareIpConfigBlock
+	variants := notFoundVariants()
+
+	steps := []resource.TestStep{{Config: config}}
+	for _, name := range sortedVariantNames(variants) {
+		respond := variants[name]
+		steps = append(steps, resource.TestStep{
+			PreConfig: func() {
+				fake.ClearFaults()
+				fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/public-ips"), respond)
+			},
+			Config:      config,
+			PlanOnly:    true,
+			ExpectError: wrapSafe("Unable to Read Public IP"),
+		})
+	}
+	steps = append(steps, resource.TestStep{
+		PreConfig: fake.ClearFaults,
+		Config:    config,
+		PlanOnly:  true,
+	})
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps:                    steps,
+	})
+}
+
+// TestAccPublicIpResource_ReleaseDoesNotTakeAMistypedEndpointForAReleasedAddress:
+// the wait after the release ends when the address is absent from the list.
+// Reads that fail with an unknown route's 404 are an error: destroy fails and
+// the address stays tracked, instead of reporting a release nobody confirmed.
+func TestAccPublicIpResource_ReleaseDoesNotTakeAMistypedEndpointForAReleasedAddress(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	deleteSeen := false
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: testAccProviderBlock(fake) + testAccBareIpConfigBlock},
+			{
+				PreConfig: func() {
+					fake.FailNext(1000, func(r *http.Request) bool {
+						if r.Method == http.MethodDelete {
+							deleteSeen = true
+						}
+						return deleteSeen && matchRoute(http.MethodGet, "/compute/public-ips")(r)
+					}, respondNoSuchRoute)
+				},
+				Config:      testAccProviderBlock(fake),
+				ExpectError: wrapSafe("Unable to Wait for Public IP Release"),
+			},
+			{
+				PreConfig: fake.ClearFaults,
+				Config:    testAccProviderBlock(fake),
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_AReleaseThatMeetsAConflictAndThenAnAbsentAddressIsDone:
+// the DELETE is answered 409 public_ip_not_releasable and the address is gone
+// when it is read back: it was being released already, so destroy is done.
+func TestAccPublicIpResource_AReleaseThatMeetsAConflictAndThenAnAbsentAddressIsDone(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: testAccProviderBlock(fake) + testAccBareIpConfigBlock, Check: testAccPublicIpIDFromState(&id)},
+			{
+				PreConfig: func() {
+					fake.FailNext(1, matchRoute(http.MethodDelete, "/compute/public-ips/"), func(rc *reqCtx) {
+						fake.VanishPublicIP(id)
+						rc.conflict("public_ip_not_releasable", "this public IP is releasing, so it cannot be released")
+					})
+				},
+				Config: testAccProviderBlock(fake),
+			},
+		},
+	})
+	if n := fake.PublicIPCount(); n != 0 {
+		t.Errorf("%d public ip(s) left", n)
+	}
+}
