@@ -340,6 +340,22 @@ func TestAPIError_FieldErrorsAreKeptAndShown(t *testing.T) {
 	}
 }
 
+// An errors[] entry may name no field (a rule about the body as a whole): the
+// message is shown without a "field:" prefix.
+func TestAPIError_FieldErrorWithoutAField(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"t","title":"Invalid request","status":400,"detail":"the request body or parameters failed validation","code":"invalid_request","request_id":"req-3","errors":[{"field":"","message":"JSON decode error"}]}`))
+	})
+
+	_, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, "")
+	want := "virtscale API 400 invalid_request: the request body or parameters failed validation: JSON decode error (request req-3)"
+	if err == nil || err.Error() != want {
+		t.Errorf("Error() = %v\nwant        %q", err, want)
+	}
+}
+
 // The API answers 404 not_found for a missing vm and for an organization the
 // key cannot see (deps.py, errors.not_found); only the detail differs. Reading
 // the second as "the resource is gone" would drop real resources from state.
@@ -847,11 +863,25 @@ func TestRetry_DefaultJitterIsUniformInZeroToMax(t *testing.T) {
 }
 
 func TestRetry_RetryAfterBeyondTheMaximumIsNotWaitedFor(t *testing.T) {
-	c, sc, log := newScriptedClient(t, problemStep(429, "rate_limited", "Retry-After", "3600"))
+	// 3600 is an hour; the other value overflows int64 and must saturate, not wrap into a short wait.
+	for _, seconds := range []string{"3600", "61", "99999999999999999999"} {
+		t.Run(seconds, func(t *testing.T) {
+			c, sc, log := newScriptedClient(t, problemStep(429, "rate_limited", "Retry-After", seconds))
 
-	_, err := c.GetVm(context.Background(), "vm-1")
-	if apiErr := asAPIError(t, err); apiErr.Status != 429 || sc.count() != 1 || len(log.all()) != 0 {
-		t.Errorf("err = %v calls = %d waits = %v, want the 429 at once: a server asking for an hour is not waited for", err, sc.count(), log.all())
+			_, err := c.GetVm(context.Background(), "vm-1")
+			if apiErr := asAPIError(t, err); apiErr.Status != 429 || sc.count() != 1 || len(log.all()) != 0 {
+				t.Errorf("err = %v calls = %d waits = %v, want the 429 at once: a server asking for %ss is not waited for", err, sc.count(), log.all(), seconds)
+			}
+		})
+	}
+
+	// The limit itself is still waited for.
+	c, sc, log := newScriptedClient(t, problemStep(429, "rate_limited", "Retry-After", "60"), jsonStep(200, testVmJSON))
+	if _, err := c.GetVm(context.Background(), "vm-1"); err != nil {
+		t.Fatalf("GetVm() error = %v", err)
+	}
+	if got := log.all(); sc.count() != 2 || len(got) != 1 || got[0] != 60*time.Second {
+		t.Errorf("Retry-After: 60 -> calls = %d waits = %v, want 2 calls and [1m0s]", sc.count(), got)
 	}
 }
 
