@@ -1438,7 +1438,7 @@ func TestSSHKeyUniqueValidator(t *testing.T) {
 		{"all different", sshKeysListRequest(keyNames("a", "b", "c")...), nil},
 		{"one twice", sshKeysListRequest(keyNames("a", "b", "a")...), []string{"a"}},
 		{"one three times is reported once", sshKeysListRequest(keyNames("a", "a", "a")...), []string{"a"}},
-		{"two names twice", sshKeysListRequest(keyNames("a", "b", "b", "a")...), []string{"a", "b"}},
+		{"two names twice, reported where the repeat is", sshKeysListRequest(keyNames("a", "b", "b", "a")...), []string{"b", "a"}},
 		{"case differs", sshKeysListRequest(keyNames("a", "A")...), nil},
 		{"unknown elements are not the same name", sshKeysListRequest(types.StringUnknown(), types.StringUnknown()), nil},
 		{"null elements are not the same name", sshKeysListRequest(types.StringNull(), types.StringNull()), nil},

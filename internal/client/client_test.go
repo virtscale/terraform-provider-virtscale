@@ -195,9 +195,11 @@ func TestAPIError_NonJSONBody(t *testing.T) {
 	}
 }
 
-// notFoundDetail is the sentence of the API's not_found helper (errors.py
-// not_found(resource)): the detail of every resource 404.
-func notFoundDetail(resource string) string {
+// helperSentence is the sentence of the API's not_found helper (errors.py
+// not_found(resource)): the detail of every resource 404. It is spelled out
+// here, apart from the client's own, so that a wrong sentence in the client
+// fails a test instead of being mirrored.
+func helperSentence(resource string) string {
 	return "no " + resource + " matching that identifier is visible to this organization"
 }
 
@@ -212,22 +214,22 @@ func TestIsNotFound_OnlyTheResourcesOwnSentenceCounts(t *testing.T) {
 
 	for _, resource := range resources {
 		for _, other := range resources {
-			err := notFound("not_found", notFoundDetail(other))
+			err := notFound("not_found", helperSentence(other))
 			if got, want := IsNotFound(err, resource), resource == other; got != want {
 				t.Errorf("IsNotFound(the %s sentence, %s) = %v, want %v", other, resource, got, want)
 			}
 		}
 		for name, err := range map[string]error{
 			"an unknown route":                     notFound("not_found", "Not Found"),
-			"the organization":                     notFound("not_found", notFoundDetail("organization")),
-			"the compute service":                  notFound("not_found", notFoundDetail("compute service")),
-			"a region":                             notFound("not_found", notFoundDetail("region")),
-			"another kind of resource":             notFound("not_found", notFoundDetail("operation")),
-			"the right sentence, another code":     notFound("vm_not_found", notFoundDetail(resource)),
-			"the right sentence, no code":          notFound("", notFoundDetail(resource)),
-			"the right sentence with more after":   notFound("not_found", notFoundDetail(resource)+" (id x)"),
+			"the organization":                     notFound("not_found", helperSentence("organization")),
+			"the compute service":                  notFound("not_found", helperSentence("compute service")),
+			"a region":                             notFound("not_found", helperSentence("region")),
+			"another kind of resource":             notFound("not_found", helperSentence("operation")),
+			"the right sentence, another code":     notFound("vm_not_found", helperSentence(resource)),
+			"the right sentence, no code":          notFound("", helperSentence(resource)),
+			"the right sentence with more after":   notFound("not_found", helperSentence(resource)+" (id x)"),
 			"a proxy's page":                       &APIError{Status: 404, Detail: "<html><body>Not Found</body></html>"},
-			"the right sentence on another status": &APIError{Status: 409, Code: "not_found", Detail: notFoundDetail(resource)},
+			"the right sentence on another status": &APIError{Status: 409, Code: "not_found", Detail: helperSentence(resource)},
 			"a plain error":                        errors.New("no " + resource + " matching that identifier is visible to this organization"),
 			"nil":                                  nil,
 		} {
@@ -235,7 +237,7 @@ func TestIsNotFound_OnlyTheResourcesOwnSentenceCounts(t *testing.T) {
 				t.Errorf("IsNotFound(%s, %s) = true, want false", name, resource)
 			}
 		}
-		if wrapped := fmt.Errorf("waiting: %w", notFound("not_found", notFoundDetail(resource))); !IsNotFound(wrapped, resource) {
+		if wrapped := fmt.Errorf("waiting: %w", notFound("not_found", helperSentence(resource))); !IsNotFound(wrapped, resource) {
 			t.Errorf("IsNotFound(a wrapped %s 404) = false, want true", resource)
 		}
 	}
@@ -262,7 +264,7 @@ func TestIsNotFound_ThroughTheClient(t *testing.T) {
 		gone                    bool
 	}
 	for _, rd := range reads {
-		_, own := problem("not_found", "Resource not found", notFoundDetail(rd.resource))
+		_, own := problem("not_found", "Resource not found", helperSentence(rd.resource))
 		_, noRoute := problem("not_found", "Not Found", "Not Found")
 		answers := []answer{
 			{"its own sentence", "application/problem+json", own, true},
@@ -272,7 +274,7 @@ func TestIsNotFound_ThroughTheClient(t *testing.T) {
 			{"an empty body", "text/plain", "", false},
 		}
 		for _, other := range []string{"organization", "compute service", "region", "operation"} {
-			_, body := problem("not_found", "Resource not found", notFoundDetail(other))
+			_, body := problem("not_found", "Resource not found", helperSentence(other))
 			answers = append(answers, answer{"the sentence for " + other, "application/problem+json", body, false})
 		}
 
@@ -377,7 +379,7 @@ func TestWaitVm_404PassedAsNilVm(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/not_found","title":"Resource not found","status":404,"code":"not_found","detail":"` + notFoundDetail("vm") + `","request_id":"req-9"}`))
+		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/not_found","title":"Resource not found","status":404,"code":"not_found","detail":"` + helperSentence("vm") + `","request_id":"req-9"}`))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -542,8 +544,8 @@ func TestGetPublicIp_AbsentUsesTheAPIsNotFoundCode(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Code != "not_found" {
 		t.Errorf("err = %+v, want a 404 with the API's own code not_found", apiErr)
 	}
-	if apiErr != nil && apiErr.Detail != notFoundDetail("public_ip") {
-		t.Errorf("Detail = %q, want the helper's sentence %q", apiErr.Detail, notFoundDetail("public_ip"))
+	if apiErr != nil && apiErr.Detail != helperSentence("public_ip") {
+		t.Errorf("Detail = %q, want the helper's sentence %q", apiErr.Detail, helperSentence("public_ip"))
 	}
 }
 
@@ -1521,8 +1523,14 @@ func TestRecoveryHint_AlsoWhenTheWaitCannotBeAfforded(t *testing.T) {
 	t.Run("cancelled while the request is out", func(t *testing.T) {
 		started := make(chan struct{})
 		c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			// The server only watches for a closed connection once the body has
+			// been read to its end.
+			_, _ = io.Copy(io.Discard, r.Body)
 			close(started)
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
 		})
 		ctx, cancel := context.WithCancel(context.Background())
 		go func() {

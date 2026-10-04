@@ -236,10 +236,10 @@ func TestAccSshKeyResource_TheSameKeyInAnotherFormIsAnUpdateWithoutAnAPICall(t *
 				Check:  sshKeyIDFromState(&id),
 			},
 			toForm(testKeyECDSA256 + " tf7-ecdsa@example.invalid"),
-			toForm(testKeyECDSA256 + " a comment with several words\r\n"),
-			toForm("  \t" + strings.Replace(testKeyECDSA256, " ", "\t", 1) + "  \n\n"),
+			// Whitespace, tabs between the fields and CRLF at once; each form has its own
+			// case in TestPublicKeysEquivalent.
+			toForm("  \t" + strings.Replace(testKeyECDSA256, " ", "\t", 1) + " a comment with several words\r\n\r\n"),
 			toForm(withSpareBitsFlipped(t, testKeyECDSA256)),
-			toForm(testKeyECDSA256),
 		},
 	})
 }
@@ -377,7 +377,7 @@ func TestAccSshKeyResource_ImportThenACommentedKeyIsAnUpdateWithoutAnAPICall(t *
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr(sshKeyAddr, "public_key", commented),
-					resource.TestCheckResourceAttr(sshKeyAddr, "id", id),
+					resource.TestCheckResourceAttrPtr(sshKeyAddr, "id", &id),
 					func(*terraform.State) error {
 						if got := mutating(fake.CallsSince(before)); len(got) != 0 {
 							return fmt.Errorf("the update called the API: %v", got)
@@ -624,6 +624,11 @@ func TestAccSshKeyResource_ScopesAreNamed(t *testing.T) {
 				Config:   testAccProviderBlockWith(fake, "compute-read", fake.org) + testAccSshKeyBlock("k", "laptop", fmt.Sprintf("%q", testKeyEd25519)),
 				PlanOnly: true,
 			},
+			{
+				// Back to the key that can destroy what step 3 made.
+				Config:   testAccProviderBlockWith(fake, "write-key", fake.org) + testAccSshKeyBlock("k", "laptop", fmt.Sprintf("%q", testKeyEd25519)),
+				PlanOnly: true,
+			},
 		},
 	})
 }
@@ -774,7 +779,7 @@ func TestParsePublicKey(t *testing.T) {
 			if !ok || keyType != tc.keyType {
 				t.Fatalf("parsePublicKey(%q) = %q, ok %v; want %q", tc.text, keyType, ok, tc.keyType)
 			}
-			want, _ := parsePublicKey(tc.keyType + " " + tc.blobText)
+			_, want, _ := parsePublicKey(tc.keyType + " " + tc.blobText)
 			if string(blob) != string(want) {
 				t.Errorf("the decoded bytes differ from the key's own: %x vs %x", blob, want)
 			}

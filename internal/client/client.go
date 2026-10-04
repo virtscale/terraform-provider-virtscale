@@ -162,7 +162,21 @@ type APIError struct {
 	// Attempts is how many times the request was sent before this error was
 	// returned; more than one means the client retried.
 	Attempts int
+	// MayHaveBeenApplied is set when the request carried an Idempotency-Key (it
+	// creates something) and the client gave up on an answer that leaves open that
+	// the API processed it anyway: a gateway error, a duplicate still being
+	// processed, a lost connection. Error() then says how to find what it may
+	// have made.
+	MayHaveBeenApplied bool
 }
+
+// lostCreateHint is what the error of a keyed create that gave up adds: the
+// first request may have been processed although no answer came back, so the
+// resource may exist, and a new apply (with a new Idempotency-Key) would meet
+// it as name_taken.
+const lostCreateHint = "the first request may still have created the resource: " +
+	"if the next apply reports name_taken, find it in the panel or with the API " +
+	"and bring it under management with tofu import"
 
 // FieldError is one entry of a problem body's errors[]: which request field
 // the API refused and why.
@@ -192,6 +206,9 @@ func (e *APIError) Error() string {
 	}
 	if e.Attempts > 1 {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
+	}
+	if e.MayHaveBeenApplied {
+		msg += "; " + lostCreateHint
 	}
 	if hint := e.hint(); hint != "" {
 		msg += "; " + hint
@@ -253,26 +270,49 @@ func scopeHint(detail string) string {
 
 // organizationNotVisiblePrefix starts the detail of the 404 the API gives for
 // an organization the key cannot see (errors.not_found("organization"), raised
-// in customer_api/deps.py). It shares code not_found with a missing vm or
-// public IP, so the detail is the only thing that tells them apart; if the
-// wording ever changes, the check degrades to "any 404 is not found".
+// in customer_api/deps.py). It shares code not_found with every other resource
+// 404, so the detail is the only thing that tells them apart. It only decides
+// which hint an error gets: IsNotFound has its own, stricter rule.
 const organizationNotVisiblePrefix = "no organization matching that identifier"
 
 func isOrganizationNotVisible(e *APIError) bool {
 	return e.Status == http.StatusNotFound && strings.HasPrefix(e.Detail, organizationNotVisiblePrefix)
 }
 
-// IsNotFound reports whether err is an *APIError with Status 404 that says the
-// resource is not there. A 404 about the organization itself (a wrong
-// organization id, or a key issued for another organization) is not: it says
-// nothing about the resource, and treating it as "gone" would drop a live
-// resource from state.
-func IsNotFound(err error) bool {
+// The resources a call can ask about, as the API's not_found helper names them
+// in the detail of a 404 (errors.py not_found(resource)).
+const (
+	ResourceVm       = "vm"
+	ResourcePublicIp = "public_ip"
+	ResourceSshKey   = "ssh_key"
+)
+
+// notFoundDetail is the sentence the API's not_found helper gives a 404: code
+// not_found and "no <resource> matching that identifier is visible to this
+// organization". The same helper words the organization, the compute service
+// and a region, and an unknown route answers not_found with the detail "Not
+// Found".
+func notFoundDetail(resource string) string {
+	return "no " + resource + " matching that identifier is visible to this organization"
+}
+
+// IsNotFound reports whether err says that the resource the call asked about is
+// gone: an *APIError with status 404, code not_found and exactly the helper's
+// sentence for that resource (ResourceVm, ResourcePublicIp, ResourceSshKey).
+//
+// Any other 404 says nothing about the resource: an unknown route (a mistyped
+// endpoint), a proxy's page, the sentence for the organization, the compute
+// service, a region or another kind of resource. Reading one of those as "gone"
+// would drop a live resource from state, or end a destroy that nobody
+// confirmed, so it stays an error. If the API ever words the sentence
+// differently, this fails safe: a resource that is really gone reads as an
+// error until the client is updated, never the other way round.
+func IsNotFound(err error, resource string) bool {
 	var apiErr *APIError
-	if errors.As(err, &apiErr) {
-		return apiErr.Status == http.StatusNotFound && !isOrganizationNotVisible(apiErr)
-	}
-	return false
+	return errors.As(err, &apiErr) &&
+		apiErr.Status == http.StatusNotFound &&
+		apiErr.Code == "not_found" &&
+		apiErr.Detail == notFoundDetail(resource)
 }
 
 // IsOrganizationNotVisible reports whether err is the 404 the API gives for an
@@ -300,23 +340,36 @@ type problemFieldError struct {
 
 const maxTruncatedBodyLen = 200
 
-func newAPIError(status int, body []byte) *APIError {
+// redact replaces every occurrence of the API key in text that came from the
+// response, so that an upstream that echoes the request (a debug page of a proxy
+// that prints the Authorization header) cannot make the key appear in an error.
+func (c *Client) redact(s string) string {
+	if c.apiKey == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, c.apiKey, "[redacted]")
+}
+
+// newAPIError builds the error of a non-2xx answer. Everything in it that came
+// from the body has the API key replaced first; a raw body is cut short after
+// that, so that a key which straddles the cut cannot leave a piece of itself.
+func (c *Client) newAPIError(status int, body []byte) *APIError {
 	var p problemBody
 	if err := json.Unmarshal(body, &p); err == nil && (p.Type != "" || p.Title != "" || p.Code != "") {
 		apiErr := &APIError{
 			Status:    status,
-			Code:      p.Code,
-			Title:     p.Title,
-			Detail:    p.Detail,
-			RequestID: p.RequestID,
+			Code:      c.redact(p.Code),
+			Title:     c.redact(p.Title),
+			Detail:    c.redact(p.Detail),
+			RequestID: c.redact(p.RequestID),
 		}
 		for _, fe := range p.Errors {
-			apiErr.Errors = append(apiErr.Errors, FieldError{Field: fe.Field, Message: fe.Message})
+			apiErr.Errors = append(apiErr.Errors, FieldError{Field: c.redact(fe.Field), Message: c.redact(fe.Message)})
 		}
 		return apiErr
 	}
 
-	detail := strings.TrimSpace(string(body))
+	detail := strings.TrimSpace(c.redact(string(body)))
 	if len(detail) > maxTruncatedBodyLen {
 		detail = detail[:maxTruncatedBodyLen] + "…"
 	}
@@ -411,9 +464,9 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 				// theirs. An earlier attempt's API error says more than the
 				// cancellation does.
 				if lastErr != nil {
-					return lastErr
+					return giveUp(lastErr, 0, idempotencyKey)
 				}
-				return transportErr
+				return giveUp(transportErr, 0, idempotencyKey)
 			}
 			lastErr = transportErr
 		case ex.status >= 200 && ex.status < 300:
@@ -425,13 +478,13 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 			}
 			return nil
 		default:
-			apiErr = newAPIError(ex.status, ex.body)
+			apiErr = c.newAPIError(ex.status, ex.body)
 			apiErr.Attempts = attempt
 			lastErr = apiErr
 		}
 
 		if attempt >= c.retry.maxAttempts || !retryable(method, idempotencyKey, ex, apiErr, transportErr) {
-			return withAttempts(lastErr, attempt)
+			return giveUp(lastErr, attempt, idempotencyKey)
 		}
 		var header http.Header
 		if ex != nil {
@@ -439,25 +492,60 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 		}
 		wait, ok := c.retryDelay(attempt, header)
 		if !ok {
-			return withAttempts(lastErr, attempt)
+			return giveUp(lastErr, attempt, idempotencyKey)
 		}
 		if deadline, has := ctx.Deadline(); has && c.retry.now().Add(wait).After(deadline) {
-			return withAttempts(lastErr, attempt)
+			return giveUp(lastErr, attempt, idempotencyKey)
 		}
 		if err := c.retry.sleep(ctx, wait); err != nil {
-			return withAttempts(lastErr, attempt)
+			return giveUp(lastErr, attempt, idempotencyKey)
 		}
 	}
 }
 
-// withAttempts says, for an error that is not an *APIError (those carry their
-// own count), how many sends it took to give up.
-func withAttempts(err error, attempts int) error {
+// giveUp is the error doJSON returns when it stops with err, the last failure:
+// the error as it came, saying (for an error that is not an *APIError, which
+// carries its own count) how many sends it took, and, for a request that
+// carried an Idempotency-Key, how to recover when the failure leaves open that
+// the API processed it anyway.
+func giveUp(err error, attempts int, idempotencyKey string) error {
+	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
+
 	var apiErr *APIError
-	if attempts <= 1 || errors.As(err, &apiErr) {
+	if errors.As(err, &apiErr) {
+		apiErr.MayHaveBeenApplied = lost
 		return err
 	}
-	return fmt.Errorf("%w; gave up after %d attempts", err, attempts)
+	if attempts > 1 {
+		err = fmt.Errorf("%w; gave up after %d attempts", err, attempts)
+	}
+	if lost {
+		err = fmt.Errorf("%w; %s", err, lostCreateHint)
+	}
+	return err
+}
+
+// mayHaveBeenApplied reports whether a failed attempt leaves open that the API
+// processed the request all the same: a transport error (the answer may have
+// been lost; a certificate that does not verify, or an endpoint that is no
+// http(s) URL, never got there), a 502, 503 or 504 (not the 503 not_ready of a
+// feature that is switched off), or a 409 idempotency_in_progress (the first
+// request is still being processed). A 429 was refused before it ran, and any
+// other answer is a decision.
+func mayHaveBeenApplied(err error) bool {
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.Status {
+		case http.StatusBadGateway, http.StatusGatewayTimeout:
+			return true
+		case http.StatusServiceUnavailable:
+			return apiErr.Code != "not_ready"
+		case http.StatusConflict:
+			return apiErr.Code == "idempotency_in_progress"
+		}
+		return false
+	}
+	return !permanentTransportError(err)
 }
 
 // repeatable reports whether sending the request twice is safe: a GET, a
@@ -657,6 +745,28 @@ type Image struct {
 	MinRAMMB  int     `json:"min_ram_mb"`
 }
 
+// SshKey is the SshKeyOut representation returned by the compute/ssh-keys
+// endpoints: a public key imported into the organization. PublicKey is the
+// canonical form, "<type> <base64>" with the comment dropped; Fingerprint is
+// "SHA256:" and the unpadded base64 of the SHA-256 of the key, as ssh-keygen -lf
+// prints it.
+type SshKey struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	KeyType     string    `json:"key_type"`
+	Fingerprint string    `json:"fingerprint"`
+	PublicKey   string    `json:"public_key"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// SshKeyCreateRequest is the body of POST /v1/orgs/{org}/compute/ssh-keys (the
+// API's SshKeyImportRequest). PublicKey is one OpenSSH line, "<type> <base64>
+// [comment]"; the API refuses anything else.
+type SshKeyCreateRequest struct {
+	Name      string `json:"name"`
+	PublicKey string `json:"public_key"`
+}
+
 type listResponse[T any] struct {
 	Items      []T     `json:"items"`
 	NextCursor *string `json:"next_cursor"`
@@ -757,8 +867,9 @@ func (c *Client) ListPublicIps(ctx context.Context) ([]PublicIp, error) {
 }
 
 // GetPublicIp has no single-item GET counterpart in the API; it lists and
-// filters, returning an *APIError with Status 404 (code not_found, like the
-// API's own answer for a missing public IP) when id is absent.
+// filters, returning an *APIError with Status 404 (code not_found and the
+// helper's public_ip sentence, like the API's own answer for a missing public
+// IP) when id is absent.
 func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) {
 	ips, err := c.ListPublicIps(ctx)
 	if err != nil {
@@ -772,7 +883,7 @@ func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) 
 	return nil, &APIError{
 		Status: http.StatusNotFound,
 		Code:   "not_found",
-		Detail: fmt.Sprintf("public ip %s not found", id),
+		Detail: notFoundDetail(ResourcePublicIp),
 	}
 }
 
@@ -809,19 +920,50 @@ func (c *Client) ReleasePublicIp(ctx context.Context, id string) (*PublicIp, *Op
 	return &out.PublicIp, &out.Operation, nil
 }
 
+// --- SSH key methods -----------------------------------------------------
+
+// CreateSshKey sends POST /v1/orgs/{org}/compute/ssh-keys, which imports the
+// key and answers 201 with it. When idempotencyKey is non-empty it is sent as
+// the Idempotency-Key header, so a request repeated after a lost answer gets the
+// first answer back instead of importing twice.
+func (c *Client) CreateSshKey(ctx context.Context, req SshKeyCreateRequest, idempotencyKey string) (*SshKey, error) {
+	var out SshKey
+	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("compute/ssh-keys"), req, idempotencyKey, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetSshKey sends GET /v1/orgs/{org}/compute/ssh-keys/{id}.
+func (c *Client) GetSshKey(ctx context.Context, id string) (*SshKey, error) {
+	var out SshKey
+	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/ssh-keys/"+url.PathEscape(id)), nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteSshKey sends DELETE /v1/orgs/{org}/compute/ssh-keys/{id}, which answers
+// 204. Instances that were created with the key keep it.
+func (c *Client) DeleteSshKey(ctx context.Context, id string) error {
+	return c.doJSON(ctx, http.MethodDelete, c.orgPath("compute/ssh-keys/"+url.PathEscape(id)), nil, "", nil)
+}
+
 // --- Waiters ---------------------------------------------------------------
 
 // WaitVm polls GetVm every pollEvery until done reports true or ctx is
-// done. A 404 is passed to done as a nil *Vm so callers can treat it as
-// deletion; if done(nil) then reports true, WaitVm returns (nil, nil). On
-// deadline it returns the last observed *Vm (possibly nil) and an error that
-// wraps ctx.Err() and mentions the last observed state.
+// done. A 404 that says the vm is gone (IsNotFound with ResourceVm) is passed
+// to done as a nil *Vm so callers can treat it as deletion; if done(nil) then
+// reports true, WaitVm returns (nil, nil). Any other error, a 404 about
+// something else included, ends the wait with that error. On deadline it
+// returns the last observed *Vm (possibly nil) and an error that wraps
+// ctx.Err() and mentions the last observed state.
 func (c *Client) WaitVm(ctx context.Context, id string, pollEvery time.Duration, done func(*Vm) (bool, error)) (*Vm, error) {
 	var last *Vm
 	for {
 		vm, err := c.GetVm(ctx, id)
 		switch {
-		case err != nil && IsNotFound(err):
+		case err != nil && IsNotFound(err, ResourceVm):
 			ok, derr := done(nil)
 			if derr != nil {
 				return last, derr
@@ -870,7 +1012,7 @@ func (c *Client) WaitPublicIp(ctx context.Context, id string, pollEvery time.Dur
 	for {
 		ip, err := c.GetPublicIp(ctx, id)
 		switch {
-		case err != nil && IsNotFound(err):
+		case err != nil && IsNotFound(err, ResourcePublicIp):
 			ok, derr := done(nil)
 			if derr != nil {
 				return last, derr

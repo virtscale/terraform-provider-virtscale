@@ -134,6 +134,7 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 	return []func() resource.Resource{
 		NewInstanceResource,
 		NewPublicIpResource,
+		NewSshKeyResource,
 	}
 }
 

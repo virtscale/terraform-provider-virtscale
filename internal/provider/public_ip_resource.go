@@ -191,7 +191,8 @@ func (r *PublicIpResource) Create(ctx context.Context, req resource.CreateReques
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Read refreshes state from the API. A 404 removes the resource from state.
+// Read refreshes state from the API. Only the 404 that says the public IP is
+// gone removes the resource from state; any other 404 is an error.
 func (r *PublicIpResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state publicIpResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -201,7 +202,7 @@ func (r *PublicIpResource) Read(ctx context.Context, req resource.ReadRequest, r
 
 	ip, err := r.client.GetPublicIp(ctx, state.ID.ValueString())
 	if err != nil {
-		if client.IsNotFound(err) {
+		if client.IsNotFound(err, client.ResourcePublicIp) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -273,7 +274,7 @@ func (r *PublicIpResource) Delete(ctx context.Context, req resource.DeleteReques
 	}
 
 	_, _, err := r.client.ReleasePublicIp(ctx, state.ID.ValueString())
-	if err != nil && !client.IsNotFound(err) && !r.releaseAlreadyUnderway(ctx, state.ID.ValueString(), err) {
+	if err != nil && !client.IsNotFound(err, client.ResourcePublicIp) && !r.releaseAlreadyUnderway(ctx, state.ID.ValueString(), err) {
 		resp.Diagnostics.AddError("Unable to Release Public IP", apiErrorDetail(err))
 		return
 	}
@@ -301,7 +302,7 @@ func (r *PublicIpResource) releaseAlreadyUnderway(ctx context.Context, id string
 		return false
 	}
 	ip, getErr := r.client.GetPublicIp(ctx, id)
-	if client.IsNotFound(getErr) {
+	if client.IsNotFound(getErr, client.ResourcePublicIp) {
 		return true
 	}
 	return getErr == nil && ip.State == "releasing"

@@ -660,6 +660,15 @@ func (rc *reqCtx) problem(status int, code, title, detail string, errs ...wireFi
 	_ = json.NewEncoder(rc.w).Encode(body)
 }
 
+// inProgress is db/idempotency.py's 409 idempotency_in_progress. The real API
+// sends no Retry-After with it, so the client backs off with jitter (which has
+// its own client tests); the fake sends 0 so that the acceptance tests, which
+// cannot shorten that backoff, do not sleep.
+func (rc *reqCtx) inProgress() {
+	rc.w.Header().Set("Retry-After", "0")
+	rc.conflict("idempotency_in_progress", detailIdempotencyInProgress)
+}
+
 // noContent writes an empty 204, the success of a delete that has nothing to say.
 func (rc *reqCtx) noContent() {
 	rc.w.Header().Set("X-Request-ID", rc.rid)
@@ -1129,7 +1138,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		if rec, ok := f.idem[key]; ok {
 			if f.inProgressLeft > 0 {
 				f.inProgressLeft--
-				rc.conflict("idempotency_in_progress", detailIdempotencyInProgress)
+				rc.inProgress()
 				return
 			}
 			if rec.payloadHash != digest {
@@ -1649,7 +1658,7 @@ func (f *fakeAPI) importSshKey(rc *reqCtx) {
 		if rec, ok := f.idem[idemKey]; ok {
 			if f.inProgressLeft > 0 {
 				f.inProgressLeft--
-				rc.conflict("idempotency_in_progress", detailIdempotencyInProgress)
+				rc.inProgress()
 				return
 			}
 			if rec.payloadHash != digest {
@@ -2836,13 +2845,14 @@ func respondEchoingTheKey(status int) func(*reqCtx) {
 
 // notFoundVariants are the 404s that do not say "this resource is gone": a
 // mistyped endpoint, a proxy's page, and the shared helper's sentence for what
-// the request did not ask about. Reading them as "gone" would empty the state.
+// the request did not ask about (the compute service, another kind of
+// resource; the organization and a region have their own cases in the client's
+// tests). Reading them as "gone" would empty the state.
 func notFoundVariants() map[string]func(*reqCtx) {
 	return map[string]func(*reqCtx){
 		"an unknown route":         respondNoSuchRoute,
 		"a proxy's html page":      respondGateway(http.StatusNotFound),
 		"the compute service":      respondNotFoundOf("compute service"),
-		"a region":                 respondNotFoundOf("region"),
 		"another kind of resource": respondNotFoundOf("operation"),
 	}
 }
