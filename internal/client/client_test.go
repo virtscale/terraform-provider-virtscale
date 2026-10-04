@@ -1491,7 +1491,8 @@ func TestRecoveryHint_AlsoWhenTheWaitCannotBeAfforded(t *testing.T) {
 	t.Run("the deadline is shorter than the wait", func(t *testing.T) {
 		c, sc, _ := newScriptedClient(t, problemStep(503, "dependency_unavailable", "Retry-After", "30"))
 		c.retry.sleep = sleepContext
-		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Millisecond)
+		// 30 seconds of Retry-After against 20 seconds of deadline: no need to be quick.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 
 		_, err := c.CreateSshKey(ctx, SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, "key-1")
@@ -1511,9 +1512,13 @@ func TestRecoveryHint_AlsoWhenTheWaitCannotBeAfforded(t *testing.T) {
 
 	t.Run("cancelled while waiting", func(t *testing.T) {
 		c, sc, _ := newScriptedClient(t, problemStep(502, "bad_gateway", "Retry-After", "20"))
-		c.retry.sleep = sleepContext
 		ctx, cancel := context.WithCancel(context.Background())
-		time.AfterFunc(100*time.Millisecond, cancel)
+		defer cancel()
+		// Ctrl-C arrives as the client starts to wait for the retry.
+		c.retry.sleep = func(ctx context.Context, _ time.Duration) error {
+			cancel()
+			return ctx.Err()
+		}
 
 		_, _, err := c.CreateVm(ctx, VmCreateRequest{Name: "web-01"}, "key-1")
 		if err == nil || sc.count() != 1 || !strings.HasSuffix(err.Error(), recoveryHint) {
