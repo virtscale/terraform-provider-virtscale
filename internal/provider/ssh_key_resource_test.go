@@ -6,6 +6,7 @@ package provider
 // §4 contract. Only run with TF_ACC=1 and tofu on PATH.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -13,6 +14,9 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -728,4 +732,154 @@ func TestAccSshKeyResource_GivingUpSaysHowToRecover(t *testing.T) {
 			},
 		},
 	})
+}
+
+// --- the public key, and when two texts are one key (D2) -----------------------------
+
+func TestParsePublicKey(t *testing.T) {
+	blobOf := func(key string) string { return strings.Fields(key)[1] }
+
+	for _, tc := range []struct {
+		name, text, keyType string
+		blobText            string // the base64 whose bytes are expected; "" when the text must not parse
+	}{
+		{"the canonical form", testKeyEd25519, "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"a comment", testKeyEd25519 + " " + testKeyEd25519Comment, "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"a comment of several words", testKeyEd25519 + " my laptop, the old one", "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"a newline", testKeyEd25519 + "\n", "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"CRLF", testKeyEd25519 + " c\r\n", "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"whitespace around it", " \t" + testKeyEd25519 + " \t\n\n", "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"tabs between the fields", strings.Replace(testKeyEd25519, " ", "\t", 1), "ssh-ed25519", blobOf(testKeyEd25519)},
+		{"a key that ends in padding", testKeyECDSA256, "ecdsa-sha2-nistp256", blobOf(testKeyECDSA256)},
+		{"spare bits in the last character", withSpareBitsFlipped(t, testKeyECDSA256), "ecdsa-sha2-nistp256", blobOf(testKeyECDSA256)},
+
+		{"nothing", "", "", ""},
+		{"only whitespace", " \r\n\t", "", ""},
+		{"only a type", "ssh-ed25519", "", ""},
+		{"base64 that is not base64", "ssh-ed25519 !!!!", "", ""},
+		{"empty base64 after trimming", "ssh-ed25519  ", "", ""},
+		{"two keys, two lines", testKeyEd25519 + "\n" + testKeyOther, "", ""},
+		{"a key and a blank line and a comment line", testKeyEd25519 + "\n\n# note", "", ""},
+		{"authorized_keys options in front", `command="ls" ` + testKeyEd25519, "", ""},
+		{"a private key", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----", "", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyType, blob, ok := parsePublicKey(tc.text)
+			if tc.blobText == "" {
+				if ok {
+					t.Fatalf("parsePublicKey(%q) = %q, %x, true; want it not to parse", tc.text, keyType, blob)
+				}
+				return
+			}
+			if !ok || keyType != tc.keyType {
+				t.Fatalf("parsePublicKey(%q) = %q, ok %v; want %q", tc.text, keyType, ok, tc.keyType)
+			}
+			want, _ := parsePublicKey(tc.keyType + " " + tc.blobText)
+			if string(blob) != string(want) {
+				t.Errorf("the decoded bytes differ from the key's own: %x vs %x", blob, want)
+			}
+		})
+	}
+}
+
+// Two texts are one key when the type and the decoded blob are the same; the
+// comment, whitespace, CRLF and spare base64 bits are not part of the key. When
+// either side does not parse, only identical text is equal, so a bad key still
+// reaches the API and its 422 is shown.
+func TestPublicKeysEquivalent(t *testing.T) {
+	spare := withSpareBitsFlipped(t, testKeyECDSA256)
+	blob := strings.Fields(testKeyEd25519)[1]
+
+	for _, tc := range []struct {
+		name, a, b string
+		want       bool
+	}{
+		{"the same text", testKeyEd25519, testKeyEd25519, true},
+		{"with and without a comment", testKeyEd25519, testKeyEd25519 + " " + testKeyEd25519Comment, true},
+		{"two different comments", testKeyEd25519 + " one", testKeyEd25519 + " two", true},
+		{"with and without a newline", testKeyEd25519, testKeyEd25519 + "\n", true},
+		{"LF and CRLF", testKeyEd25519 + " c\n", testKeyEd25519 + " c\r\n", true},
+		{"whitespace around it", " \t" + testKeyEd25519 + "  ", testKeyEd25519, true},
+		{"spare bits: one key, two base64 texts", testKeyECDSA256, spare, true},
+		{"spare bits, the other way round", spare, testKeyECDSA256 + " c\n", true},
+		{"two keys of one type", testKeyEd25519, testKeyOther, false},
+		{"two keys of one type, with comments", testKeyEd25519 + " c", testKeyOther + " c", false},
+		{"two types", testKeyEd25519, testKeyECDSA256, false},
+		{"the same bytes under another type name", "ssh-ed25519 " + blob, "ssh-rsa " + blob, false},
+		{"a key and a truncated key", testKeyEd25519, testKeyEd25519[:len(testKeyEd25519)-8], false},
+		{"a key and nothing", testKeyEd25519, "", false},
+
+		{"unparseable, identical", "this is not a key", "this is not a key", true},
+		{"empty, identical", "", "", true},
+		{"unparseable, different", "this is not a key", "this is not a key either", false},
+		{"unparseable against a key", "ssh-ed25519 !!!!", testKeyEd25519, false},
+		{"the first line of two keys against the key", testKeyEd25519 + "\n" + testKeyOther, testKeyEd25519, false},
+		{"two keys, written differently", testKeyEd25519 + "\n" + testKeyOther, testKeyEd25519 + " c\n" + testKeyOther, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := publicKeysEquivalent(tc.a, tc.b); got != tc.want {
+				t.Errorf("publicKeysEquivalent(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			if got := publicKeysEquivalent(tc.b, tc.a); got != tc.want {
+				t.Errorf("publicKeysEquivalent(%q, %q) = %v, want %v (it must be symmetric)", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// The framework asks the value, not our function: the custom type is what makes
+// a Read that returns the canonical text keep the configuration's, and an apply
+// that stores the canonical text match the plan.
+func TestPublicKeyValue_StringSemanticEquals(t *testing.T) {
+	ctx := context.Background()
+	commented := NewPublicKeyValue(testKeyEd25519 + " " + testKeyEd25519Comment + "\n")
+	canonical := NewPublicKeyValue(testKeyEd25519)
+
+	if same, diags := canonical.StringSemanticEquals(ctx, commented); diags.HasError() || !same {
+		t.Errorf("canonical vs commented: %v, %v; want equal", same, diags)
+	}
+	if same, diags := commented.StringSemanticEquals(ctx, canonical); diags.HasError() || !same {
+		t.Errorf("commented vs canonical: %v, %v; want equal", same, diags)
+	}
+	if same, diags := canonical.StringSemanticEquals(ctx, NewPublicKeyValue(testKeyOther)); diags.HasError() || same {
+		t.Errorf("one key vs another: %v, %v; want different", same, diags)
+	}
+	if _, diags := canonical.StringSemanticEquals(ctx, basetypes.NewStringValue(testKeyEd25519)); !diags.HasError() {
+		t.Error("comparing against a plain string value must say what is wrong, not guess")
+	}
+}
+
+func TestPublicKeyType_IsAStringTypeWithItsOwnValue(t *testing.T) {
+	ctx := context.Background()
+	typ := PublicKeyType{}
+
+	if !typ.Equal(PublicKeyType{}) || typ.Equal(basetypes.StringType{}) {
+		t.Error("PublicKeyType must equal itself and nothing else, even the plain string type")
+	}
+	value, diags := typ.ValueFromString(ctx, basetypes.NewStringValue("x"))
+	if diags.HasError() {
+		t.Fatal(diags)
+	}
+	key, ok := value.(PublicKeyValue)
+	if !ok || key.ValueString() != "x" || !key.Type(ctx).Equal(typ) {
+		t.Errorf("ValueFromString gave %T %v, want a PublicKeyValue of type PublicKeyType", value, value)
+	}
+	if _, ok := typ.ValueType(ctx).(PublicKeyValue); !ok {
+		t.Errorf("ValueType = %T, want PublicKeyValue", typ.ValueType(ctx))
+	}
+	tfValue, err := NewPublicKeyValue("x").ToTerraformValue(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := typ.ValueFromTerraform(ctx, tfValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := back.(PublicKeyValue); !ok || !back.Equal(NewPublicKeyValue("x")) {
+		t.Errorf("ValueFromTerraform = %T %v, want the same PublicKeyValue back", back, back)
+	}
+	var _ attr.Value = NewPublicKeyNull()
+	if !NewPublicKeyNull().IsNull() {
+		t.Error("NewPublicKeyNull must be null")
+	}
 }

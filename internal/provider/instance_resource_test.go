@@ -16,6 +16,7 @@ package provider
 // gracefully instead of failing on an exec error.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -25,7 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -1359,4 +1364,101 @@ func TestAccInstanceResource_GivingUpSaysHowToRecover(t *testing.T) {
 			},
 		},
 	})
+}
+
+// --- the plan-time checks on ssh_keys (S7, S8) -------------------------------------
+
+func sshKeysListRequest(elements ...types.String) validator.ListRequest {
+	values := make([]attr.Value, len(elements))
+	for i, e := range elements {
+		values[i] = e
+	}
+	return validator.ListRequest{
+		Path:        path.Root("ssh_keys"),
+		ConfigValue: types.ListValueMust(types.StringType, values),
+	}
+}
+
+func keyNames(n ...string) []types.String {
+	out := make([]types.String, len(n))
+	for i, name := range n {
+		out[i] = types.StringValue(name)
+	}
+	return out
+}
+
+func TestSSHKeyCountValidator(t *testing.T) {
+	ctx := context.Background()
+	many := func(n int) []types.String {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("k%d", i)
+		}
+		return keyNames(out...)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		req     validator.ListRequest
+		wantErr bool
+	}{
+		{"none", sshKeysListRequest(), false},
+		{"one", sshKeysListRequest(many(1)...), false},
+		{"ten", sshKeysListRequest(many(10)...), false},
+		{"eleven", sshKeysListRequest(many(11)...), true},
+		{"unknown elements still count", sshKeysListRequest(append(many(10), types.StringUnknown())...), true},
+		{"a null list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListNull(types.StringType)}, false},
+		{"an unknown list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListUnknown(types.StringType)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp validator.ListResponse
+			sshKeyCountValidator{}.ValidateList(ctx, tc.req, &resp)
+			if resp.Diagnostics.HasError() != tc.wantErr {
+				t.Fatalf("diagnostics = %v, want an error: %v", resp.Diagnostics, tc.wantErr)
+			}
+			if tc.wantErr {
+				d := resp.Diagnostics.Errors()[0]
+				if d.Detail() != "a VM can be given at most 10 SSH keys" {
+					t.Errorf("detail = %q, want the API's own sentence", d.Detail())
+				}
+			}
+		})
+	}
+}
+
+func TestSSHKeyUniqueValidator(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		req  validator.ListRequest
+		want []string // the names reported, each once
+	}{
+		{"none", sshKeysListRequest(), nil},
+		{"all different", sshKeysListRequest(keyNames("a", "b", "c")...), nil},
+		{"one twice", sshKeysListRequest(keyNames("a", "b", "a")...), []string{"a"}},
+		{"one three times is reported once", sshKeysListRequest(keyNames("a", "a", "a")...), []string{"a"}},
+		{"two names twice", sshKeysListRequest(keyNames("a", "b", "b", "a")...), []string{"a", "b"}},
+		{"case differs", sshKeysListRequest(keyNames("a", "A")...), nil},
+		{"unknown elements are not the same name", sshKeysListRequest(types.StringUnknown(), types.StringUnknown()), nil},
+		{"null elements are not the same name", sshKeysListRequest(types.StringNull(), types.StringNull()), nil},
+		{"a null list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListNull(types.StringType)}, nil},
+		{"an unknown list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListUnknown(types.StringType)}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp validator.ListResponse
+			sshKeyUniqueValidator{}.ValidateList(ctx, tc.req, &resp)
+			var got []string
+			for _, d := range resp.Diagnostics.Errors() {
+				got = append(got, d.Detail())
+			}
+			var want []string
+			for _, name := range tc.want {
+				want = append(want, fmt.Sprintf("SSH key '%s' is listed more than once", name))
+			}
+			if strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Errorf("errors = %q, want %q", got, want)
+			}
+		})
+	}
 }
