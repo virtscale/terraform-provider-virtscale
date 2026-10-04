@@ -95,10 +95,9 @@ A configuration with an instance and a public IP associated to it needs both `co
 `network:write`.
 
 `compute:write` covers every `compute.*` and `operation.*` permission, reads included (SSH keys are
-`compute.ssh_key.*`); `network:write` covers
-every `network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`). The `:read` scopes cover the
-`.read` and `.list` permissions of their family. The older all-family scopes also work: `write` for everything
-above, `read` for plan-only use.
+`compute.ssh_key.*`); `network:write` covers every `network.*` and `edge.*` permission (public IPs are
+`edge.public_ip.*`). The `:read` scopes cover the `.read` and `.list` permissions of their family. The older
+all-family scopes also work: `write` for everything above, `read` for plan-only use.
 
 A key can also carry network limits (allowed CIDRs). A request from an address outside them is refused with
 `403 source_address_not_allowed`.
@@ -267,7 +266,9 @@ Unit tests (client package) run with plain `go test`. Provider and resource test
 tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
 `TF_ACC=1` and `tofu` on `PATH`. The fake is written from the deployed API's spec and handlers
 (s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
-own types, so a wrong field name or status in the client fails a test instead of being mirrored back:
+own types, so a wrong field name or status in the client fails a test instead of being mirrored back. Its SSH-key
+routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
+parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made:
 
 ```bash
 TF_ACC=1 \
