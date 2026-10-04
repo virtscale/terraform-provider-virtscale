@@ -43,7 +43,17 @@ type fakeAPI struct {
 
 	// idem is the Idempotency-Key store of the VM create (db/idempotency.py):
 	// same key and same body replays the stored response.
-	idem map[string]*idemRecord
+	idem         map[string]*idemRecord
+	idemKeysSeen []string
+
+	// keys maps an API key to the scopes it was issued; sourceDenied makes
+	// every authenticated request fail the key's allowed_cidrs check.
+	keys         map[string][]string
+	sourceDenied bool
+
+	// faults are injected failures, served in order of registration.
+	faults       []*fakeFault
+	faultsServed int
 
 	publicIPs        map[string]*fakePublicIP
 	pubIPCreateCount int
@@ -149,6 +159,14 @@ type fakeVm struct {
 	deletedAt *time.Time
 }
 
+// fakeFault is one injected failure.
+type fakeFault struct {
+	match     func(*http.Request) bool
+	respond   func(*reqCtx)
+	after     bool // process the request first, then replace the answer
+	remaining int
+}
+
 // idemRecord is one stored Idempotency-Key answer.
 type idemRecord struct {
 	payloadHash string
@@ -186,6 +204,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		org:            org,
 		vms:            make(map[string]*fakeVm),
 		idem:           make(map[string]*idemRecord),
+		keys:           map[string][]string{apiKey: {"compute:write", "network:write"}},
 		nextOctet:      10,
 		publicIPs:      make(map[string]*fakePublicIP),
 		pubIPNextOctet: 10,
@@ -257,6 +276,68 @@ func (f *fakeAPI) SetPublicIPQuota(n int) {
 	f.publicIPQuota = n
 }
 
+// AddKey registers another API key with the given scopes. The fake's own
+// apiKey holds compute:write and network:write, which is what the provider
+// needs for every resource it has (README, "API key scopes").
+func (f *fakeAPI) AddKey(key string, scopes ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keys[key] = append([]string(nil), scopes...)
+}
+
+// DenySourceAddress makes every authenticated request answer 403
+// source_address_not_allowed, as a key whose allowed_cidrs exclude the caller.
+func (f *fakeAPI) DenySourceAddress() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sourceDenied = true
+}
+
+// FailNext answers the next n requests matching match with respond, without
+// processing them (a proxy or rate limiter in front of the API).
+func (f *fakeAPI) FailNext(n int, match func(*http.Request) bool, respond func(*reqCtx)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = append(f.faults, &fakeFault{match: match, respond: respond, remaining: n})
+}
+
+// FailNextAfterHandling processes the next n requests matching match and then
+// answers with respond instead: the response was lost.
+func (f *fakeAPI) FailNextAfterHandling(n int, match func(*http.Request) bool, respond func(*reqCtx)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = append(f.faults, &fakeFault{match: match, respond: respond, after: true, remaining: n})
+}
+
+// FaultsServed reports how many injected failures have been served.
+func (f *fakeAPI) FaultsServed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.faultsServed
+}
+
+// IdempotencyKeys lists the Idempotency-Key of every create that reached the API.
+func (f *fakeAPI) IdempotencyKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.idemKeysSeen...)
+}
+
+// takeFault returns the first registered fault matching r that has failures
+// left, consuming one.
+func (f *fakeAPI) takeFault(r *http.Request) *fakeFault {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, fault := range f.faults {
+		if fault.remaining > 0 && fault.match(r) {
+			fault.remaining--
+			f.faultsServed++
+			return fault
+		}
+	}
+	return nil
+}
+
 // Vanish removes vm id from the store entirely, so the next GetVm returns a
 // genuine 404 -- unlike deleteVm, which retains the vm in state "deleted".
 // It simulates an out-of-band deletion.
@@ -271,10 +352,11 @@ func (f *fakeAPI) Vanish(id string) {
 // reqCtx is one request in flight: it knows its own request id, which every
 // response (success or problem) carries, like the real API's X-Request-ID.
 type reqCtx struct {
-	f   *fakeAPI
-	w   http.ResponseWriter
-	r   *http.Request
-	rid string
+	f      *fakeAPI
+	w      http.ResponseWriter
+	r      *http.Request
+	rid    string
+	scopes []string // the authenticated key's scopes
 }
 
 func (f *fakeAPI) newReqCtx(w http.ResponseWriter, r *http.Request) *reqCtx {
@@ -382,7 +464,69 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 
 func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	rc := f.newReqCtx(w, r)
+	if fault := f.takeFault(r); fault != nil {
+		if fault.after {
+			f.serve(&reqCtx{f: f, w: httptest.NewRecorder(), r: r, rid: rc.rid})
+		}
+		fault.respond(rc)
+		return
+	}
+	f.serve(rc)
+}
 
+// routePermissions is ROUTE_PERMISSIONS (permissions.py) restricted to the
+// routes this fake serves.
+var routePermissions = map[string]string{
+	"POST compute/vms":                                    "compute.instance.create",
+	"GET compute/vms/{vm_id}":                             "compute.instance.read",
+	"DELETE compute/vms/{vm_id}":                          "compute.instance.delete",
+	"GET compute/images":                                  "compute.instance.list",
+	"GET compute/public-ips":                              "edge.public_ip.read",
+	"POST compute/public-ips":                             "edge.public_ip.allocate",
+	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
+	"POST compute/public-ips/{public_ip_id}/associate":    "edge.public_ip.allocate",
+	"POST compute/public-ips/{public_ip_id}/disassociate": "edge.public_ip.release",
+}
+
+// scopeGrants is SCOPE_PERMISSIONS (permissions.py): the legacy read and write
+// scopes, and the family bundles compute:* (compute. and operation.) and
+// network:* (network. and edge.), each also carrying org.read.
+func scopeGrants(scope, perm string) bool {
+	isRead := strings.HasSuffix(perm, ".read") || strings.HasSuffix(perm, ".list")
+	switch scope {
+	case "write":
+		return !strings.HasPrefix(perm, "iam.")
+	case "read":
+		return !strings.HasPrefix(perm, "iam.") && isRead
+	case "compute:read", "compute:write", "network:read", "network:write":
+		if perm == "org.read" {
+			return true
+		}
+		family, half, _ := strings.Cut(scope, ":")
+		prefixes := []string{"compute.", "operation."}
+		if family == "network" {
+			prefixes = []string{"network.", "edge."}
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(perm, prefix) {
+				return half == "write" || isRead
+			}
+		}
+	}
+	return false
+}
+
+func (rc *reqCtx) allows(perm string) bool {
+	for _, scope := range rc.scopes {
+		if scopeGrants(scope, perm) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeAPI) serve(rc *reqCtx) {
+	r := rc.r
 	orgRaw, rest, ok := splitOrgPath(r.URL.Path)
 	if !ok {
 		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
@@ -407,6 +551,23 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	// organization that does not exist (deps.py: 404 not_found).
 	if orgRaw != f.org {
 		rc.notFound("organization")
+		return
+	}
+	// A key restricted to other networks is refused once it has proved to be a
+	// valid key of this organization (deps.py _principal_from_api_token).
+	f.mu.Lock()
+	denied := f.sourceDenied
+	f.mu.Unlock()
+	if denied {
+		rc.problem(http.StatusForbidden, "source_address_not_allowed", "Forbidden",
+			"this API token cannot be used from this network address")
+		return
+	}
+	// Then the permission (require_permission), before anything about the
+	// request itself is validated.
+	if perm := routePermissions[route]; perm != "" && !rc.allows(perm) {
+		rc.problem(http.StatusForbidden, "permission_denied", "Forbidden",
+			"this credential does not carry the '"+perm+"' permission")
 		return
 	}
 	// Path parameters are validated with the rest of the request, after the
@@ -442,10 +603,15 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 // 401 ("one message for unparseable / unknown / wrong secret / revoked /
 // expired").
 func (f *fakeAPI) authenticate(rc *reqCtx) bool {
-	if rc.r.Header.Get("Authorization") != "Bearer "+f.apiKey {
+	key, found := strings.CutPrefix(rc.r.Header.Get("Authorization"), "Bearer ")
+	f.mu.Lock()
+	scopes, ok := f.keys[key]
+	f.mu.Unlock()
+	if !found || !ok {
 		rc.problem(http.StatusUnauthorized, "unauthorized", "Unauthorized", "the presented API token is not valid")
 		return false
 	}
+	rc.scopes = scopes
 	return true
 }
 
@@ -671,6 +837,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 	key := rc.r.Header.Get("Idempotency-Key")
 	var digest string
 	if key != "" {
+		f.idemKeysSeen = append(f.idemKeysSeen, key)
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%+v", req)))
 		digest = hex.EncodeToString(sum[:])
 		if rec, ok := f.idem[key]; ok {
@@ -1842,5 +2009,179 @@ func TestFakeAPI_PublicIPQuotaIsPerRegionAndIgnoresErrorRows(t *testing.T) {
 	settleIP(t, f, first, "error")
 	if id := allocateIPVia(t, f, "gro"); id == "" {
 		t.Error("an error row must not count against the quota")
+	}
+}
+
+// --- keys, scopes and refusals (deps.py, permissions.py) --------------------
+
+func TestFakeAPI_KeyScopesGatePermissions(t *testing.T) {
+	f := newFakeAPI(t, "full-key", testOrgID)
+	f.AddKey("compute-read", "compute:read")
+	f.AddKey("compute-write", "compute:write")
+	f.AddKey("network-write", "network:write")
+	f.AddKey("read-halves", "compute:read", "network:read")
+	f.AddKey("legacy-read", "read")
+	f.AddKey("legacy-write", "write")
+
+	vmPath := vmsPath(testOrgID) + "/" + testSomeUUID
+	ips := ipsPath(testOrgID)
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+	denied := func(perm string) string { return "this credential does not carry the '" + perm + "' permission" }
+
+	type call struct {
+		method, path, body string
+		perm               string // permission the route needs
+	}
+	create := call{http.MethodPost, vmsPath(testOrgID), testValidVmJS, "compute.instance.create"}
+	getVm := call{http.MethodGet, vmPath, "", "compute.instance.read"}
+	delVm := call{http.MethodDelete, vmPath, "", "compute.instance.delete"}
+	listImages := call{http.MethodGet, images, "", "compute.instance.list"}
+	listIPs := call{http.MethodGet, ips, "", "edge.public_ip.read"}
+	allocate := call{http.MethodPost, ips, `{"region_id":"gro"}`, "edge.public_ip.allocate"}
+	associate := call{http.MethodPost, ips + "/" + testSomeUUID + "/associate", `{"vm_id":"` + testSomeUUID + `"}`, "edge.public_ip.allocate"}
+	disassociate := call{http.MethodPost, ips + "/" + testSomeUUID + "/disassociate", "", "edge.public_ip.release"}
+	release := call{http.MethodDelete, ips + "/" + testSomeUUID, "", "edge.public_ip.release"}
+
+	cases := []struct {
+		key     string
+		allowed []call
+		refused []call
+	}{
+		{"compute-read", []call{getVm, listImages}, []call{create, delVm, listIPs, allocate, associate, disassociate, release}},
+		{"compute-write", []call{create, getVm, delVm, listImages}, []call{listIPs, allocate, associate, disassociate, release}},
+		{"network-write", []call{listIPs, allocate, associate, disassociate, release}, []call{create, getVm, delVm, listImages}},
+		{"read-halves", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, associate, disassociate, release}},
+		{"legacy-read", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, release}},
+		{"legacy-write", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
+		{"full-key", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
+	}
+	for _, tc := range cases {
+		for _, c := range tc.refused {
+			status, _, body := fakeHTTP(t, f, tc.key, c.method, c.path, c.body)
+			p := decodeObject(t, body)
+			if status != http.StatusForbidden || p["code"] != "permission_denied" || p["detail"] != denied(c.perm) || p["title"] != "Forbidden" {
+				t.Errorf("%s %s %s: %d %v %v, want 403 permission_denied naming %s", tc.key, c.method, c.path, status, p["code"], p["detail"], c.perm)
+			}
+		}
+		for _, c := range tc.allowed {
+			status, _, body := fakeHTTP(t, f, tc.key, c.method, c.path, c.body)
+			if status == http.StatusForbidden || status == http.StatusUnauthorized {
+				t.Errorf("%s %s %s: %d, want the request to pass the permission check (%s)", tc.key, c.method, c.path, status, body)
+			}
+		}
+	}
+
+	// The order of the gates: the credential, then the org boundary, then the
+	// permission, then the body -- so a read-only key posting garbage is told
+	// it may not post, and a foreign org is 404 whatever the key holds.
+	status, _, _ := fakeHTTP(t, f, "compute-read", http.MethodPost, vmsPath(testOrgID), `{"bogus":1}`)
+	if status != http.StatusForbidden {
+		t.Errorf("permission before body validation: status = %d, want 403", status)
+	}
+	status, _, _ = fakeHTTP(t, f, "compute-read", http.MethodPost, vmsPath(testOtherOrg), testValidVmJS)
+	if status != http.StatusNotFound {
+		t.Errorf("foreign org with a limited key: status = %d, want 404", status)
+	}
+}
+
+func TestFakeAPI_SourceAddressRestriction(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.DenySourceAddress()
+
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodGet, images, "")
+	p := decodeObject(t, body)
+	if status != http.StatusForbidden || p["code"] != "source_address_not_allowed" ||
+		p["detail"] != "this API token cannot be used from this network address" || p["title"] != "Forbidden" {
+		t.Errorf("restricted key: %d %v %v, want 403 source_address_not_allowed", status, p["code"], p["detail"])
+	}
+	// The credential is checked first: a wrong key learns nothing about the restriction.
+	if status, _, _ := fakeHTTP(t, f, "wrong-key", http.MethodGet, images, ""); status != http.StatusUnauthorized {
+		t.Errorf("wrong key: status = %d, want 401", status)
+	}
+}
+
+func matchAny(*http.Request) bool { return true }
+
+func matchMethod(method string) func(*http.Request) bool {
+	return func(r *http.Request) bool { return r.Method == method }
+}
+
+// respondThrottle is the deployed 429 (middleware/rate_limit.py).
+func respondThrottle(retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		rc.problem(http.StatusTooManyRequests, "rate_limited", "Too Many Requests",
+			"too many requests for this organization; wait for the duration in the Retry-After header before retrying")
+	}
+}
+
+// respondGateway is what a proxy in front of the API answers: not problem+json.
+func respondGateway(status int) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Content-Type", "text/html")
+		rc.w.WriteHeader(status)
+		_, _ = rc.w.Write([]byte("<html><body>" + http.StatusText(status) + "</body></html>"))
+	}
+}
+
+// respondDrop closes the connection without a response: a transport error.
+func respondDrop(rc *reqCtx) {
+	if hj, ok := rc.w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func TestFakeAPI_FaultInjection(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+
+	f.FailNext(2, matchAny, respondThrottle("1"))
+	for i := 0; i < 2; i++ {
+		status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodGet, images, "")
+		p := decodeObject(t, body)
+		if status != http.StatusTooManyRequests || hdr.Get("Retry-After") != "1" ||
+			p["code"] != "rate_limited" || p["request_id"] == "" {
+			t.Fatalf("throttled request %d: %d %q %v", i, status, hdr.Get("Retry-After"), p["code"])
+		}
+	}
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodGet, images, ""); status != http.StatusOK {
+		t.Errorf("after the injected failures: status = %d, want 200", status)
+	}
+	if f.FaultsServed() != 2 {
+		t.Errorf("FaultsServed = %d, want 2", f.FaultsServed())
+	}
+
+	// "After handling": the request is processed, the answer is replaced. The
+	// vm exists although the caller saw a 502, which is what makes a retry of
+	// a create without an Idempotency-Key dangerous.
+	f.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGateway(502))
+	status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "k1")
+	if status != http.StatusBadGateway {
+		t.Fatalf("lost response: status = %d, want 502", status)
+	}
+	if f.CreateCount() != 1 {
+		t.Errorf("CreateCount = %d, want 1: the create was processed before the response was lost", f.CreateCount())
+	}
+	status, _, _ = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "k1")
+	if status != http.StatusAccepted || f.CreateCount() != 1 {
+		t.Errorf("retry with the same key: status %d, creates %d, want the replayed 202 and still 1 create", status, f.CreateCount())
+	}
+	if keys := f.IdempotencyKeys(); len(keys) != 2 || keys[0] != "k1" || keys[1] != "k1" {
+		t.Errorf("IdempotencyKeys = %v, want [k1 k1]", keys)
+	}
+
+	// A dropped connection is a transport error for the caller. A fresh
+	// connection is used on purpose: net/http silently re-sends an idempotent
+	// request when a *reused* keep-alive connection dies before any response.
+	f.FailNext(1, matchAny, respondDrop)
+	req, _ := http.NewRequest(http.MethodGet, f.URL()+images, nil)
+	req.Header.Set("Authorization", "Bearer good-key")
+	fresh := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	if resp, err := fresh.Do(req); err == nil {
+		resp.Body.Close()
+		t.Error("a dropped connection must surface as a transport error")
 	}
 }
