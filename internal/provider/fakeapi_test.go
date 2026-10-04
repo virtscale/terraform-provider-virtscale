@@ -1,6 +1,9 @@
 package provider
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,6 +40,10 @@ type fakeAPI struct {
 	vmSeq       int
 	opSeq       int
 	reqSeq      int
+
+	// idem is the Idempotency-Key store of the VM create (db/idempotency.py):
+	// same key and same body replays the stored response.
+	idem map[string]*idemRecord
 
 	publicIPs        map[string]*fakePublicIP
 	pubIPCreateCount int
@@ -130,6 +137,21 @@ type wireFieldError struct {
 // knows.
 type fakeVm struct {
 	wireVmOut
+
+	// inFlight is true while an operation (the create, then a delete) is
+	// converging the row: uq_operations_one_in_flight allows one per resource.
+	inFlight bool
+	// deletedAt is the soft-delete tombstone the executor writes together with
+	// state=deleted; a row carrying it reads as absent.
+	deletedAt *time.Time
+}
+
+// idemRecord is one stored Idempotency-Key answer.
+type idemRecord struct {
+	payloadHash string
+	status      int
+	body        []byte
+	location    string
 }
 
 // fakePublicIP is one public IP row.
@@ -160,6 +182,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		apiKey:         apiKey,
 		org:            org,
 		vms:            make(map[string]*fakeVm),
+		idem:           make(map[string]*idemRecord),
 		nextOctet:      10,
 		publicIPs:      make(map[string]*fakePublicIP),
 		pubIPNextOctet: 10,
@@ -260,6 +283,17 @@ func (rc *reqCtx) json(status int, v any, headers ...string) {
 	}
 	rc.w.WriteHeader(status)
 	_ = json.NewEncoder(rc.w).Encode(v)
+}
+
+// raw writes an already-encoded success body (an idempotent replay).
+func (rc *reqCtx) raw(status int, body []byte, headers ...string) {
+	rc.w.Header().Set("Content-Type", "application/json")
+	rc.w.Header().Set("X-Request-ID", rc.rid)
+	for i := 0; i+1 < len(headers); i += 2 {
+		rc.w.Header().Set(headers[i], headers[i+1])
+	}
+	rc.w.WriteHeader(status)
+	_, _ = rc.w.Write(body)
 }
 
 const problemTypeBase = "https://docs.virtscale.nl/s3/problems/"
@@ -477,6 +511,19 @@ func (b *bodyCheck) str(name string, required bool, minLen, maxLen int) string {
 	return s
 }
 
+func (b *bodyCheck) nullableStr(name string) *string {
+	raw, ok := b.present(name, false)
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		b.fail(name, "Input should be a valid string")
+		return nil
+	}
+	return &s
+}
+
 func (b *bodyCheck) uuid(name string, required bool) string {
 	s := b.str(name, required, 0, 0)
 	if s != "" && !anyUUIDRE.MatchString(s) {
@@ -531,9 +578,10 @@ func (b *bodyCheck) finish() []wireFieldError {
 // --- VM handlers -----------------------------------------------------------
 
 type vmCreateIn struct {
-	Name, Image, StoragePool, Region, NetworkProfile string
-	VCPUs, MemoryMB, DiskGB                          int
-	SSHKeys                                          []string
+	Name, Image, StoragePool, Region, NetworkProfile, WorkloadType string
+	VCPUs, MemoryMB, DiskGB                                        int
+	SSHKeys                                                        []string
+	UserData                                                       *string
 }
 
 func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
@@ -547,7 +595,12 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 		StoragePool:    b.str("storage_pool", true, 0, 0),
 		Region:         b.str("region", true, 0, 0),
 		NetworkProfile: b.str("network_profile", true, 0, 0),
+		WorkloadType:   b.str("workload_type", false, 0, 0),
 		SSHKeys:        b.strList("ssh_keys"),
+		UserData:       b.nullableStr("user_data"),
+	}
+	if in.WorkloadType == "" {
+		in.WorkloadType = "customer"
 	}
 	return in, b.finish()
 }
@@ -570,26 +623,82 @@ func (f *fakeAPI) operationLocation(op wireOperationRef) string {
 	return "/v1/orgs/" + f.org + "/operations/" + op.ID
 }
 
+// vmNameRE is naming.py's NAME_RE: a DNS label, 1-63 characters.
+var vmNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// canonicalVmName is naming.py canonical_name: trimmed, lower-cased, a
+// trailing .virtscale.nl stripped, then it must be a DNS label.
+func canonicalVmName(raw string) (string, bool) {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".virtscale.nl")
+	return name, vmNameRE.MatchString(name)
+}
+
+const (
+	detailOperationInFlightVm = "another operation is already running for this VM; wait for it to finish and retry"
+	detailUserDataUnsupported = "user_data is not accepted: the instance is built asynchronously, so cloud-init would " +
+		"have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, " +
+		"so where such a payload may live is still an open design question"
+)
+
+// createVm follows compute.py create_vm's gate order: body validation, then
+// user_data (before the key is claimed), then the Idempotency-Key claim, then
+// create_vm_request's own checks.
 func (f *fakeAPI) createVm(rc *reqCtx) {
 	req, errs := decodeVmCreate(rc.r.Body)
 	if len(errs) > 0 {
 		rc.invalid(errs...)
 		return
 	}
+	if req.UserData != nil {
+		rc.unprocessable("user_data_unsupported", detailUserDataUnsupported)
+		return
+	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	key := rc.r.Header.Get("Idempotency-Key")
+	var digest string
+	if key != "" {
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%+v", req)))
+		digest = hex.EncodeToString(sum[:])
+		if rec, ok := f.idem[key]; ok {
+			if rec.payloadHash != digest {
+				rc.conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+				return
+			}
+			rc.raw(rec.status, rec.body, "Location", rec.location)
+			return
+		}
+	}
+
+	name, ok := canonicalVmName(req.Name)
+	if !ok {
+		rc.unprocessable("invalid_name", "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'")
+		return
+	}
+	if len(req.SSHKeys) > 1 {
+		rc.unprocessable("too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use")
+		return
+	}
+	if req.WorkloadType != "customer" {
+		if req.WorkloadType != "infra" {
+			rc.unprocessable("invalid_spec", "workload_type must be one of: infra, customer")
+			return
+		}
+		rc.unprocessable("workload_not_allowed", "a customer account cannot request infra workloads")
+		return
+	}
 	for _, existing := range f.vms {
-		if existing.Name == req.Name && existing.RegionID == req.Region && existing.State != "deleted" {
-			rc.conflict("name_taken", fmt.Sprintf("a VM named %q already exists in %s", req.Name, req.Region))
+		if existing.Name == name && existing.RegionID == req.Region && existing.deletedAt == nil {
+			rc.conflict("name_taken", fmt.Sprintf("a VM named '%s' already exists in %s", name, req.Region))
 			return
 		}
 	}
 
 	f.createCount++
 	f.vmSeq++
-	f.lastIdemKey = rc.r.Header.Get("Idempotency-Key")
+	f.lastIdemKey = key
 
 	id := fakeUUID(1, f.vmSeq)
 	now := time.Now().UTC()
@@ -603,55 +712,85 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		glanceID = req.Image + "-glance-uuid"
 	}
 
-	vm := &fakeVm{wireVmOut{
-		ID:               id,
-		OrgID:            f.org,
-		RegionID:         req.Region,
-		Name:             req.Name,
-		Image:            wireImageRef{GlanceID: glanceID, Name: req.Image},
-		VCPUs:            req.VCPUs,
-		MemoryMB:         req.MemoryMB,
-		DiskGB:           req.DiskGB,
-		StoragePoolID:    req.StoragePool,
-		WorkloadType:     "customer",
-		NetworkProfileID: req.NetworkProfile,
-		State:            "pending",
-		DesiredState:     "running",
-		SSHKeyNames:      req.SSHKeys,
-		AllowedActions:   allVmActions,
-		CreatedAt:        now,
-		UpdatedAt:        now,
-	}}
+	vm := &fakeVm{
+		wireVmOut: wireVmOut{
+			ID:               id,
+			OrgID:            f.org,
+			RegionID:         req.Region,
+			Name:             name,
+			Image:            wireImageRef{GlanceID: glanceID, Name: req.Image},
+			VCPUs:            req.VCPUs,
+			MemoryMB:         req.MemoryMB,
+			DiskGB:           req.DiskGB,
+			StoragePoolID:    req.StoragePool,
+			WorkloadType:     "customer",
+			NetworkProfileID: req.NetworkProfile,
+			State:            "pending",
+			DesiredState:     "running",
+			SSHKeyNames:      req.SSHKeys,
+			AllowedActions:   allVmActions,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		},
+		inFlight: true,
+	}
 	f.vms[id] = vm
 
 	op := f.newOperation("vm.create", "vm", id, now)
-	rc.json(http.StatusAccepted, map[string]any{"vm": vm.wireVmOut, "operation": op},
-		"Location", f.operationLocation(op))
+	payload := map[string]any{"vm": vm.wireVmOut, "operation": op}
+	location := f.operationLocation(op)
+	if key != "" {
+		body, _ := json.Marshal(payload)
+		f.idem[key] = &idemRecord{
+			payloadHash: digest,
+			status:      http.StatusAccepted,
+			body:        append(body, '\n'),
+			location:    location,
+		}
+	}
+	rc.json(http.StatusAccepted, payload, "Location", location)
 }
 
+// getVm: "a foreign row and a soft-deleted row both read as absent"
+// (compute.py get_vm). The read that moves a deleting vm to deleted therefore
+// answers 404 at once, as the real GET does once the executor has committed.
 func (f *fakeAPI) getVm(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	vm, ok := f.vms[id]
-	if !ok {
+	if !ok || vm.deletedAt != nil {
 		rc.notFound("vm")
 		return
 	}
 
 	f.advance(vm)
+	if vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
 	rc.json(http.StatusOK, vm.wireVmOut)
 }
 
-// advance moves vm one step through pending -> provisioning -> running (or
-// -> error, for a name starting with "fail-"), and deleting -> deleted. It
-// is a no-op in any terminal state, so repeated GETs after convergence are
-// stable.
+// advance moves vm one step the way the executor does: pending ->
+// provisioning -> running (or -> error, for a name starting with "fail-");
+// and, once a delete has set desired_state=deleted, -> deleting -> deleted
+// with the tombstone. It is a no-op in any other state, so repeated GETs after
+// convergence are stable.
 func (f *fakeAPI) advance(vm *fakeVm) {
-	switch vm.State {
-	case "pending":
+	switch {
+	case vm.State == "deleting":
+		vm.State = "deleted"
+		now := time.Now().UTC()
+		vm.deletedAt = &now
+		vm.inFlight = false
+		vm.ErrorClass, vm.ErrorDetail = nil, nil
+	case vm.DesiredState == "deleted":
+		vm.State = "deleting"
+	case vm.State == "pending":
 		vm.State = "provisioning"
-	case "provisioning":
+	case vm.State == "provisioning":
+		vm.inFlight = false
 		if strings.HasPrefix(vm.Name, "fail-") {
 			errClass := "build_failed"
 			errDetail := "the cloud could not build this instance"
@@ -674,23 +813,31 @@ func (f *fakeAPI) advance(vm *fakeVm) {
 			observed := time.Now().UTC()
 			vm.ObservedAt = &observed
 		}
-	case "deleting":
-		vm.State = "deleted"
 	}
 	vm.UpdatedAt = time.Now().UTC()
 }
 
+// deleteVm declares desired_state=deleted and queues the teardown; state is
+// left alone (the executor commits deleting itself). One operation per
+// resource: a delete while the create or an earlier delete is still running is
+// 409 operation_in_flight, and a vm that is gone is 404 (vms.py
+// delete_vm_request).
 func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	vm, ok := f.vms[id]
-	if !ok {
+	if !ok || vm.deletedAt != nil {
 		rc.notFound("vm")
 		return
 	}
+	if vm.inFlight {
+		rc.conflict("operation_in_flight", detailOperationInFlightVm)
+		return
+	}
 
-	vm.State = "deleting"
+	vm.DesiredState = "deleted"
+	vm.inFlight = true
 	vm.UpdatedAt = time.Now().UTC()
 
 	op := f.newOperation("vm.delete", "vm", id, time.Now().UTC())
@@ -946,56 +1093,6 @@ func doCreate(t *testing.T, f *fakeAPI, body string) int {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode
-}
-
-func TestFakeAPI_DeleteThenGetShowsDeleted(t *testing.T) {
-	f := newFakeAPI(t, "good-key", testOrgID)
-
-	body := `{"name":"to-delete","image":"img","vcpus":1,"memory_mb":256,"disk_gb":10,"storage_pool":"pool","region":"gro","network_profile":"net"}`
-	if status := doCreate(t, f, body); status != http.StatusAccepted {
-		t.Fatalf("create: expected 202, got %d", status)
-	}
-
-	if f.CreateCount() != 1 {
-		t.Fatalf("expected create count 1, got %d", f.CreateCount())
-	}
-
-	id := fakeUUID(1, 1)
-
-	req, err := http.NewRequest(http.MethodDelete, f.URL()+"/v1/orgs/"+f.org+"/compute/vms/"+id, nil)
-	if err != nil {
-		t.Fatalf("build delete request: %v", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+f.apiKey)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("do delete: %v", err)
-	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("delete: expected 202, got %d", resp.StatusCode)
-	}
-
-	state, ok := f.VmState(id)
-	if !ok || state != "deleting" {
-		t.Fatalf("expected state deleting after delete, got %q (ok=%v)", state, ok)
-	}
-
-	getReq, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/"+f.org+"/compute/vms/"+id, nil)
-	if err != nil {
-		t.Fatalf("build get request: %v", err)
-	}
-	getReq.Header.Set("Authorization", "Bearer "+f.apiKey)
-	getResp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		t.Fatalf("do get: %v", err)
-	}
-	getResp.Body.Close()
-
-	state, ok = f.VmState(id)
-	if !ok || state != "deleted" {
-		t.Fatalf("expected state deleted after get, got %q (ok=%v)", state, ok)
-	}
 }
 
 // --- Contract tests of the fake against the 94f5021f customer API ----------
@@ -1312,3 +1409,222 @@ func TestFakeAPI_ImagesRequireRegionAs400(t *testing.T) {
 		t.Errorf("problem = %v errors = %v, want invalid_request naming region", p["code"], p["errors"])
 	}
 }
+
+// createVmVia posts a create and returns the decoded {vm, operation} body.
+func createVmVia(t *testing.T, f *fakeAPI, key, body string, extra ...string) jsonObject {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodPost, vmsPath(f.org), body, extra...)
+	if status != http.StatusAccepted {
+		t.Fatalf("create: status = %d, want 202 (%s)", status, resp)
+	}
+	return jsonObject(decodeObject(t, resp))
+}
+
+func getVmVia(t *testing.T, f *fakeAPI, key, id string) (int, map[string]any) {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodGet, vmsPath(f.org)+"/"+id, "")
+	if status == http.StatusOK {
+		return status, decodeObject(t, resp)
+	}
+	return status, decodeObject(t, resp)
+}
+
+func deleteVmVia(t *testing.T, f *fakeAPI, key, id string) (int, map[string]any) {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodDelete, vmsPath(f.org)+"/"+id, "")
+	return status, decodeObject(t, resp)
+}
+
+// runVm polls a freshly created vm until it is running, as a waiter would.
+func runVm(t *testing.T, f *fakeAPI, key, id string) {
+	t.Helper()
+	for i := 0; i < 5; i++ {
+		_, vm := getVmVia(t, f, key, id)
+		if vm["state"] == "running" {
+			return
+		}
+	}
+	t.Fatalf("vm %s never reached running", id)
+}
+
+// TestFakeAPI_DeleteFlowEndsIn404 pins what a delete looks like from outside
+// (compute.py delete_vm, executors/compute.py): the 202 body still shows the
+// old state with desired_state=deleted, then the executor commits deleting,
+// then state=deleted together with deleted_at -- and a soft-deleted row reads
+// as absent, so the GET that would have shown "deleted" is a 404.
+func TestFakeAPI_DeleteFlowEndsIn404(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS)["vm"].(map[string]any)["id"].(string)
+	runVm(t, f, "good-key", id)
+
+	status, body := deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusAccepted {
+		t.Fatalf("delete: status = %d, want 202 (%v)", status, body)
+	}
+	vm, op := body["vm"].(map[string]any), body["operation"].(map[string]any)
+	if vm["state"] != "running" || vm["desired_state"] != "deleted" {
+		t.Errorf("202 body vm state/desired = %v/%v, want running/deleted (state is not moved by the delete)", vm["state"], vm["desired_state"])
+	}
+	if op["type"] != "vm.delete" {
+		t.Errorf("operation type = %v, want vm.delete", op["type"])
+	}
+
+	status, got := getVmVia(t, f, "good-key", id)
+	if status != http.StatusOK || got["state"] != "deleting" {
+		t.Fatalf("first GET after delete: status %d state %v, want 200 deleting", status, got["state"])
+	}
+	status, got = getVmVia(t, f, "good-key", id)
+	if status != http.StatusNotFound || got["code"] != "not_found" {
+		t.Fatalf("GET of a deleted vm: status %d code %v, want 404 not_found", status, got["code"])
+	}
+	if state, ok := f.VmState(id); !ok || state != "deleted" {
+		t.Errorf("the fake keeps the row for inspection: VmState = %q ok=%v, want deleted", state, ok)
+	}
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusNotFound {
+		t.Errorf("delete of a gone vm: status = %d, want 404", status)
+	}
+}
+
+// TestFakeAPI_SecondDeleteIs409OperationInFlight pins uq_operations_one_in_flight:
+// one operation per resource, so a second request while one runs is a 409 --
+// during the create as much as during a delete.
+func TestFakeAPI_SecondDeleteIs409OperationInFlight(t *testing.T) {
+	const detail = "another operation is already running for this VM; wait for it to finish and retry"
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS)["vm"].(map[string]any)["id"].(string)
+
+	status, p := deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusConflict || p["code"] != "operation_in_flight" || p["detail"] != detail {
+		t.Fatalf("delete during create: %d %v %v, want 409 operation_in_flight", status, p["code"], p["detail"])
+	}
+
+	runVm(t, f, "good-key", id)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Fatalf("delete of a running vm: status = %d, want 202", status)
+	}
+	status, p = deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusConflict || p["code"] != "operation_in_flight" || p["detail"] != detail {
+		t.Fatalf("second delete: %d %v %v, want 409 operation_in_flight", status, p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_NamesAreCanonicalisedLikeTheAPI(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	body := func(name string) string {
+		return `{"name":` + fmt.Sprintf("%q", name) + `,"image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`
+	}
+
+	// Lower-cased, trimmed, and a trailing .virtscale.nl stripped (naming.py).
+	vm := createVmVia(t, f, "good-key", body("  Web-01.virtscale.nl ")).get("vm")
+	if vm["name"] != "web-01" {
+		t.Errorf("name = %q, want the canonical web-01", vm["name"])
+	}
+
+	// Anything that is not a DNS label afterwards is 422 invalid_name.
+	for _, bad := range []string{"under_score", "-lead", "trail-", "has space", strings.Repeat("a", 64)} {
+		status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body(bad))
+		p := decodeObject(t, resp)
+		if status != http.StatusUnprocessableEntity || p["code"] != "invalid_name" {
+			t.Errorf("name %q: %d %v, want 422 invalid_name", bad, status, p["code"])
+		}
+		if p["detail"] != "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'" {
+			t.Errorf("name %q: detail = %q", bad, p["detail"])
+		}
+	}
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body(strings.Repeat("a", 63))); status != http.StatusAccepted {
+		t.Errorf("a 63 character name: status = %d, want 202", status)
+	}
+
+	// Uniqueness is on the canonical name, among live vms of the region.
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body("WEB-01"))
+	p := decodeObject(t, resp)
+	if status != http.StatusConflict || p["code"] != "name_taken" || p["detail"] != "a VM named 'web-01' already exists in gro" {
+		t.Errorf("duplicate canonical name: %d %v %v", status, p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_RefusesWhatTheAPIRefuses(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	withExtra := func(extra string) string {
+		return `{"name":"web-01","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n",` + extra + `}`
+	}
+	cases := []struct {
+		name, extra, code, detail string
+	}{
+		{"two ssh keys", `"ssh_keys":["a","b"]`, "too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use"},
+		{"user_data", `"user_data":"#cloud-config"`, "user_data_unsupported", "user_data is not accepted: the instance is built asynchronously, so cloud-init would have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, so where such a payload may live is still an open design question"},
+		{"empty user_data", `"user_data":""`, "user_data_unsupported", ""},
+		{"infra workload", `"workload_type":"infra"`, "workload_not_allowed", "a customer account cannot request infra workloads"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), withExtra(tc.extra))
+			p := decodeObject(t, resp)
+			if status != http.StatusUnprocessableEntity || p["code"] != tc.code {
+				t.Fatalf("%d %v, want 422 %s (%s)", status, p["code"], tc.code, resp)
+			}
+			if tc.detail != "" && p["detail"] != tc.detail {
+				t.Errorf("detail = %q, want %q", p["detail"], tc.detail)
+			}
+		})
+	}
+	if f.CreateCount() != 0 {
+		t.Errorf("refused requests created %d vms", f.CreateCount())
+	}
+
+	// The allowed shapes still work: one keypair name, null user_data, customer workload.
+	vm := createVmVia(t, f, "good-key", withExtra(`"ssh_keys":["k1"],"user_data":null,"workload_type":"customer"`)).get("vm")
+	if names, _ := vm["ssh_key_names"].([]any); len(names) != 1 || names[0] != "k1" {
+		t.Errorf("ssh_key_names = %v, want [k1]", vm["ssh_key_names"])
+	}
+	if vm["user_data_present"] != false {
+		t.Errorf("user_data_present = %v, want false", vm["user_data_present"])
+	}
+}
+
+// TestFakeAPI_IdempotencyKeyReplaysTheStoredResponse pins db/idempotency.py:
+// same key and same body replays the stored 202 (no second vm, same ids);
+// same key and another body is 409 idempotency_key_reused.
+func TestFakeAPI_IdempotencyKeyReplaysTheStoredResponse(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, hdr1, first := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "key-1")
+	if status != http.StatusAccepted {
+		t.Fatalf("first: status = %d (%s)", status, first)
+	}
+	status, hdr2, second := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "key-1")
+	if status != http.StatusAccepted {
+		t.Fatalf("replay: status = %d, want the stored 202 (%s)", status, second)
+	}
+	if string(first) != string(second) {
+		t.Errorf("replayed body differs:\nfirst  %s\nreplay %s", first, second)
+	}
+	if hdr1.Get("Location") != hdr2.Get("Location") || hdr1.Get("Location") == "" {
+		t.Errorf("Location %q vs %q, want the same non-empty value", hdr1.Get("Location"), hdr2.Get("Location"))
+	}
+	if f.CreateCount() != 1 {
+		t.Errorf("CreateCount = %d, want 1: a replay must not build a second vm", f.CreateCount())
+	}
+
+	other := strings.Replace(testValidVmJS, `"vcpus":1`, `"vcpus":2`, 1)
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), other, "Idempotency-Key", "key-1")
+	p := decodeObject(t, resp)
+	if status != http.StatusConflict || p["code"] != "idempotency_key_reused" ||
+		p["detail"] != "this Idempotency-Key was already used with a different request body" {
+		t.Errorf("reused key: %d %v %v, want 409 idempotency_key_reused", status, p["code"], p["detail"])
+	}
+
+	// Without a key the natural uniqueness answers instead.
+	status, _, resp = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS)
+	if status != http.StatusConflict || decodeObject(t, resp)["code"] != "name_taken" {
+		t.Errorf("keyless duplicate: %d, want 409 name_taken (%s)", status, resp)
+	}
+}
+
+// get returns the nested object under key; it exists so tests can chain off
+// createVmVia without a type assertion at every call site.
+type jsonObject map[string]any
+
+func (o jsonObject) get(key string) map[string]any { return o[key].(map[string]any) }
