@@ -16,6 +16,9 @@ import (
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -320,6 +323,28 @@ func TestAccSshKeyResource_ImportByID(t *testing.T) {
 				ImportState:             true,
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{},
+			},
+		},
+	})
+}
+
+// TestAccSshKeyResource_ImportOfAnUnknownIDFails: importing an id that is not
+// in the keystore is refused as a missing object (Read sees the ssh_key 404 and
+// drops it), not as a failure of the API.
+func TestAccSshKeyResource_ImportOfAnUnknownIDFails(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckSshKeyDestroy(t, fake),
+		Steps: []resource.TestStep{
+			{Config: testAccSshKeyConfig(fake, "laptop", testKeyEd25519)},
+			{
+				ResourceName:  sshKeyAddr,
+				ImportState:   true,
+				ImportStateId: testSomeUUID,
+				ExpectError:   wrapSafe("Cannot import non-existent remote object"),
 			},
 		},
 	})
@@ -886,5 +911,30 @@ func TestPublicKeyType_IsAStringTypeWithItsOwnValue(t *testing.T) {
 	var _ attr.Value = NewPublicKeyNull()
 	if !NewPublicKeyNull().IsNull() {
 		t.Error("NewPublicKeyNull must be null")
+	}
+}
+
+// The plan modifier is asked only when the text differs; it says whether the key
+// does too. A value that is not known yet may be another key.
+func TestReplaceWhenTheKeyChanges(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		plan, state types.String
+		want        bool
+	}{
+		{"the same key with a comment", types.StringValue(testKeyEd25519 + " c\n"), types.StringValue(testKeyEd25519), false},
+		{"the same key, spare bits", types.StringValue(withSpareBitsFlipped(t, testKeyECDSA256)), types.StringValue(testKeyECDSA256), false},
+		{"another key", types.StringValue(testKeyOther), types.StringValue(testKeyEd25519), true},
+		{"another key with the old one's comment", types.StringValue(testKeyOther + " " + testKeyEd25519Comment), types.StringValue(testKeyEd25519 + " " + testKeyEd25519Comment), true},
+		{"a text that is no key", types.StringValue("nope"), types.StringValue(testKeyEd25519), true},
+		{"not known yet", types.StringUnknown(), types.StringValue(testKeyEd25519), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp stringplanmodifier.RequiresReplaceIfFuncResponse
+			replaceWhenTheKeyChanges(context.Background(), planmodifier.StringRequest{PlanValue: tc.plan, StateValue: tc.state}, &resp)
+			if resp.RequiresReplace != tc.want || resp.Diagnostics.HasError() {
+				t.Errorf("RequiresReplace = %v (%v), want %v", resp.RequiresReplace, resp.Diagnostics, tc.want)
+			}
+		})
 	}
 }

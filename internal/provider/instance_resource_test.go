@@ -844,6 +844,32 @@ func TestAccInstanceResource_NoSSHKeysStayNull(t *testing.T) {
 	})
 }
 
+// TestAccInstanceResource_AnEmptySSHKeysListStaysEmpty: a configuration that
+// says ssh_keys = [] and an API that returns no names agree: the state keeps the
+// empty list, and the next plan has nothing to change.
+func TestAccInstanceResource_AnEmptySSHKeysListStaysEmpty(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "empty-list", "[]")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "0"),
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
 // TestAccInstanceResource_SSHKeysStayInTheOrderTheyAreConfiguredIn: a
 // deployment that reports ssh_key_names in another order, the same names, is no
 // change. A reordered list read back must not plan the instance's replacement.
