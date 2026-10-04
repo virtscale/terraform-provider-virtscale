@@ -61,7 +61,7 @@ func (r *PublicIpResource) Metadata(_ context.Context, req resource.MetadataRequ
 // replacement; instance_id associates or disassociates the IP in place.
 func (r *PublicIpResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "A VirtScale public IP address. A customer organization's quota is one public IP.",
+		Description: "A VirtScale public IP address. A customer organization's quota is one public IP per region.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,

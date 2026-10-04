@@ -114,6 +114,9 @@ The client retries like the AWS SDK's standard mode, within what this API makes 
   reaches you and the address may exist without being in state: check the panel or `GET .../compute/public-ips`
   and `tofu import` it.
 - A `503` with code `not_ready` (the feature is switched off) is never retried.
+- A `409` with code `idempotency_in_progress` is retried for creating an instance: the first attempt with
+  the same `Idempotency-Key` is still being processed, and the key returns its answer once the API has
+  stored it. Every other `409` is returned at once.
 - The wait is the `Retry-After` header (seconds or an HTTP date) when the API sends one, otherwise exponential
   backoff with full jitter: a random wait between zero and a ceiling that starts at 1 second, doubles with
   each retry and is capped at 20 seconds. A `Retry-After` above 60 seconds is not waited for: the error is
