@@ -1341,7 +1341,8 @@ func TestAPIError_RawBodyNeverCarriesTheAPIKey(t *testing.T) {
 					t.Fatal("err = nil, want the API error")
 				}
 				msg := err.Error()
-				if strings.Contains(msg, key) || strings.Contains(msg, key[:8]) {
+				// Not even the start of it: a key cut by the truncation would leave one.
+				if strings.Contains(msg, key[:4]) {
 					t.Errorf("the API key (or a piece of it) is in the error: %q", msg)
 				}
 				var apiErr *APIError
