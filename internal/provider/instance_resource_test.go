@@ -397,8 +397,8 @@ func TestAccInstanceResource_WrongOrganizationKeepsTheResourceInState(t *testing
 				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
 			},
 			{
-				Config:      testAccProviderBlockWith(fake, fake.apiKey, testOtherOrg) + testAccInstanceBlock("org-guard"),
-				PlanOnly:    true,
+				Config:   testAccProviderBlockWith(fake, fake.apiKey, testOtherOrg) + testAccInstanceBlock("org-guard"),
+				PlanOnly: true,
 				// The API's own words, then where to look.
 				ExpectError: regexp.MustCompile(`(?s)no\s+organization\s+matching.*check\s+VIRTSCALE_ORGANIZATION`),
 			},
