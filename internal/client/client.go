@@ -6,12 +6,15 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +33,68 @@ type Client struct {
 	org        string
 	httpClient *http.Client
 	userAgent  string
+	retry      retryConfig
+}
+
+// retryConfig is the retry policy of a Client, modelled on the AWS SDK's
+// standard retry mode and adapted to this API (see retryable and retryDelay).
+// The hooks exist so tests can run the policy without waiting.
+type retryConfig struct {
+	maxAttempts   int           // in total, the first try included
+	baseDelay     time.Duration // first backoff ceiling
+	maxDelay      time.Duration // backoff ceiling cap
+	maxRetryAfter time.Duration // a longer Retry-After is not waited for
+	sleep         func(ctx context.Context, d time.Duration) error
+	now           func() time.Time
+	jitter        func(max time.Duration) time.Duration
+}
+
+const (
+	defaultMaxAttempts   = 5
+	defaultBaseDelay     = time.Second
+	defaultMaxDelay      = 20 * time.Second
+	defaultMaxRetryAfter = 60 * time.Second
+)
+
+func defaultRetryConfig() retryConfig {
+	return retryConfig{
+		maxAttempts:   defaultMaxAttempts,
+		baseDelay:     defaultBaseDelay,
+		maxDelay:      defaultMaxDelay,
+		maxRetryAfter: defaultMaxRetryAfter,
+		sleep:         sleepContext,
+		now:           time.Now,
+		jitter:        defaultJitter,
+	}
+}
+
+// sleepContext waits d, or until ctx is done, whichever is first. It returns
+// ctx's error when the context ended the wait.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// defaultJitter returns a uniformly random duration in [0, max): "full
+// jitter", so clients that were throttled together do not retry together.
+func defaultJitter(max time.Duration) time.Duration {
+	if max <= 0 {
+		return 0
+	}
+	d := time.Duration(rand.Float64() * float64(max))
+	if d >= max {
+		d = max - 1
+	}
+	return d
 }
 
 // Option configures a Client constructed by New.
@@ -75,6 +140,7 @@ func New(endpoint, apiKey, org string, opts ...Option) (*Client, error) {
 		org:        org,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		userAgent:  defaultUserAgentBase + "/dev",
+		retry:      defaultRetryConfig(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -92,6 +158,9 @@ type APIError struct {
 	Detail    string
 	RequestID string
 	Errors    []FieldError
+	// Attempts is how many times the request was sent before this error was
+	// returned; more than one means the client retried.
+	Attempts int
 }
 
 // FieldError is one entry of a problem body's errors[]: which request field
@@ -119,6 +188,9 @@ func (e *APIError) Error() string {
 	}
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
+	}
+	if e.Attempts > 1 {
+		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
 	return msg
 }
@@ -195,17 +267,15 @@ func newAPIError(status int, body []byte) *APIError {
 	return &APIError{Status: status, Detail: detail}
 }
 
-// do issues an HTTP request against the API, setting auth, Accept,
-// User-Agent and (when body is non-nil) Content-Type headers. idempotencyKey,
-// when non-empty, is sent as the Idempotency-Key header.
-func (c *Client) do(ctx context.Context, method, fullURL string, body any, idempotencyKey string) (*http.Response, error) {
+// newRequest builds one attempt's HTTP request. payload is the encoded body
+// (nil for none) and is wrapped in a fresh reader every time, so a retry never
+// sends a drained one. It sets auth, Accept, User-Agent and, when there is a
+// body, Content-Type; idempotencyKey, when non-empty, goes out as the
+// Idempotency-Key header.
+func (c *Client) newRequest(ctx context.Context, method, fullURL string, payload []byte, idempotencyKey string) (*http.Request, error) {
 	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("client: encode request body: %w", err)
-		}
-		reader = bytes.NewReader(b)
+	if payload != nil {
+		reader = bytes.NewReader(payload)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, reader)
@@ -216,41 +286,219 @@ func (c *Client) do(ctx context.Context, method, fullURL string, body any, idemp
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-
-	return c.httpClient.Do(req)
+	return req, nil
 }
 
-// doJSON issues a request and, on a 2xx response, decodes the JSON body into
-// out (when out is non-nil). Any non-2xx response yields an *APIError.
-func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
-	resp, err := c.do(ctx, method, fullURL, body, idempotencyKey)
+// exchange is one completed HTTP round trip.
+type exchange struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// roundTrip sends req and reads the whole response. A failure to get the
+// status line or the body is a transport error.
+func (c *Client) roundTrip(req *http.Request) (*exchange, error) {
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("client: read response body: %w", err)
+		return nil, fmt.Errorf("client: read response body: %w", err)
+	}
+	return &exchange{status: resp.StatusCode, header: resp.Header, body: data}, nil
+}
+
+// doJSON issues a request and, on a 2xx response, decodes the JSON body into
+// out (when out is non-nil). Any non-2xx response yields an *APIError.
+//
+// Throttling and transient failures are retried, like the AWS SDK's standard
+// mode, within what the API makes safe (see retryable): at most
+// retryConfig.maxAttempts sends in all, waiting what Retry-After says or an
+// exponential backoff with full jitter, and never sleeping past ctx's
+// deadline -- when the next wait would end after it, the last error is
+// returned instead. The body is rebuilt, and the Idempotency-Key reused, for
+// every attempt.
+func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
+	var payload []byte
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("client: encode request body: %w", err)
+		}
+		payload = b
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp.StatusCode, data)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		req, err := c.newRequest(ctx, method, fullURL, payload, idempotencyKey)
+		if err != nil {
+			return err
+		}
+
+		ex, transportErr := c.roundTrip(req)
+
+		var apiErr *APIError
+		switch {
+		case transportErr != nil:
+			if ctx.Err() != nil {
+				// The caller gave up (deadline or cancellation): the failure is
+				// theirs. An earlier attempt's API error says more than the
+				// cancellation does.
+				if lastErr != nil {
+					return lastErr
+				}
+				return transportErr
+			}
+			lastErr = transportErr
+		case ex.status >= 200 && ex.status < 300:
+			if out == nil || len(ex.body) == 0 {
+				return nil
+			}
+			if err := json.Unmarshal(ex.body, out); err != nil {
+				return fmt.Errorf("client: decode response body: %w", err)
+			}
+			return nil
+		default:
+			apiErr = newAPIError(ex.status, ex.body)
+			apiErr.Attempts = attempt
+			lastErr = apiErr
+		}
+
+		if attempt >= c.retry.maxAttempts || !retryable(method, idempotencyKey, ex, apiErr, transportErr) {
+			return withAttempts(lastErr, attempt)
+		}
+		var header http.Header
+		if ex != nil {
+			header = ex.header
+		}
+		wait, ok := c.retryDelay(attempt, header)
+		if !ok {
+			return withAttempts(lastErr, attempt)
+		}
+		if deadline, has := ctx.Deadline(); has && c.retry.now().Add(wait).After(deadline) {
+			return withAttempts(lastErr, attempt)
+		}
+		if err := c.retry.sleep(ctx, wait); err != nil {
+			return withAttempts(lastErr, attempt)
+		}
+	}
+}
+
+// withAttempts says, for an error that is not an *APIError (those carry their
+// own count), how many sends it took to give up.
+func withAttempts(err error, attempts int) error {
+	var apiErr *APIError
+	if attempts <= 1 || errors.As(err, &apiErr) {
+		return err
+	}
+	return fmt.Errorf("%w; gave up after %d attempts", err, attempts)
+}
+
+// repeatable reports whether sending the request twice is safe: a GET, a
+// DELETE, or a POST that carries an Idempotency-Key (the API replays the first
+// answer for the same key and body).
+func repeatable(method, idempotencyKey string) bool {
+	return method == http.MethodGet || method == http.MethodDelete ||
+		(method == http.MethodPost && idempotencyKey != "")
+}
+
+// retryable decides whether a failed attempt may be repeated.
+//
+//   - 429 is retried for every method: the rate limiter refuses a request
+//     before it runs.
+//   - 502, 503, 504 and transport errors may have been applied, so only a
+//     repeatable request is retried.
+//   - A 503 whose code is not_ready says a feature flag is off; retrying
+//     cannot help.
+//   - Nothing else is retried: a 4xx is a decision about the request, and a
+//     500 says nothing about whether it ran.
+func retryable(method, idempotencyKey string, ex *exchange, apiErr *APIError, transportErr error) bool {
+	if transportErr != nil {
+		return repeatable(method, idempotencyKey) && !permanentTransportError(transportErr)
+	}
+	switch ex.status {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusBadGateway, http.StatusGatewayTimeout:
+		return repeatable(method, idempotencyKey)
+	case http.StatusServiceUnavailable:
+		return repeatable(method, idempotencyKey) && (apiErr == nil || apiErr.Code != "not_ready")
+	}
+	return false
+}
+
+// permanentTransportError reports transport failures no retry can fix: a
+// certificate that does not verify, or an endpoint that is not an http(s) URL.
+func permanentTransportError(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr) && strings.HasPrefix(urlErr.Err.Error(), "unsupported protocol scheme")
+}
+
+// maxRetryAfterSeconds saturates absurd delay-seconds values before they can
+// overflow a Duration.
+const maxRetryAfterSeconds = 1 << 20
+
+// parseRetryAfter reads a Retry-After value: delay-seconds (digits only) or an
+// HTTP date (relative to now; a date in the past is no wait). ok is false for
+// anything else, which the caller treats as absent.
+func parseRetryAfter(value string, now time.Time) (d time.Duration, ok bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if strings.Trim(value, "0123456789") == "" {
+		secs, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || secs > maxRetryAfterSeconds {
+			secs = maxRetryAfterSeconds
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// retryDelay is how long to wait before retry number retryNumber (1 for the
+// first retry): what Retry-After says when it is usable, otherwise a random
+// draw from [0, min(maxDelay, baseDelay*2^(n-1))) -- exponential backoff with
+// full jitter. ok is false when Retry-After asks for longer than maxRetryAfter:
+// the server is not going to be ready within anything worth waiting for here.
+func (c *Client) retryDelay(retryNumber int, header http.Header) (wait time.Duration, ok bool) {
+	if header != nil {
+		if d, parsed := parseRetryAfter(header.Get("Retry-After"), c.retry.now()); parsed {
+			if d > c.retry.maxRetryAfter {
+				return 0, false
+			}
+			return d, true
+		}
 	}
 
-	if out == nil || len(data) == 0 {
-		return nil
+	ceiling := c.retry.baseDelay
+	for i := 1; i < retryNumber && ceiling < c.retry.maxDelay; i++ {
+		ceiling *= 2
 	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("client: decode response body: %w", err)
+	if ceiling > c.retry.maxDelay {
+		ceiling = c.retry.maxDelay
 	}
-	return nil
+	return c.retry.jitter(ceiling), true
 }
 
 // orgPath builds an absolute URL under /v1/orgs/{org}/ for the given
