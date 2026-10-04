@@ -7,6 +7,7 @@ package provider
 
 import (
 	"fmt"
+	"net/http"
 	"regexp"
 	"testing"
 
@@ -54,7 +55,7 @@ func testAccCheckPublicIpDestroy(fake *fakeAPI) resource.TestCheckFunc {
 // updated in place to allocated with instance_id null, ImportStateVerify,
 // then destroy leaving no public IP in the fake.
 func TestAccPublicIpResource_Lifecycle(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -79,6 +80,10 @@ func TestAccPublicIpResource_Lifecycle(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "allocated"),
 					resource.TestCheckNoResourceAttr("virtscale_public_ip.test", "instance_id"),
+					// The refresh before this step read the vm while the
+					// address was attached: Nova lists it, as a floating entry,
+					// ahead of the fixed one. It is not the private address.
+					resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
 				),
 			},
 			{
@@ -94,7 +99,7 @@ func TestAccPublicIpResource_Lifecycle(t *testing.T) {
 // TestAccPublicIpResource_QuotaExceeded covers scenario (5): a second
 // allocation while the first is still live fails with quota_exceeded.
 func TestAccPublicIpResource_QuotaExceeded(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	config := testAccProviderBlock(fake) + `
 resource "virtscale_public_ip" "first" {
@@ -125,7 +130,7 @@ resource "virtscale_public_ip" "second" {
 // to state error, and the associate wait must fail immediately with the
 // API's own error field rather than polling out the full timeout.
 func TestAccPublicIpResource_AssociateFailsFast(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	config := testAccProviderBlock(fake) + `
 resource "virtscale_instance" "test" {
@@ -176,7 +181,7 @@ resource "virtscale_public_ip" "test" {
 // exercising that path here, a regression that made Delete retry
 // unconditionally would go uncaught.
 func TestAccPublicIpResource_DisassociateFailsFast(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	withInstanceID := testAccProviderBlock(fake) + `
 resource "virtscale_instance" "test" {
@@ -242,7 +247,7 @@ resource "virtscale_public_ip" "test" {
 // against the final released state, so a regression in the guard (e.g.
 // deleting it) is caught even though the end state looks identical.
 func TestAccPublicIpResource_DisassociateBeforeRelease(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	var ipID string
 
 	resource.Test(t, resource.TestCase{
@@ -285,7 +290,7 @@ data "virtscale_images" "test" {
 // TestAccImagesDataSource covers scenario (6): the data source returns the
 // fake's two gro images, sorted by name.
 func TestAccImagesDataSource(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", "test-org")
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
@@ -304,4 +309,130 @@ func TestAccImagesDataSource(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccPublicIpResource_DestroyWhileAReleaseIsAlreadyRunning covers M3 for
+// public IPs: releasing an address that is already being released is 409
+// public_ip_not_releasable ("this public IP is releasing"). The release is
+// underway, so destroy waits for the address to go instead of failing.
+func TestAccPublicIpResource_DestroyWhileAReleaseIsAlreadyRunning(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetReleaseSteps(4)
+	config := testAccProviderBlock(fake) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: func(s *terraform.State) error {
+					rs, ok := s.RootModule().Resources["virtscale_public_ip.test"]
+					if !ok {
+						return fmt.Errorf("virtscale_public_ip.test not found in state")
+					}
+					id = rs.Primary.ID
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					if status, _ := ipAction(t, fake, id, "", ""); status != http.StatusAccepted {
+						t.Errorf("out-of-band release: status = %d, want 202", status)
+					}
+				},
+				Config:  config,
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_SurvivesALostReleaseResponse: the release (a DELETE,
+// safe to repeat) is processed but its answer is lost; the retry meets 409
+// public_ip_not_releasable because the address is already going, which destroy
+// takes as underway. The disassociate before it (an unkeyed POST) is not retried
+// and does not need to be.
+func TestAccPublicIpResource_SurvivesALostReleaseResponse(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetReleaseSteps(2)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPublicIpInstanceAndIpConfig(fake, true),
+				Check:  resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "associated"),
+			},
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(1, matchMethod(http.MethodDelete), respondGatewayRetryAfter(504, "0"))
+				},
+				Config:  testAccPublicIpInstanceAndIpConfig(fake, true),
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_AnUnkeyedAllocateIsNeverRepeated is the other side:
+// allocating an address has no Idempotency-Key, so when the API processed it
+// but the answer was lost, repeating it would take a second address. The client
+// does not; the error reaches the user, and exactly one address exists.
+func TestAccPublicIpResource_AnUnkeyedAllocateIsNeverRepeated(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetPublicIPQuota(5)
+	fake.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGateway(502))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccProviderBlock(fake) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`,
+				ExpectError: regexp.MustCompile(`Unable to Allocate Public IP`),
+			},
+		},
+	})
+	if n := fake.PublicIPCount(); n != 1 {
+		t.Errorf("addresses after one lost allocate answer = %d, want exactly 1: a repeated allocate would have taken a second", n)
+	}
+}
+
+// TestAccPublicIpResource_KeyWithoutNetworkWriteIsToldSo: public IPs are edge.*
+// permissions, so compute:write alone cannot allocate one, and the message
+// names the scope that can.
+func TestAccPublicIpResource_KeyWithoutNetworkWriteIsToldSo(t *testing.T) {
+	fake := newFakeAPI(t, "write-key", testOrgID)
+	fake.AddKey("compute-only", "compute:write")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccProviderBlockWith(fake, "compute-only", fake.org) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`,
+				ExpectError: wrapSafe("the API key needs the 'network:write' scope"),
+			},
+		},
+	})
+	if fake.PublicIPCount() != 0 {
+		t.Errorf("the API refused the request, yet %d public ip(s) exist", fake.PublicIPCount())
+	}
 }

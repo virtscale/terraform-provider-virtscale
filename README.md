@@ -14,7 +14,7 @@ from there.
 - Provider `virtscale`: configured with an API key and an organization id.
 - Resource `virtscale_instance`: a VirtScale compute instance (VM).
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
-  A customer organization's quota is one public IP.
+  The default customer quota is one public IP per region; addresses in state `error` do not count against it.
 - Data source `virtscale_images`: the image catalogue for a region.
 
 See [examples/main.tf](examples/main.tf) for a complete, runnable configuration.
@@ -74,13 +74,82 @@ An attribute set in configuration takes precedence over the matching environment
 `api_key` or `organization` (after both are checked) fails `Configure` with a diagnostic naming the missing
 attribute and its environment variable -- never a panic.
 
+`organization` is the organization's id, a UUID. Anything else is refused by the API with
+`400 invalid_request`, and the error names the field (`org: Input should be a valid UUID`).
+
+## API key scopes
+
+An API key carries scopes, and the API refuses a call the key's scopes do not cover with
+`403 permission_denied`. What the provider needs:
+
+| You use | The key needs |
+| ------- | ------------- |
+| `virtscale_instance` (create, destroy, refresh) | `compute:write` |
+| `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
+| `virtscale_images` (data source) | `compute:read` (`compute:write` covers it too) |
+| `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances and images, `network:read` for public IPs |
+
+A configuration with an instance and a public IP associated to it needs both `compute:write` and
+`network:write`.
+
+`compute:write` covers every `compute.*` and `operation.*` permission, reads included; `network:write` covers
+every `network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`). The `:read` scopes cover the
+`.read` and `.list` permissions of their family. The older all-family scopes also work: `write` for everything
+above, `read` for plan-only use.
+
+A key can also carry network limits (allowed CIDRs). A request from an address outside them is refused with
+`403 source_address_not_allowed`.
+
+## Retries
+
+The client retries like the AWS SDK's standard mode, within what this API makes safe:
+
+- `429` (`rate_limited`) is retried for every request: the rate limiter refuses a request before it runs.
+- `502`, `503`, `504` and transport errors (a dropped connection, a timeout) may have been applied, so they
+  are retried only for requests that are safe to send twice: reads, deletes, and creating an instance, which
+  carries an `Idempotency-Key` (the API answers a repeat of the same request with the first answer, so one
+  create never builds two instances).
+- Allocating, associating and disassociating a public IP carry no `Idempotency-Key`, so they are never
+  retried after a `5xx` or a lost connection. If the API processed one but its answer was lost, the error
+  reaches you and the address may exist without being in state: check the panel or `GET .../compute/public-ips`
+  and `tofu import` it.
+- A `503` with code `not_ready` (the feature is switched off) is never retried.
+- The wait is the `Retry-After` header (seconds or an HTTP date) when the API sends one, otherwise exponential
+  backoff with full jitter: a random wait between zero and a ceiling that starts at 1 second, doubles with
+  each retry and is capped at 20 seconds. A `Retry-After` above 60 seconds is not waited for: the error is
+  returned at once.
+- At most 5 attempts in all, and never a wait that would end after the context's deadline: the last error is
+  returned instead. Cancelling the run (Ctrl-C) ends a wait at once.
+
+When it gives up, the error is still the API's own (status, code, detail, request id) followed by
+`gave up after N attempts`.
+
+Waiting for a result is separate from retrying a request: creating an instance waits up to 20 minutes for
+state `running` and fails at once, with the API's `error_class` and `error_detail`, if it reaches `error`;
+destroying waits up to 10 minutes; each public IP operation waits up to 10 minutes. Waits poll every 5 seconds.
+
+## Errors
+
+Every error carries the API's own message and its request id (quote the request id when you ask for help),
+including the field list the API sends with a `400`. Where the fix is on your side, a hint follows:
+
+| Response | Hint |
+| -------- | ---- |
+| `401 unauthorized` | check `VIRTSCALE_API_KEY`: the key may be wrong, revoked or expired |
+| `403 permission_denied` | the scope that grants the permission it names: `compute:write` or `compute:read` for `compute.*` and `operation.*`, `network:write` or `network:read` for `edge.*` and `network.*` |
+| `403 source_address_not_allowed` | the key's network limits do not include this address |
+| `404` about the organization | check `VIRTSCALE_ORGANIZATION`, or that the key belongs to that organization |
+
+A `404` about the organization is not read as "the resource is gone": pointing the provider at the wrong
+organization fails the refresh instead of dropping your instances from state.
+
 ## Resources and data sources
 
 ### `virtscale_instance`
 
 | Attribute         | Type   | Required/Computed | Notes |
 | ----------------- | ------ | ------------------ | ----- |
-| `name`            | string | Required, forces replacement | |
+| `name`            | string | Required, forces replacement | 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit; checked at plan time (the API lower-cases names and strips a trailing `.virtscale.nl`, so any other form would come back different). Unique among live instances in the same region; a deleted instance's name is reusable. |
 | `region`          | string | Required, forces replacement | |
 | `image`           | string | Required, forces replacement | Image id from `virtscale_images`. Set at creation only; the provider does not detect image drift in v0. |
 | `vcpus`           | number | Required, forces replacement | |
@@ -88,13 +157,18 @@ attribute and its environment variable -- never a panic.
 | `disk_gb`         | number | Required, forces replacement | |
 | `storage_pool`    | string | Required, forces replacement | |
 | `network_profile` | string | Required, forces replacement | |
-| `ssh_keys`        | list(string) | Optional, forces replacement | |
+| `ssh_keys`        | list(string) | Optional, forces replacement | Nova keypair *names*, at most one (the API refuses more with `422 too_many_ssh_keys`). Customer projects have no keypairs and no API route creates one yet, so leave it unset: an unknown name makes the instance fail to build. The API also refuses `user_data`, so the provider has no such attribute. Not read back on import. |
 | `id`              | string | Computed | |
 | `state`           | string | Computed | |
 | `fqdn`            | string | Computed | Null for a customer account. |
-| `private_ipv4`    | string | Computed | Empty until observed. |
+| `private_ipv4`    | string | Computed | The first fixed IPv4 address the API has observed for the instance; empty until one is. An associated public IP is not the private address. |
 | `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. |
 | `created_at`      | string | Computed | RFC 3339. |
+
+The API checks `vcpus`, `memory_mb` and `disk_gb` against the platform's size limits and the image's
+minimums (`min_disk_gb` and `min_ram_mb` in `virtscale_images`); a refusal lists every violation
+(`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute forces replacement: there
+are no in-place changes yet.
 
 ### `virtscale_public_ip`
 
@@ -105,6 +179,11 @@ attribute and its environment variable -- never a panic.
 | `id`          | string | Computed | |
 | `address`     | string | Computed | |
 | `state`       | string | Computed | |
+
+Associating needs the instance to be `running` (otherwise `409 vm_not_in_a_state_for_this`) and in the same
+region as the address (`422 region_mismatch`), and an instance carries one public IP at a time. Allocating
+beyond the quota is `422 quota_exceeded`. Destroying disassociates first when the address is associated, then
+releases it.
 
 ### `virtscale_images` (data source)
 
@@ -118,7 +197,9 @@ attribute and its environment variable -- never a panic.
 
 Unit tests (client package) run with plain `go test`. Provider and resource tests are Terraform acceptance
 tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
-`TF_ACC=1` and `tofu` on `PATH`:
+`TF_ACC=1` and `tofu` on `PATH`. The fake is written from the deployed API's spec and handlers
+(s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
+own types, so a wrong field name or status in the client fails a test instead of being mirrored back:
 
 ```bash
 TF_ACC=1 \

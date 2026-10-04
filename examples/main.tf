@@ -6,8 +6,9 @@ terraform {
   }
 }
 
-# No credentials here: set VIRTSCALE_API_KEY and VIRTSCALE_ORGANIZATION in
-# the environment instead.
+# No credentials here: set VIRTSCALE_API_KEY and VIRTSCALE_ORGANIZATION (the
+# organization's UUID) in the environment instead. The key needs the
+# compute:write scope, and network:write as well for the public IP below.
 provider "virtscale" {}
 
 data "virtscale_images" "gro" {

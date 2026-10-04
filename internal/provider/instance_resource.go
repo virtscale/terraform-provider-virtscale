@@ -5,6 +5,9 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/netip"
+	"regexp"
 	"sort"
 	"time"
 
@@ -15,6 +18,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/client"
@@ -40,6 +44,40 @@ const (
 // errInstanceBuildFailed is the sentinel WaitVm's done callback returns when
 // the observed vm reaches state "error" during create.
 var errInstanceBuildFailed = errors.New("instance entered error state")
+
+// vmNamePattern is the API's stored form of an instance name: a DNS label of
+// 1-63 characters (compute/naming.py NAME_RE).
+var vmNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// vmNameValidator refuses, at plan time, a name the API would not store as
+// given. The API canonicalises names (trims, lower-cases, strips a trailing
+// ".virtscale.nl") and answers with the canonical one; the provider copies
+// that answer into state, so a name that is not already canonical would fail
+// the apply with "inconsistent result" after the instance has been created.
+type vmNameValidator struct{}
+
+func (vmNameValidator) Description(context.Context) string {
+	return "1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit"
+}
+
+func (v vmNameValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (vmNameValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if name := req.ConfigValue.ValueString(); !vmNamePattern.MatchString(name) {
+		resp.Diagnostics.AddAttributeError(
+			req.Path,
+			"Invalid instance name",
+			fmt.Sprintf("%q is not a valid instance name: use 1-63 lowercase letters, digits or hyphens, "+
+				"starting and ending with a letter or digit. The API lower-cases names and strips a trailing "+
+				"\".virtscale.nl\", so any other form would come back different from the configuration.", name),
+		)
+	}
+}
 
 // InstanceResource implements the virtscale_instance resource.
 type InstanceResource struct {
@@ -91,8 +129,10 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 			"name": schema.StringAttribute{
-				Required:    true,
-				Description: "Lowercase letters, digits and hyphens; must start and end alphanumeric. Unique among live instances in the same region -- a deleted instance's name is reusable.",
+				Required: true,
+				Description: "1-63 lowercase letters, digits or hyphens; must start and end alphanumeric. " +
+					"Unique among live instances in the same region -- a deleted instance's name is reusable.",
+				Validators: []validator.String{vmNameValidator{}},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
@@ -160,7 +200,11 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"ssh_keys": schema.ListAttribute{
 				ElementType: types.StringType,
 				Optional:    true,
-				Description: "Names of your SSH keys to install on the instance. No key material is stored here.",
+				Description: "Names of Nova keypairs to give the instance; no key material is stored here. " +
+					"At most one name: the API refuses more with 422 too_many_ssh_keys. The keypair must " +
+					"already exist in the organization's cloud project. Customer projects have none and no " +
+					"API route creates one yet, so leave this unset: an unknown name makes the instance " +
+					"fail to build (state error).",
 				PlanModifiers: []planmodifier.List{
 					listplanmodifier.RequiresReplace(),
 				},
@@ -349,8 +393,10 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Delete requests deletion (a 404 counts as already gone) and waits for the
-// vm to report state deleted or disappear entirely.
+// Delete requests deletion and waits for the vm to report state deleted or
+// disappear entirely. A 404 counts as already gone, and so does a 409 that
+// turns out to mean the vm is already being deleted (see
+// removalAlreadyUnderway).
 func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state instanceResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -359,7 +405,7 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	}
 
 	_, _, err := r.client.DeleteVm(ctx, state.ID.ValueString())
-	if err != nil && !client.IsNotFound(err) {
+	if err != nil && !client.IsNotFound(err) && !r.removalAlreadyUnderway(ctx, state.ID.ValueString(), err) {
 		resp.Diagnostics.AddError("Unable to Delete Instance", apiErrorDetail(err))
 		return
 	}
@@ -376,6 +422,29 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Wait for Instance Deletion", err.Error())
 	}
+}
+
+// removalAlreadyUnderway reports whether err, from a DELETE, only says that the
+// vm is already on its way out. The API allows one operation per vm, so a
+// second DELETE while the first runs is 409 operation_in_flight -- what an
+// interrupted destroy meets on its next run, and what a DELETE retried after a
+// lost response meets. Other 409s are real refusals (vm_protected,
+// vm_action_not_allowed, an operation that is not a delete), so the vm is read
+// back before the 409 is believed: it is underway only when it is gone, or the
+// delete is recorded (desired_state deleted) or running (deleting).
+func (r *InstanceResource) removalAlreadyUnderway(ctx context.Context, id string, err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
+		return false
+	}
+	vm, getErr := r.client.GetVm(ctx, id)
+	if client.IsNotFound(getErr) {
+		return true
+	}
+	if getErr != nil {
+		return false
+	}
+	return vm.DesiredState == "deleted" || vm.State == "deleting" || vm.State == "deleted"
 }
 
 // ImportState imports by id, passthrough.
@@ -413,9 +482,17 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.PrivateIPv4 = types.StringValue(firstIPv4(vm.ObservedAddresses))
 }
 
-// firstIPv4 returns the first fixed IPv4 address from a Nova-shaped
+// firstIPv4 returns the instance's private IPv4 address from the
 // observed_addresses map, iterating network names in sorted order for
 // determinism. It returns "" when there is none.
+//
+// The map is Nova's addresses structure, stored verbatim: network name to a
+// list of entries. The contract promises "addr" and little else -- the
+// platform's own readers and fixtures accept entries with just addr, or bare
+// address strings -- so an entry counts when its addr parses as IPv4 and it is
+// not explicitly marked as anything but fixed. A floating entry (an associated
+// public IP, which Nova lists next to the fixed address) is never the private
+// address.
 func firstIPv4(observed map[string]any) string {
 	if observed == nil {
 		return ""
@@ -433,37 +510,33 @@ func firstIPv4(observed map[string]any) string {
 			continue
 		}
 		for _, e := range entries {
-			addr, ok := e.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			if !isIPv4(addr["version"]) {
-				continue
-			}
-			addrType, _ := addr["OS-EXT-IPS:type"].(string)
-			if addrType != "fixed" {
-				continue
-			}
-			if a, ok := addr["addr"].(string); ok {
-				return a
+			if addr := fixedIPv4Of(e); addr != "" {
+				return addr
 			}
 		}
 	}
 	return ""
 }
 
-func isIPv4(v any) bool {
-	switch t := v.(type) {
-	case float64:
-		return t == 4
-	case int:
-		return t == 4
+// fixedIPv4Of returns the IPv4 address of one addresses entry, or "" when the
+// entry is not an IPv4 address or is marked as other than fixed.
+func fixedIPv4Of(entry any) string {
+	var raw string
+	switch e := entry.(type) {
 	case string:
-		return t == "4"
+		raw = e
+	case map[string]any:
+		if kind, ok := e["OS-EXT-IPS:type"].(string); ok && kind != "fixed" {
+			return ""
+		}
+		raw, _ = e["addr"].(string)
 	default:
-		return false
+		return ""
 	}
+	if ip, err := netip.ParseAddr(raw); err == nil && ip.Is4() {
+		return ip.String()
+	}
+	return ""
 }
 
 func ptrOrEmpty(s *string) string {

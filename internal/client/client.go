@@ -6,12 +6,16 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -30,6 +34,68 @@ type Client struct {
 	org        string
 	httpClient *http.Client
 	userAgent  string
+	retry      retryConfig
+}
+
+// retryConfig is the retry policy of a Client, modelled on the AWS SDK's
+// standard retry mode and adapted to this API (see retryable and retryDelay).
+// The hooks exist so tests can run the policy without waiting.
+type retryConfig struct {
+	maxAttempts   int           // in total, the first try included
+	baseDelay     time.Duration // first backoff ceiling
+	maxDelay      time.Duration // backoff ceiling cap
+	maxRetryAfter time.Duration // a longer Retry-After is not waited for
+	sleep         func(ctx context.Context, d time.Duration) error
+	now           func() time.Time
+	jitter        func(ceiling time.Duration) time.Duration
+}
+
+const (
+	defaultMaxAttempts   = 5
+	defaultBaseDelay     = time.Second
+	defaultMaxDelay      = 20 * time.Second
+	defaultMaxRetryAfter = 60 * time.Second
+)
+
+func defaultRetryConfig() retryConfig {
+	return retryConfig{
+		maxAttempts:   defaultMaxAttempts,
+		baseDelay:     defaultBaseDelay,
+		maxDelay:      defaultMaxDelay,
+		maxRetryAfter: defaultMaxRetryAfter,
+		sleep:         sleepContext,
+		now:           time.Now,
+		jitter:        defaultJitter,
+	}
+}
+
+// sleepContext waits d, or until ctx is done, whichever is first. It returns
+// ctx's error when the context ended the wait.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// defaultJitter returns a uniformly random duration in [0, ceiling): "full
+// jitter", so clients that were throttled together do not retry together.
+func defaultJitter(ceiling time.Duration) time.Duration {
+	if ceiling <= 0 {
+		return 0
+	}
+	d := time.Duration(rand.Float64() * float64(ceiling))
+	if d >= ceiling {
+		d = ceiling - 1
+	}
+	return d
 }
 
 // Option configures a Client constructed by New.
@@ -75,6 +141,7 @@ func New(endpoint, apiKey, org string, opts ...Option) (*Client, error) {
 		org:        org,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		userAgent:  defaultUserAgentBase + "/dev",
+		retry:      defaultRetryConfig(),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -91,6 +158,17 @@ type APIError struct {
 	Title     string
 	Detail    string
 	RequestID string
+	Errors    []FieldError
+	// Attempts is how many times the request was sent before this error was
+	// returned; more than one means the client retried.
+	Attempts int
+}
+
+// FieldError is one entry of a problem body's errors[]: which request field
+// the API refused and why.
+type FieldError struct {
+	Field   string
+	Message string
 }
 
 func (e *APIError) Error() string {
@@ -99,19 +177,109 @@ func (e *APIError) Error() string {
 		code = "error"
 	}
 	msg := fmt.Sprintf("virtscale API %d %s: %s", e.Status, code, e.Detail)
+	if len(e.Errors) > 0 {
+		parts := make([]string, len(e.Errors))
+		for i, fe := range e.Errors {
+			parts[i] = fe.Message
+			if fe.Field != "" {
+				parts[i] = fe.Field + ": " + fe.Message
+			}
+		}
+		msg += ": " + strings.Join(parts, "; ")
+	}
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
+	}
+	if e.Attempts > 1 {
+		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
+	}
+	if hint := e.hint(); hint != "" {
+		msg += "; " + hint
 	}
 	return msg
 }
 
-// IsNotFound reports whether err is an *APIError with Status 404.
+// permissionNameRE finds the permission a 403 permission_denied names: "this
+// credential does not carry the '<permission>' permission" (customer_api/deps.py).
+var permissionNameRE = regexp.MustCompile(`'([A-Za-z0-9_.]+)' permission`)
+
+// hint says what to change for the failures a user can fix themselves: the
+// API's own message stays in front of it, this only adds the next step.
+func (e *APIError) hint() string {
+	switch {
+	case e.Status == http.StatusUnauthorized:
+		// One answer for a wrong, revoked or expired key: the API does not say which.
+		return "check VIRTSCALE_API_KEY: the key may be wrong, revoked or expired"
+	case e.Status == http.StatusForbidden && e.Code == "permission_denied":
+		return scopeHint(e.Detail)
+	case e.Status == http.StatusForbidden && e.Code == "source_address_not_allowed":
+		return "the key's network limits do not include this address; " +
+			"run Terraform from an allowed address or widen the key's network limits"
+	case isOrganizationNotVisible(e):
+		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
+			"or VIRTSCALE_API_KEY belongs to another organization"
+	}
+	return ""
+}
+
+// scopeHint maps the permission a 403 names to the key scope that grants it
+// (permissions.py SCOPE_PERMISSIONS): compute.* and operation.* come with
+// compute:write, edge.* and network.* with network:write, and the read halves
+// (permissions ending .read or .list) with the :read scope as well. Any other
+// family, or a detail it cannot read, only sends the user to the key's scopes.
+func scopeHint(detail string) string {
+	const generic = "check the scopes of the API key (VIRTSCALE_API_KEY)"
+
+	m := permissionNameRE.FindStringSubmatch(detail)
+	if m == nil {
+		return generic
+	}
+	permission := m[1]
+
+	var family string
+	switch {
+	case strings.HasPrefix(permission, "compute."), strings.HasPrefix(permission, "operation."):
+		family = "compute"
+	case strings.HasPrefix(permission, "edge."), strings.HasPrefix(permission, "network."):
+		family = "network"
+	default:
+		return generic
+	}
+	if strings.HasSuffix(permission, ".read") || strings.HasSuffix(permission, ".list") {
+		return fmt.Sprintf("the API key needs the '%s:read' or '%s:write' scope", family, family)
+	}
+	return fmt.Sprintf("the API key needs the '%s:write' scope", family)
+}
+
+// organizationNotVisiblePrefix starts the detail of the 404 the API gives for
+// an organization the key cannot see (errors.not_found("organization"), raised
+// in customer_api/deps.py). It shares code not_found with a missing vm or
+// public IP, so the detail is the only thing that tells them apart; if the
+// wording ever changes, the check degrades to "any 404 is not found".
+const organizationNotVisiblePrefix = "no organization matching that identifier"
+
+func isOrganizationNotVisible(e *APIError) bool {
+	return e.Status == http.StatusNotFound && strings.HasPrefix(e.Detail, organizationNotVisiblePrefix)
+}
+
+// IsNotFound reports whether err is an *APIError with Status 404 that says the
+// resource is not there. A 404 about the organization itself (a wrong
+// organization id, or a key issued for another organization) is not: it says
+// nothing about the resource, and treating it as "gone" would drop a live
+// resource from state.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.Status == http.StatusNotFound
+		return apiErr.Status == http.StatusNotFound && !isOrganizationNotVisible(apiErr)
 	}
 	return false
+}
+
+// IsOrganizationNotVisible reports whether err is the 404 the API gives for an
+// organization the key cannot see.
+func IsOrganizationNotVisible(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && isOrganizationNotVisible(apiErr)
 }
 
 type problemBody struct {
@@ -135,13 +303,17 @@ const maxTruncatedBodyLen = 200
 func newAPIError(status int, body []byte) *APIError {
 	var p problemBody
 	if err := json.Unmarshal(body, &p); err == nil && (p.Type != "" || p.Title != "" || p.Code != "") {
-		return &APIError{
+		apiErr := &APIError{
 			Status:    status,
 			Code:      p.Code,
 			Title:     p.Title,
 			Detail:    p.Detail,
 			RequestID: p.RequestID,
 		}
+		for _, fe := range p.Errors {
+			apiErr.Errors = append(apiErr.Errors, FieldError{Field: fe.Field, Message: fe.Message})
+		}
+		return apiErr
 	}
 
 	detail := strings.TrimSpace(string(body))
@@ -151,17 +323,15 @@ func newAPIError(status int, body []byte) *APIError {
 	return &APIError{Status: status, Detail: detail}
 }
 
-// do issues an HTTP request against the API, setting auth, Accept,
-// User-Agent and (when body is non-nil) Content-Type headers. idempotencyKey,
-// when non-empty, is sent as the Idempotency-Key header.
-func (c *Client) do(ctx context.Context, method, fullURL string, body any, idempotencyKey string) (*http.Response, error) {
+// newRequest builds one attempt's HTTP request. payload is the encoded body
+// (nil for none) and is wrapped in a fresh reader every time, so a retry never
+// sends a drained one. It sets auth, Accept, User-Agent and, when there is a
+// body, Content-Type; idempotencyKey, when non-empty, goes out as the
+// Idempotency-Key header.
+func (c *Client) newRequest(ctx context.Context, method, fullURL string, payload []byte, idempotencyKey string) (*http.Request, error) {
 	var reader io.Reader
-	if body != nil {
-		b, err := json.Marshal(body)
-		if err != nil {
-			return nil, fmt.Errorf("client: encode request body: %w", err)
-		}
-		reader = bytes.NewReader(b)
+	if payload != nil {
+		reader = bytes.NewReader(payload)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, reader)
@@ -172,41 +342,220 @@ func (c *Client) do(ctx context.Context, method, fullURL string, body any, idemp
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", c.userAgent)
-	if body != nil {
+	if payload != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
 	}
-
-	return c.httpClient.Do(req)
+	return req, nil
 }
 
-// doJSON issues a request and, on a 2xx response, decodes the JSON body into
-// out (when out is non-nil). Any non-2xx response yields an *APIError.
-func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
-	resp, err := c.do(ctx, method, fullURL, body, idempotencyKey)
+// exchange is one completed HTTP round trip.
+type exchange struct {
+	status int
+	header http.Header
+	body   []byte
+}
+
+// roundTrip sends req and reads the whole response. A failure to get the
+// status line or the body is a transport error.
+func (c *Client) roundTrip(req *http.Request) (*exchange, error) {
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("client: read response body: %w", err)
+		return nil, fmt.Errorf("client: read response body: %w", err)
+	}
+	return &exchange{status: resp.StatusCode, header: resp.Header, body: data}, nil
+}
+
+// doJSON issues a request and, on a 2xx response, decodes the JSON body into
+// out (when out is non-nil). Any non-2xx response yields an *APIError.
+//
+// Throttling and transient failures are retried, like the AWS SDK's standard
+// mode, within what the API makes safe (see retryable): at most
+// retryConfig.maxAttempts sends in all, waiting what Retry-After says or an
+// exponential backoff with full jitter, and never sleeping past ctx's
+// deadline -- when the next wait would end after it, the last error is
+// returned instead. The body is rebuilt, and the Idempotency-Key reused, for
+// every attempt.
+func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
+	var payload []byte
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("client: encode request body: %w", err)
+		}
+		payload = b
 	}
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return newAPIError(resp.StatusCode, data)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		req, err := c.newRequest(ctx, method, fullURL, payload, idempotencyKey)
+		if err != nil {
+			return err
+		}
+
+		ex, transportErr := c.roundTrip(req)
+
+		var apiErr *APIError
+		switch {
+		case transportErr != nil:
+			if ctx.Err() != nil {
+				// The caller gave up (deadline or cancellation): the failure is
+				// theirs. An earlier attempt's API error says more than the
+				// cancellation does.
+				if lastErr != nil {
+					return lastErr
+				}
+				return transportErr
+			}
+			lastErr = transportErr
+		case ex.status >= 200 && ex.status < 300:
+			if out == nil || len(ex.body) == 0 {
+				return nil
+			}
+			if err := json.Unmarshal(ex.body, out); err != nil {
+				return fmt.Errorf("client: decode response body: %w", err)
+			}
+			return nil
+		default:
+			apiErr = newAPIError(ex.status, ex.body)
+			apiErr.Attempts = attempt
+			lastErr = apiErr
+		}
+
+		if attempt >= c.retry.maxAttempts || !retryable(method, idempotencyKey, ex, apiErr, transportErr) {
+			return withAttempts(lastErr, attempt)
+		}
+		var header http.Header
+		if ex != nil {
+			header = ex.header
+		}
+		wait, ok := c.retryDelay(attempt, header)
+		if !ok {
+			return withAttempts(lastErr, attempt)
+		}
+		if deadline, has := ctx.Deadline(); has && c.retry.now().Add(wait).After(deadline) {
+			return withAttempts(lastErr, attempt)
+		}
+		if err := c.retry.sleep(ctx, wait); err != nil {
+			return withAttempts(lastErr, attempt)
+		}
+	}
+}
+
+// withAttempts says, for an error that is not an *APIError (those carry their
+// own count), how many sends it took to give up.
+func withAttempts(err error, attempts int) error {
+	var apiErr *APIError
+	if attempts <= 1 || errors.As(err, &apiErr) {
+		return err
+	}
+	return fmt.Errorf("%w; gave up after %d attempts", err, attempts)
+}
+
+// repeatable reports whether sending the request twice is safe: a GET, a
+// DELETE, or a POST that carries an Idempotency-Key (the API replays the first
+// answer for the same key and body).
+func repeatable(method, idempotencyKey string) bool {
+	return method == http.MethodGet || method == http.MethodDelete ||
+		(method == http.MethodPost && idempotencyKey != "")
+}
+
+// retryable decides whether a failed attempt may be repeated.
+//
+//   - 429 is retried for every method: the rate limiter refuses a request
+//     before it runs.
+//   - 502, 503, 504 and transport errors may have been applied, so only a
+//     repeatable request is retried.
+//   - A 503 whose code is not_ready says a feature flag is off; retrying
+//     cannot help.
+//   - Nothing else is retried: a 4xx is a decision about the request, and a
+//     500 says nothing about whether it ran.
+func retryable(method, idempotencyKey string, ex *exchange, apiErr *APIError, transportErr error) bool {
+	if transportErr != nil {
+		return repeatable(method, idempotencyKey) && !permanentTransportError(transportErr)
+	}
+	switch ex.status {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusBadGateway, http.StatusGatewayTimeout:
+		return repeatable(method, idempotencyKey)
+	case http.StatusServiceUnavailable:
+		return repeatable(method, idempotencyKey) && (apiErr == nil || apiErr.Code != "not_ready")
+	}
+	return false
+}
+
+// permanentTransportError reports transport failures no retry can fix: a
+// certificate that does not verify, or an endpoint that is not an http(s) URL.
+func permanentTransportError(err error) bool {
+	var certErr *tls.CertificateVerificationError
+	if errors.As(err, &certErr) {
+		return true
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr) && urlErr.Err != nil &&
+		strings.HasPrefix(urlErr.Err.Error(), "unsupported protocol scheme")
+}
+
+// maxRetryAfterSeconds saturates absurd delay-seconds values before they can
+// overflow a Duration.
+const maxRetryAfterSeconds = 1 << 20
+
+// parseRetryAfter reads a Retry-After value: delay-seconds (digits only) or an
+// HTTP date (relative to now; a date in the past is no wait). ok is false for
+// anything else, which the caller treats as absent.
+func parseRetryAfter(value string, now time.Time) (d time.Duration, ok bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if strings.Trim(value, "0123456789") == "" {
+		secs, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || secs > maxRetryAfterSeconds {
+			secs = maxRetryAfterSeconds
+		}
+		return time.Duration(secs) * time.Second, true
+	}
+	if t, err := http.ParseTime(value); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d, true
+		}
+		return 0, true
+	}
+	return 0, false
+}
+
+// retryDelay is how long to wait before retry number retryNumber (1 for the
+// first retry): what Retry-After says when it is usable, otherwise a random
+// draw from [0, min(maxDelay, baseDelay*2^(n-1))) -- exponential backoff with
+// full jitter. ok is false when Retry-After asks for longer than maxRetryAfter:
+// the server is not going to be ready within anything worth waiting for here.
+func (c *Client) retryDelay(retryNumber int, header http.Header) (wait time.Duration, ok bool) {
+	if header != nil {
+		if d, parsed := parseRetryAfter(header.Get("Retry-After"), c.retry.now()); parsed {
+			if d > c.retry.maxRetryAfter {
+				return 0, false
+			}
+			return d, true
+		}
 	}
 
-	if out == nil || len(data) == 0 {
-		return nil
+	ceiling := c.retry.baseDelay
+	for i := 1; i < retryNumber && ceiling < c.retry.maxDelay; i++ {
+		ceiling *= 2
 	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("client: decode response body: %w", err)
+	if ceiling > c.retry.maxDelay {
+		ceiling = c.retry.maxDelay
 	}
-	return nil
+	return c.retry.jitter(ceiling), true
 }
 
 // orgPath builds an absolute URL under /v1/orgs/{org}/ for the given
@@ -403,7 +752,8 @@ func (c *Client) ListPublicIps(ctx context.Context) ([]PublicIp, error) {
 }
 
 // GetPublicIp has no single-item GET counterpart in the API; it lists and
-// filters, returning an *APIError with Status 404 when id is absent.
+// filters, returning an *APIError with Status 404 (code not_found, like the
+// API's own answer for a missing public IP) when id is absent.
 func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) {
 	ips, err := c.ListPublicIps(ctx)
 	if err != nil {
@@ -416,7 +766,7 @@ func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) 
 	}
 	return nil, &APIError{
 		Status: http.StatusNotFound,
-		Code:   "public_ip_not_found",
+		Code:   "not_found",
 		Detail: fmt.Sprintf("public ip %s not found", id),
 	}
 }

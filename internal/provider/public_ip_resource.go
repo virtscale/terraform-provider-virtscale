@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
@@ -272,7 +273,7 @@ func (r *PublicIpResource) Delete(ctx context.Context, req resource.DeleteReques
 	}
 
 	_, _, err := r.client.ReleasePublicIp(ctx, state.ID.ValueString())
-	if err != nil && !client.IsNotFound(err) {
+	if err != nil && !client.IsNotFound(err) && !r.releaseAlreadyUnderway(ctx, state.ID.ValueString(), err) {
 		resp.Diagnostics.AddError("Unable to Release Public IP", apiErrorDetail(err))
 		return
 	}
@@ -286,6 +287,24 @@ func (r *PublicIpResource) Delete(ctx context.Context, req resource.DeleteReques
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Wait for Public IP Release", err.Error())
 	}
+}
+
+// releaseAlreadyUnderway is removalAlreadyUnderway for a public IP. A release
+// is accepted from allocated, associated or error; from releasing it is 409
+// public_ip_not_releasable. That 409 means "already being released" only when
+// reading the address back shows it gone or releasing; any other 409 (an
+// address still pending, associating or disassociating) is a real refusal and
+// is returned as it came.
+func (r *PublicIpResource) releaseAlreadyUnderway(ctx context.Context, id string, err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
+		return false
+	}
+	ip, getErr := r.client.GetPublicIp(ctx, id)
+	if client.IsNotFound(getErr) {
+		return true
+	}
+	return getErr == nil && ip.State == "releasing"
 }
 
 // ImportState imports by id, passthrough.

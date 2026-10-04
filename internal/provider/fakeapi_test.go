@@ -1,37 +1,71 @@
 package provider
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
-
-	"gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/client"
 )
 
-// fakeAPI is an in-process httptest fake of the VirtScale customer API,
-// scoped to the compute/vms surface the provider and its resources need.
-// It is deliberately structured so a later task can add compute/public-ips
-// routes alongside createVm/getVm/deleteVm without reshaping this file.
+// fakeAPI is an in-process httptest fake of the VirtScale customer API
+// (s3-control-plane 94f5021f), scoped to the compute surface the provider
+// needs: VMs, public IPs and the image catalogue.
+//
+// It deliberately does NOT reuse internal/client's types. Its wire structs
+// below are transcribed from the deployed OpenAPI spec, so a wrong JSON tag in
+// the client shows up as a failing test instead of being mirrored on the way
+// out. docs/verification/terraform-provider-virtscale/04-contract-94f5021f.md
+// lists, behaviour by behaviour, what is emulated and from which handler.
 type fakeAPI struct {
 	apiKey string
 	org    string
 	srv    *httptest.Server
 
 	mu          sync.Mutex
-	vms         map[string]*client.Vm
+	vms         map[string]*fakeVm
 	createCount int
 	lastIdemKey string
 	nextOctet   int
+	vmSeq       int
+	opSeq       int
+	reqSeq      int
 
-	publicIPs        map[string]*client.PublicIp
+	// idem is the Idempotency-Key store of the VM create (db/idempotency.py):
+	// same key and same body replays the stored response.
+	idem         map[string]*idemRecord
+	idemKeysSeen []string
+
+	// keys maps an API key to the scopes it was issued; sourceDenied makes
+	// every authenticated request fail the key's allowed_cidrs check.
+	keys         map[string][]string
+	sourceDenied bool
+
+	// faults are injected failures, served in order of registration.
+	faults       []*fakeFault
+	faultsServed int
+
+	publicIPs        map[string]*fakePublicIP
 	pubIPCreateCount int
 	pubIPNextOctet   int
+	// publicIPQuota is QuotaProfile.public_ips: 1 for customer-default,
+	// negative for unlimited.
+	publicIPQuota int
+
+	// Pacing: how many reads a delete stays in "deleting", and how many list
+	// reads still show a release as "releasing".
+	deleteSteps  int
+	releaseSteps int
 
 	// callSeq records, per public IP id, the order "disassociate"/"release"
 	// calls were observed -- used to assert Delete disassociates before it
@@ -39,18 +73,153 @@ type fakeAPI struct {
 	callSeq map[string][]string
 }
 
+// --- wire types (customer-v1.json) ---------------------------------------
+
+type wireImageRef struct {
+	GlanceID string `json:"glance_id"`
+	Name     string `json:"name"`
+}
+
+type wireVmOut struct {
+	ID                string         `json:"id"`
+	OrgID             string         `json:"org_id"`
+	RegionID          string         `json:"region_id"`
+	Name              string         `json:"name"`
+	FQDN              *string        `json:"fqdn"`
+	Image             wireImageRef   `json:"image"`
+	VCPUs             int            `json:"vcpus"`
+	MemoryMB          int            `json:"memory_mb"`
+	DiskGB            int            `json:"disk_gb"`
+	StoragePoolID     string         `json:"storage_pool_id"`
+	WorkloadType      string         `json:"workload_type"`
+	NetworkProfileID  string         `json:"network_profile_id"`
+	State             string         `json:"state"`
+	DesiredState      string         `json:"desired_state"`
+	ErrorClass        *string        `json:"error_class"`
+	ErrorDetail       *string        `json:"error_detail"`
+	ObservedStatus    *string        `json:"observed_status"`
+	ObservedAddresses map[string]any `json:"observed_addresses"`
+	ObservedAt        *time.Time     `json:"observed_at"`
+	SSHKeyNames       []string       `json:"ssh_key_names"`
+	UserDataPresent   bool           `json:"user_data_present"`
+	Protected         bool           `json:"protected"`
+	AllowedActions    []string       `json:"allowed_actions"`
+	CreatedAt         time.Time      `json:"created_at"`
+	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+type wireOperationRef struct {
+	ID           string     `json:"id"`
+	Type         string     `json:"type"`
+	State        string     `json:"state"`
+	ResourceType string     `json:"resource_type"`
+	ResourceID   string     `json:"resource_id"`
+	Attempt      int        `json:"attempt"`
+	MaxAttempts  int        `json:"max_attempts"`
+	ErrorClass   *string    `json:"error_class"`
+	ErrorDetail  *string    `json:"error_detail"`
+	CreatedAt    time.Time  `json:"created_at"`
+	FinishedAt   *time.Time `json:"finished_at"`
+}
+
+type wirePublicIpOut struct {
+	ID        string    `json:"id"`
+	RegionID  string    `json:"region_id"`
+	Address   *string   `json:"address"`
+	VmID      *string   `json:"vm_id"`
+	State     string    `json:"state"`
+	Error     *string   `json:"error"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+type wireImageOut struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	OSDistro  *string `json:"os_distro"`
+	OSVersion *string `json:"os_version"`
+	MinDiskGB int     `json:"min_disk_gb"`
+	MinRAMMB  int     `json:"min_ram_mb"`
+}
+
+type wireList[T any] struct {
+	Items      []T     `json:"items"`
+	NextCursor *string `json:"next_cursor"`
+}
+
+type wireFieldError struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
+// fakeVm is one VM row: what the API shows, plus what only the control plane
+// knows.
+type fakeVm struct {
+	wireVmOut
+
+	// inFlight is true while an operation (the create, then a delete) is
+	// converging the row: uq_operations_one_in_flight allows one per resource.
+	inFlight bool
+	// deletedAt is the soft-delete tombstone the executor writes together with
+	// state=deleted; a row carrying it reads as absent.
+	deletedAt *time.Time
+	// deletingLeft counts the reads the vm still stays in state deleting.
+	deletingLeft int
+}
+
+// fakeFault is one injected failure.
+type fakeFault struct {
+	match     func(*http.Request) bool
+	respond   func(*reqCtx)
+	after     bool // process the request first, then replace the answer
+	remaining int
+}
+
+// idemRecord is one stored Idempotency-Key answer.
+type idemRecord struct {
+	payloadHash string
+	status      int
+	body        []byte
+	location    string
+}
+
+// fakePublicIP is one public IP row.
+type fakePublicIP struct {
+	wirePublicIpOut
+
+	// releasingLeft counts the list reads that still show the row releasing.
+	releasingLeft int
+}
+
+// allVmActions is VmOut.allowed_actions for a VM in an ordinary region.
+var allVmActions = []string{
+	"start", "stop", "reboot", "console", "resize", "rebuild", "rescue", "unrescue",
+	"delete", "firewall", "public_ip", "protection",
+}
+
+var anyUUIDRE = regexp.MustCompile(`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// fakeUUID is a deterministic, valid version-4 UUID: kind 1 vms, 2 public IPs,
+// 3 operations.
+func fakeUUID(kind, n int) string {
+	return fmt.Sprintf("00000000-0000-4%03x-8000-%012x", kind, n)
+}
+
 // newFakeAPI starts a fake API server scoped to apiKey/org and registers its
-// shutdown with t.Cleanup.
+// shutdown with t.Cleanup. org must be a UUID, as it is on the real API.
 func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 	t.Helper()
 
 	f := &fakeAPI{
 		apiKey:         apiKey,
 		org:            org,
-		vms:            make(map[string]*client.Vm),
+		vms:            make(map[string]*fakeVm),
+		idem:           make(map[string]*idemRecord),
+		keys:           map[string][]string{apiKey: {"compute:write", "network:write"}},
 		nextOctet:      10,
-		publicIPs:      make(map[string]*client.PublicIp),
+		publicIPs:      make(map[string]*fakePublicIP),
 		pubIPNextOctet: 10,
+		publicIPQuota:  1,
+		deleteSteps:    1,
 		callSeq:        make(map[string][]string),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
@@ -111,6 +280,120 @@ func (f *fakeAPI) CallSequence(id string) []string {
 	return out
 }
 
+// SetPublicIPQuota sets the per-region public IP ceiling (negative: unlimited).
+func (f *fakeAPI) SetPublicIPQuota(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publicIPQuota = n
+}
+
+// AddKey registers another API key with the given scopes. The fake's own
+// apiKey holds compute:write and network:write, which is what the provider
+// needs for every resource it has (README, "API key scopes").
+func (f *fakeAPI) AddKey(key string, scopes ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.keys[key] = append([]string(nil), scopes...)
+}
+
+// DenySourceAddress makes every authenticated request answer 403
+// source_address_not_allowed, as a key whose allowed_cidrs exclude the caller.
+func (f *fakeAPI) DenySourceAddress() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sourceDenied = true
+}
+
+// FailNext answers the next n requests matching match with respond, without
+// processing them (a proxy or rate limiter in front of the API).
+func (f *fakeAPI) FailNext(n int, match func(*http.Request) bool, respond func(*reqCtx)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = append(f.faults, &fakeFault{match: match, respond: respond, remaining: n})
+}
+
+// FailNextAfterHandling processes the next n requests matching match and then
+// answers with respond instead: the response was lost.
+func (f *fakeAPI) FailNextAfterHandling(n int, match func(*http.Request) bool, respond func(*reqCtx)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = append(f.faults, &fakeFault{match: match, respond: respond, after: true, remaining: n})
+}
+
+// FaultsServed reports how many injected failures have been served.
+func (f *fakeAPI) FaultsServed() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.faultsServed
+}
+
+// IdempotencyKeys lists the Idempotency-Key of every create that reached the API.
+func (f *fakeAPI) IdempotencyKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.idemKeysSeen...)
+}
+
+// takeFault returns the first registered fault matching r that has failures
+// left, consuming one.
+func (f *fakeAPI) takeFault(r *http.Request) *fakeFault {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, fault := range f.faults {
+		if fault.remaining > 0 && fault.match(r) {
+			fault.remaining--
+			f.faultsServed++
+			return fault
+		}
+	}
+	return nil
+}
+
+// SSHKeyNames reports the keypair names the API recorded for vm id.
+func (f *fakeAPI) SSHKeyNames(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), vm.SSHKeyNames...)
+}
+
+// Protect switches deletion protection on or off for vm id (VmOut.protected).
+// While it is on a delete is 409 vm_protected, and allowed_actions drops delete.
+func (f *fakeAPI) Protect(id string, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok {
+		return
+	}
+	vm.Protected = on
+	vm.AllowedActions = nil
+	for _, action := range allVmActions {
+		if !(on && action == "delete") {
+			vm.AllowedActions = append(vm.AllowedActions, action)
+		}
+	}
+}
+
+// SetDeleteSteps makes a delete stay in state "deleting" for n reads before
+// the vm is gone (the default is one), so a test can act while it runs.
+func (f *fakeAPI) SetDeleteSteps(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteSteps = n
+}
+
+// SetReleaseSteps makes a release keep its row, in state "releasing", for n
+// list reads before it disappears (the default is zero: the first list drops it).
+func (f *fakeAPI) SetReleaseSteps(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseSteps = n
+}
+
 // Vanish removes vm id from the store entirely, so the next GetVm returns a
 // genuine 404 -- unlike deleteVm, which retains the vm in state "deleted".
 // It simulates an out-of-band deletion.
@@ -120,52 +403,271 @@ func (f *fakeAPI) Vanish(id string) {
 	delete(f.vms, id)
 }
 
-func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
-	if !f.checkAuth(w, r) {
-		return
-	}
+// --- request plumbing ------------------------------------------------------
 
-	org, rest, ok := splitOrgPath(r.URL.Path)
-	if !ok {
-		writeProblem(w, http.StatusNotFound, "not_found", "unknown path")
-		return
-	}
-	if org != f.org {
-		writeProblem(w, http.StatusNotFound, "org_not_found", fmt.Sprintf("organization %q not found", org))
-		return
-	}
+// reqCtx is one request in flight: it knows its own request id, which every
+// response (success or problem) carries, like the real API's X-Request-ID.
+type reqCtx struct {
+	f      *fakeAPI
+	w      http.ResponseWriter
+	r      *http.Request
+	rid    string
+	scopes []string // the authenticated key's scopes
+}
 
+func (f *fakeAPI) newReqCtx(w http.ResponseWriter, r *http.Request) *reqCtx {
+	f.mu.Lock()
+	f.reqSeq++
+	rid := fmt.Sprintf("req-%06d", f.reqSeq)
+	f.mu.Unlock()
+	return &reqCtx{f: f, w: w, r: r, rid: rid}
+}
+
+// json writes a success body. headers is a flat list of name/value pairs.
+func (rc *reqCtx) json(status int, v any, headers ...string) {
+	rc.w.Header().Set("Content-Type", "application/json")
+	rc.w.Header().Set("X-Request-ID", rc.rid)
+	for i := 0; i+1 < len(headers); i += 2 {
+		rc.w.Header().Set(headers[i], headers[i+1])
+	}
+	rc.w.WriteHeader(status)
+	_ = json.NewEncoder(rc.w).Encode(v)
+}
+
+// raw writes an already-encoded success body (an idempotent replay).
+func (rc *reqCtx) raw(status int, body []byte, headers ...string) {
+	rc.w.Header().Set("Content-Type", "application/json")
+	rc.w.Header().Set("X-Request-ID", rc.rid)
+	for i := 0; i+1 < len(headers); i += 2 {
+		rc.w.Header().Set(headers[i], headers[i+1])
+	}
+	rc.w.WriteHeader(status)
+	_, _ = rc.w.Write(body)
+}
+
+const problemTypeBase = "https://docs.virtscale.nl/s3/problems/"
+
+// problem writes an RFC 9457 problem+json response in the shape errors.py
+// renders: type, title, status, detail, instance, code, request_id and, when
+// there are any, errors[].
+func (rc *reqCtx) problem(status int, code, title, detail string, errs ...wireFieldError) {
+	body := map[string]any{
+		"type":       problemTypeBase + code,
+		"title":      title,
+		"status":     status,
+		"detail":     detail,
+		"instance":   rc.r.URL.Path,
+		"code":       code,
+		"request_id": rc.rid,
+	}
+	if len(errs) > 0 {
+		body["errors"] = errs
+	}
+	rc.w.Header().Set("Content-Type", "application/problem+json")
+	rc.w.Header().Set("X-Request-ID", rc.rid)
+	rc.w.WriteHeader(status)
+	_ = json.NewEncoder(rc.w).Encode(body)
+}
+
+func (rc *reqCtx) notFound(resource string) {
+	rc.problem(http.StatusNotFound, "not_found", "Resource not found",
+		"no "+resource+" matching that identifier is visible to this organization")
+}
+
+func (rc *reqCtx) conflict(code, detail string) {
+	rc.problem(http.StatusConflict, code, "Conflict", detail)
+}
+
+func (rc *reqCtx) unprocessable(code, detail string) {
+	rc.problem(http.StatusUnprocessableEntity, code, "Unprocessable", detail)
+}
+
+// invalid is a 400 invalid_request, the shape every validation failure takes.
+func (rc *reqCtx) invalid(errs ...wireFieldError) {
+	rc.problem(http.StatusBadRequest, "invalid_request", "Invalid request",
+		"the request body or parameters failed validation", errs...)
+}
+
+// parseRoute maps (method, path below the org) to a route key and the uuid
+// path parameter, if any.
+func parseRoute(method, rest string) (key, param, id string, ok bool) {
+	parts := strings.Split(rest, "/")
 	switch {
-	case rest == "compute/vms" && r.Method == http.MethodPost:
-		f.createVm(w, r)
-	case strings.HasPrefix(rest, "compute/vms/") && r.Method == http.MethodGet:
-		f.getVm(w, strings.TrimPrefix(rest, "compute/vms/"))
-	case strings.HasPrefix(rest, "compute/vms/") && r.Method == http.MethodDelete:
-		f.deleteVm(w, strings.TrimPrefix(rest, "compute/vms/"))
-	case rest == "compute/public-ips" && r.Method == http.MethodPost:
-		f.createPublicIp(w, r)
-	case rest == "compute/public-ips" && r.Method == http.MethodGet:
-		f.listPublicIps(w, r)
-	case strings.HasPrefix(rest, "compute/public-ips/") && strings.HasSuffix(rest, "/associate") && r.Method == http.MethodPost:
-		id := strings.TrimSuffix(strings.TrimPrefix(rest, "compute/public-ips/"), "/associate")
-		f.associatePublicIp(w, r, id)
-	case strings.HasPrefix(rest, "compute/public-ips/") && strings.HasSuffix(rest, "/disassociate") && r.Method == http.MethodPost:
-		id := strings.TrimSuffix(strings.TrimPrefix(rest, "compute/public-ips/"), "/disassociate")
-		f.disassociatePublicIp(w, id)
-	case strings.HasPrefix(rest, "compute/public-ips/") && r.Method == http.MethodDelete:
-		f.releasePublicIp(w, strings.TrimPrefix(rest, "compute/public-ips/"))
-	case rest == "compute/images" && r.Method == http.MethodGet:
-		f.listImages(w, r)
+	case rest == "compute/vms":
+		key = "compute/vms"
+	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "vms":
+		key, param, id = "compute/vms/{vm_id}", "vm_id", parts[2]
+	case rest == "compute/images":
+		key = "compute/images"
+	case rest == "compute/public-ips":
+		key = "compute/public-ips"
+	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "public-ips":
+		key, param, id = "compute/public-ips/{public_ip_id}", "public_ip_id", parts[2]
+	case len(parts) == 4 && parts[0] == "compute" && parts[1] == "public-ips" && (parts[3] == "associate" || parts[3] == "disassociate"):
+		key, param, id = "compute/public-ips/{public_ip_id}/"+parts[3], "public_ip_id", parts[2]
 	default:
-		writeProblem(w, http.StatusNotFound, "not_found", "unknown route")
+		return "", "", "", false
+	}
+	switch method + " " + key {
+	case "POST compute/vms", "GET compute/vms/{vm_id}", "DELETE compute/vms/{vm_id}",
+		"GET compute/images",
+		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
+		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate":
+		return method + " " + key, param, id, true
+	}
+	return "", "", "", false
+}
+
+func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
+	rc := f.newReqCtx(w, r)
+	if fault := f.takeFault(r); fault != nil {
+		if fault.after {
+			f.serve(&reqCtx{f: f, w: httptest.NewRecorder(), r: r, rid: rc.rid})
+		}
+		fault.respond(rc)
+		return
+	}
+	f.serve(rc)
+}
+
+// routePermissions is ROUTE_PERMISSIONS (permissions.py) restricted to the
+// routes this fake serves.
+var routePermissions = map[string]string{
+	"POST compute/vms":                                    "compute.instance.create",
+	"GET compute/vms/{vm_id}":                             "compute.instance.read",
+	"DELETE compute/vms/{vm_id}":                          "compute.instance.delete",
+	"GET compute/images":                                  "compute.instance.list",
+	"GET compute/public-ips":                              "edge.public_ip.read",
+	"POST compute/public-ips":                             "edge.public_ip.allocate",
+	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
+	"POST compute/public-ips/{public_ip_id}/associate":    "edge.public_ip.allocate",
+	"POST compute/public-ips/{public_ip_id}/disassociate": "edge.public_ip.release",
+}
+
+// scopeGrants is SCOPE_PERMISSIONS (permissions.py): the legacy read and write
+// scopes, and the family bundles compute:* (compute. and operation.) and
+// network:* (network. and edge.), each also carrying org.read.
+func scopeGrants(scope, perm string) bool {
+	isRead := strings.HasSuffix(perm, ".read") || strings.HasSuffix(perm, ".list")
+	switch scope {
+	case "write":
+		return !strings.HasPrefix(perm, "iam.")
+	case "read":
+		return !strings.HasPrefix(perm, "iam.") && isRead
+	case "compute:read", "compute:write", "network:read", "network:write":
+		if perm == "org.read" {
+			return true
+		}
+		family, half, _ := strings.Cut(scope, ":")
+		prefixes := []string{"compute.", "operation."}
+		if family == "network" {
+			prefixes = []string{"network.", "edge."}
+		}
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(perm, prefix) {
+				return half == "write" || isRead
+			}
+		}
+	}
+	return false
+}
+
+func (rc *reqCtx) allows(perm string) bool {
+	for _, scope := range rc.scopes {
+		if scopeGrants(scope, perm) {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeAPI) serve(rc *reqCtx) {
+	r := rc.r
+	orgRaw, rest, ok := splitOrgPath(r.URL.Path)
+	if !ok {
+		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
+		return
+	}
+	route, param, id, ok := parseRoute(r.Method, rest)
+	if !ok {
+		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
+		return
+	}
+
+	// A malformed organization is refused before the credential is looked at
+	// (deps.py current_principal), so it is a 400 whatever the key.
+	if !anyUUIDRE.MatchString(orgRaw) {
+		rc.invalid(wireFieldError{Field: "org", Message: "Input should be a valid UUID"})
+		return
+	}
+	if !f.authenticate(rc) {
+		return
+	}
+	// The org boundary: a key for another organization reads exactly like an
+	// organization that does not exist (deps.py: 404 not_found).
+	if orgRaw != f.org {
+		rc.notFound("organization")
+		return
+	}
+	// A key restricted to other networks is refused once it has proved to be a
+	// valid key of this organization (deps.py _principal_from_api_token).
+	f.mu.Lock()
+	denied := f.sourceDenied
+	f.mu.Unlock()
+	if denied {
+		rc.problem(http.StatusForbidden, "source_address_not_allowed", "Forbidden",
+			"this API token cannot be used from this network address")
+		return
+	}
+	// Then the permission (require_permission), before anything about the
+	// request itself is validated.
+	if perm := routePermissions[route]; perm != "" && !rc.allows(perm) {
+		rc.problem(http.StatusForbidden, "permission_denied", "Forbidden",
+			"this credential does not carry the '"+perm+"' permission")
+		return
+	}
+	// Path parameters are validated with the rest of the request, after the
+	// credential and the org boundary (FastAPI raises dependency errors first).
+	if param != "" && !anyUUIDRE.MatchString(id) {
+		rc.invalid(wireFieldError{Field: param, Message: "Input should be a valid UUID"})
+		return
+	}
+
+	switch route {
+	case "POST compute/vms":
+		f.createVm(rc)
+	case "GET compute/vms/{vm_id}":
+		f.getVm(rc, id)
+	case "DELETE compute/vms/{vm_id}":
+		f.deleteVm(rc, id)
+	case "POST compute/public-ips":
+		f.createPublicIp(rc)
+	case "GET compute/public-ips":
+		f.listPublicIps(rc)
+	case "POST compute/public-ips/{public_ip_id}/associate":
+		f.associatePublicIp(rc, id)
+	case "POST compute/public-ips/{public_ip_id}/disassociate":
+		f.disassociatePublicIp(rc, id)
+	case "DELETE compute/public-ips/{public_ip_id}":
+		f.releasePublicIp(rc, id)
+	case "GET compute/images":
+		f.listImages(rc)
 	}
 }
 
-func (f *fakeAPI) checkAuth(w http.ResponseWriter, r *http.Request) bool {
-	if r.Header.Get("Authorization") != "Bearer "+f.apiKey {
-		writeProblem(w, http.StatusUnauthorized, "invalid_api_key", "the api key is invalid")
+// authenticate checks the bearer credential: any other key is the deployed
+// 401 ("one message for unparseable / unknown / wrong secret / revoked /
+// expired").
+func (f *fakeAPI) authenticate(rc *reqCtx) bool {
+	key, found := strings.CutPrefix(rc.r.Header.Get("Authorization"), "Bearer ")
+	f.mu.Lock()
+	scopes, ok := f.keys[key]
+	f.mu.Unlock()
+	if !found || !ok {
+		rc.problem(http.StatusUnauthorized, "unauthorized", "Unauthorized", "the presented API token is not valid")
 		return false
 	}
+	rc.scopes = scopes
 	return true
 }
 
@@ -187,57 +689,252 @@ func splitOrgPath(p string) (org, rest string, ok bool) {
 	return orgEsc, p[idx+1:], true
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+// --- strict body decoding (pydantic RequestModel, extra="forbid") ----------
+
+// bodyCheck decodes a JSON object field by field the way a pydantic model with
+// extra="forbid" does, collecting {field, message} entries instead of stopping
+// at the first.
+type bodyCheck struct {
+	raw  map[string]json.RawMessage
+	seen map[string]bool
+	errs []wireFieldError
 }
 
-func writeProblem(w http.ResponseWriter, status int, code, detail string) {
-	w.Header().Set("Content-Type", "application/problem+json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"type":   "about:blank",
-		"title":  http.StatusText(status),
-		"status": status,
-		"code":   code,
-		"detail": detail,
-	})
+func newBodyCheck(r io.Reader) *bodyCheck {
+	b := &bodyCheck{seen: map[string]bool{}}
+	data, _ := io.ReadAll(r)
+	if err := json.Unmarshal(data, &b.raw); err != nil || b.raw == nil {
+		b.errs = append(b.errs, wireFieldError{Field: "0", Message: "JSON decode error"})
+		b.raw = map[string]json.RawMessage{}
+	}
+	return b
 }
 
-type fakeVmCreateRequest struct {
-	Name           string   `json:"name"`
-	Image          string   `json:"image"`
-	VCPUs          int      `json:"vcpus"`
-	MemoryMB       int      `json:"memory_mb"`
-	DiskGB         int      `json:"disk_gb"`
-	StoragePool    string   `json:"storage_pool"`
-	Region         string   `json:"region"`
-	NetworkProfile string   `json:"network_profile"`
-	SSHKeys        []string `json:"ssh_keys"`
+func (b *bodyCheck) fail(field, message string) {
+	b.errs = append(b.errs, wireFieldError{Field: field, Message: message})
 }
 
-func (f *fakeAPI) createVm(w http.ResponseWriter, r *http.Request) {
-	var req fakeVmCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid request body")
+// present reports whether name was sent, recording a "Field required" error
+// when it is required and absent.
+func (b *bodyCheck) present(name string, required bool) (json.RawMessage, bool) {
+	b.seen[name] = true
+	raw, ok := b.raw[name]
+	if !ok && required {
+		b.fail(name, "Field required")
+	}
+	return raw, ok
+}
+
+func (b *bodyCheck) str(name string, required bool, minLen, maxLen int) string {
+	raw, ok := b.present(name, required)
+	if !ok {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		b.fail(name, "Input should be a valid string")
+		return ""
+	}
+	if len([]rune(s)) < minLen {
+		b.fail(name, fmt.Sprintf("String should have at least %d character", minLen))
+	}
+	if maxLen > 0 && len([]rune(s)) > maxLen {
+		b.fail(name, fmt.Sprintf("String should have at most %d characters", maxLen))
+	}
+	return s
+}
+
+func (b *bodyCheck) nullableStr(name string) *string {
+	raw, ok := b.present(name, false)
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		b.fail(name, "Input should be a valid string")
+		return nil
+	}
+	return &s
+}
+
+func (b *bodyCheck) uuid(name string, required bool) string {
+	s := b.str(name, required, 0, 0)
+	if s != "" && !anyUUIDRE.MatchString(s) {
+		b.fail(name, "Input should be a valid UUID")
+	}
+	return s
+}
+
+func (b *bodyCheck) integer(name string, required bool, ge int64) int {
+	raw, ok := b.present(name, required)
+	if !ok {
+		return 0
+	}
+	var n int64
+	if err := json.Unmarshal(raw, &n); err != nil {
+		b.fail(name, "Input should be a valid integer, unable to parse string as an integer")
+		return 0
+	}
+	if n < ge {
+		b.fail(name, fmt.Sprintf("Input should be greater than or equal to %d", ge))
+	}
+	return int(n)
+}
+
+func (b *bodyCheck) strList(name string) []string {
+	raw, ok := b.present(name, false)
+	if !ok {
+		return []string{}
+	}
+	var l []string
+	if err := json.Unmarshal(raw, &l); err != nil {
+		b.fail(name, "Input should be a valid list")
+		return []string{}
+	}
+	if l == nil {
+		l = []string{}
+	}
+	return l
+}
+
+// finish reports every field the model does not declare, then all errors.
+func (b *bodyCheck) finish() []wireFieldError {
+	for name := range b.raw {
+		if !b.seen[name] {
+			b.fail(name, "Extra inputs are not permitted")
+		}
+	}
+	sort.SliceStable(b.errs, func(i, j int) bool { return b.errs[i].Field < b.errs[j].Field })
+	return b.errs
+}
+
+// --- VM handlers -----------------------------------------------------------
+
+type vmCreateIn struct {
+	Name, Image, StoragePool, Region, NetworkProfile, WorkloadType string
+	VCPUs, MemoryMB, DiskGB                                        int
+	SSHKeys                                                        []string
+	UserData                                                       *string
+}
+
+func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
+	b := newBodyCheck(r)
+	in := vmCreateIn{
+		Name:           b.str("name", true, 1, 80),
+		Image:          b.str("image", true, 0, 0),
+		VCPUs:          b.integer("vcpus", true, 1),
+		MemoryMB:       b.integer("memory_mb", true, 256),
+		DiskGB:         b.integer("disk_gb", true, 1),
+		StoragePool:    b.str("storage_pool", true, 0, 0),
+		Region:         b.str("region", true, 0, 0),
+		NetworkProfile: b.str("network_profile", true, 0, 0),
+		WorkloadType:   b.str("workload_type", false, 0, 0),
+		SSHKeys:        b.strList("ssh_keys"),
+		UserData:       b.nullableStr("user_data"),
+	}
+	if in.WorkloadType == "" {
+		in.WorkloadType = "customer"
+	}
+	return in, b.finish()
+}
+
+func (f *fakeAPI) newOperation(typ, resourceType, resourceID string, now time.Time) wireOperationRef {
+	f.opSeq++
+	return wireOperationRef{
+		ID:           fakeUUID(3, f.opSeq),
+		Type:         typ,
+		State:        "pending",
+		ResourceType: resourceType,
+		ResourceID:   resourceID,
+		Attempt:      0,
+		MaxAttempts:  3,
+		CreatedAt:    now,
+	}
+}
+
+func (f *fakeAPI) operationLocation(op wireOperationRef) string {
+	return "/v1/orgs/" + f.org + "/operations/" + op.ID
+}
+
+// vmNameRE is naming.py's NAME_RE: a DNS label, 1-63 characters.
+var vmNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// canonicalVmName is naming.py canonical_name: trimmed, lower-cased, a
+// trailing .virtscale.nl stripped, then it must be a DNS label.
+func canonicalVmName(raw string) (string, bool) {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".virtscale.nl")
+	return name, vmNameRE.MatchString(name)
+}
+
+const (
+	detailOperationInFlightVm = "another operation is already running for this VM; wait for it to finish and retry"
+	detailUserDataUnsupported = "user_data is not accepted: the instance is built asynchronously, so cloud-init would " +
+		"have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, " +
+		"so where such a payload may live is still an open design question"
+)
+
+// createVm follows compute.py create_vm's gate order: body validation, then
+// user_data (before the key is claimed), then the Idempotency-Key claim, then
+// create_vm_request's own checks.
+func (f *fakeAPI) createVm(rc *reqCtx) {
+	req, errs := decodeVmCreate(rc.r.Body)
+	if len(errs) > 0 {
+		rc.invalid(errs...)
+		return
+	}
+	if req.UserData != nil {
+		rc.unprocessable("user_data_unsupported", detailUserDataUnsupported)
 		return
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	key := rc.r.Header.Get("Idempotency-Key")
+	var digest string
+	if key != "" {
+		f.idemKeysSeen = append(f.idemKeysSeen, key)
+		sum := sha256.Sum256([]byte(fmt.Sprintf("%+v", req)))
+		digest = hex.EncodeToString(sum[:])
+		if rec, ok := f.idem[key]; ok {
+			if rec.payloadHash != digest {
+				rc.conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+				return
+			}
+			rc.raw(rec.status, rec.body, "Location", rec.location)
+			return
+		}
+	}
+
+	name, ok := canonicalVmName(req.Name)
+	if !ok {
+		rc.unprocessable("invalid_name", "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'")
+		return
+	}
+	if len(req.SSHKeys) > 1 {
+		rc.unprocessable("too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use")
+		return
+	}
+	if req.WorkloadType != "customer" {
+		if req.WorkloadType != "infra" {
+			rc.unprocessable("invalid_spec", "workload_type must be one of: infra, customer")
+			return
+		}
+		rc.unprocessable("workload_not_allowed", "a customer account cannot request infra workloads")
+		return
+	}
 	for _, existing := range f.vms {
-		if existing.Name == req.Name && existing.State != "deleted" {
-			writeProblem(w, http.StatusConflict, "name_taken", fmt.Sprintf("an instance named %q already exists", req.Name))
+		if existing.Name == name && existing.RegionID == req.Region && existing.deletedAt == nil {
+			rc.conflict("name_taken", fmt.Sprintf("a VM named '%s' already exists in %s", name, req.Region))
 			return
 		}
 	}
 
 	f.createCount++
-	f.lastIdemKey = r.Header.Get("Idempotency-Key")
+	f.vmSeq++
+	f.lastIdemKey = key
 
-	id := fmt.Sprintf("vm-%d", f.createCount)
+	id := fakeUUID(1, f.vmSeq)
 	now := time.Now().UTC()
 
 	// An "alias-" prefixed image id simulates a catalogue id (ImageOut.id)
@@ -249,68 +946,88 @@ func (f *fakeAPI) createVm(w http.ResponseWriter, r *http.Request) {
 		glanceID = req.Image + "-glance-uuid"
 	}
 
-	vm := &client.Vm{
-		ID:                id,
-		OrgID:             f.org,
-		RegionID:          req.Region,
-		Name:              req.Name,
-		FQDN:              nil,
-		Image:             client.ImageRef{GlanceID: glanceID, Name: req.Image},
-		VCPUs:             req.VCPUs,
-		MemoryMB:          req.MemoryMB,
-		DiskGB:            req.DiskGB,
-		StoragePoolID:     req.StoragePool,
-		NetworkProfileID:  req.NetworkProfile,
-		State:             "pending",
-		DesiredState:      "running",
-		ObservedAddresses: nil,
-		SSHKeyNames:       req.SSHKeys,
-		CreatedAt:         now,
-		UpdatedAt:         now,
+	vm := &fakeVm{
+		wireVmOut: wireVmOut{
+			ID:               id,
+			OrgID:            f.org,
+			RegionID:         req.Region,
+			Name:             name,
+			Image:            wireImageRef{GlanceID: glanceID, Name: req.Image},
+			VCPUs:            req.VCPUs,
+			MemoryMB:         req.MemoryMB,
+			DiskGB:           req.DiskGB,
+			StoragePoolID:    req.StoragePool,
+			WorkloadType:     "customer",
+			NetworkProfileID: req.NetworkProfile,
+			State:            "pending",
+			DesiredState:     "running",
+			SSHKeyNames:      req.SSHKeys,
+			AllowedActions:   allVmActions,
+			CreatedAt:        now,
+			UpdatedAt:        now,
+		},
+		inFlight: true,
 	}
 	f.vms[id] = vm
 
-	op := client.Operation{
-		ID:           id + "-create",
-		Type:         "create_vm",
-		State:        "pending",
-		ResourceType: "vm",
-		ResourceID:   id,
-		CreatedAt:    now,
+	op := f.newOperation("vm.create", "vm", id, now)
+	payload := map[string]any{"vm": vm.wireVmOut, "operation": op}
+	location := f.operationLocation(op)
+	if key != "" {
+		body, _ := json.Marshal(payload)
+		f.idem[key] = &idemRecord{
+			payloadHash: digest,
+			status:      http.StatusAccepted,
+			body:        append(body, '\n'),
+			location:    location,
+		}
 	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"vm": vm, "operation": op})
+	rc.json(http.StatusAccepted, payload, "Location", location)
 }
 
-func (f *fakeAPI) getVm(w http.ResponseWriter, rawID string) {
-	id, err := url.PathUnescape(rawID)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
-		return
-	}
-
+// getVm: "a foreign row and a soft-deleted row both read as absent"
+// (compute.py get_vm). The read that moves a deleting vm to deleted therefore
+// answers 404 at once, as the real GET does once the executor has committed.
+func (f *fakeAPI) getVm(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	vm, ok := f.vms[id]
-	if !ok {
-		writeProblem(w, http.StatusNotFound, "vm_not_found", fmt.Sprintf("instance %s not found", id))
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
 		return
 	}
 
 	f.advance(vm)
-	writeJSON(w, http.StatusOK, vm)
+	if vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	rc.json(http.StatusOK, vm.wireVmOut)
 }
 
-// advance moves vm one step through pending -> provisioning -> running (or
-// -> error, for a name starting with "fail-"), and deleting -> deleted. It
-// is a no-op in any terminal state, so repeated GETs after convergence are
-// stable.
-func (f *fakeAPI) advance(vm *client.Vm) {
-	switch vm.State {
-	case "pending":
+// advance moves vm one step the way the executor does: pending ->
+// provisioning -> running (or -> error, for a name starting with "fail-");
+// and, once a delete has set desired_state=deleted, -> deleting -> deleted
+// with the tombstone. It is a no-op in any other state, so repeated GETs after
+// convergence are stable.
+func (f *fakeAPI) advance(vm *fakeVm) {
+	switch {
+	case vm.State == "deleting":
+		vm.deletingLeft--
+		if vm.deletingLeft <= 0 {
+			vm.State = "deleted"
+			now := time.Now().UTC()
+			vm.deletedAt = &now
+			vm.inFlight = false
+			vm.ErrorClass, vm.ErrorDetail = nil, nil
+		}
+	case vm.DesiredState == "deleted":
+		vm.State = "deleting"
+	case vm.State == "pending":
 		vm.State = "provisioning"
-	case "provisioning":
+	case vm.State == "provisioning":
+		vm.inFlight = false
 		if strings.HasPrefix(vm.Name, "fail-") {
 			errClass := "build_failed"
 			errDetail := "the cloud could not build this instance"
@@ -320,123 +1037,186 @@ func (f *fakeAPI) advance(vm *client.Vm) {
 		} else {
 			vm.State = "running"
 			f.nextOctet++
-			vm.ObservedAddresses = map[string]any{
-				"gro-tenant-default": []any{
-					map[string]any{
-						"addr":                    fmt.Sprintf("10.128.3.%d", f.nextOctet),
-						"version":                 4,
-						"OS-EXT-IPS:type":         "fixed",
-						"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
-					},
-				},
+			addr := fmt.Sprintf("10.128.3.%d", f.nextOctet)
+			entry := map[string]any{
+				"addr":                    addr,
+				"version":                 4,
+				"OS-EXT-IPS:type":         "fixed",
+				"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
 			}
+			switch {
+			case strings.HasPrefix(vm.Name, "notype-"):
+				// The contract only promises addr; OS-EXT-IPS is a Nova extension.
+				entry = map[string]any{"addr": addr, "version": 4}
+			case strings.HasPrefix(vm.Name, "bare-"):
+				entry = map[string]any{"addr": addr}
+			}
+			vm.ObservedAddresses = map[string]any{fakeNetwork: []any{entry}}
+			observed := time.Now().UTC()
+			vm.ObservedAt = &observed
 		}
-	case "deleting":
-		vm.State = "deleted"
 	}
 	vm.UpdatedAt = time.Now().UTC()
 }
 
-func (f *fakeAPI) deleteVm(w http.ResponseWriter, rawID string) {
-	id, err := url.PathUnescape(rawID)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
+// fakeNetwork is the one network the fake's vms sit on.
+const fakeNetwork = "gro-tenant-default"
+
+// attachFloating lists an associated public IP in the vm's addresses, FIRST,
+// as a floating entry: Nova reports it there next to the fixed address, and a
+// reader that takes the first IPv4 would mistake it for the private one.
+func attachFloating(vm *fakeVm, addr string) {
+	if vm.ObservedAddresses == nil {
 		return
 	}
+	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
+	floating := map[string]any{
+		"addr":                    addr,
+		"version":                 4,
+		"OS-EXT-IPS:type":         "floating",
+		"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
+	}
+	vm.ObservedAddresses[fakeNetwork] = append([]any{floating}, list...)
+}
 
+// detachFloating removes the floating entry for addr again.
+func detachFloating(vm *fakeVm, addr string) {
+	if vm.ObservedAddresses == nil {
+		return
+	}
+	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
+	kept := make([]any, 0, len(list))
+	for _, e := range list {
+		if m, ok := e.(map[string]any); ok && m["addr"] == addr && m["OS-EXT-IPS:type"] == "floating" {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	vm.ObservedAddresses[fakeNetwork] = kept
+}
+
+// deleteVm declares desired_state=deleted and queues the teardown; state is
+// left alone (the executor commits deleting itself). One operation per
+// resource: a delete while the create or an earlier delete is still running is
+// 409 operation_in_flight, and a vm that is gone is 404 (vms.py
+// delete_vm_request).
+func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	vm, ok := f.vms[id]
-	if !ok {
-		writeProblem(w, http.StatusNotFound, "vm_not_found", fmt.Sprintf("instance %s not found", id))
+	// _refuse_while_protected comes first and only looks at a live vm; an
+	// unknown or gone one falls through to the 404 below.
+	if ok && vm.deletedAt == nil && vm.Protected {
+		rc.conflict("vm_protected", fmt.Sprintf("this VM is protected against deletion; an owner of this "+
+			"organization has to switch that off first, with PUT /v1/orgs/%s/compute/vms/%s/protection", f.org, id))
+		return
+	}
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	if vm.inFlight {
+		rc.conflict("operation_in_flight", detailOperationInFlightVm)
 		return
 	}
 
-	vm.State = "deleting"
+	vm.DesiredState = "deleted"
+	vm.deletingLeft = f.deleteSteps
+	vm.inFlight = true
 	vm.UpdatedAt = time.Now().UTC()
 
-	op := client.Operation{
-		ID:           id + "-delete",
-		Type:         "delete_vm",
-		State:        "pending",
-		ResourceType: "vm",
-		ResourceID:   id,
-		CreatedAt:    time.Now().UTC(),
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"vm": vm, "operation": op})
+	op := f.newOperation("vm.delete", "vm", id, time.Now().UTC())
+	rc.json(http.StatusAccepted, map[string]any{"vm": vm.wireVmOut, "operation": op},
+		"Location", f.operationLocation(op))
 }
 
 // --- Public IP handlers ------------------------------------------------
 
-type fakePublicIpCreateRequest struct {
-	RegionID string `json:"region_id"`
+func (f *fakeAPI) newPublicIPOperation(typ, id string) wireOperationRef {
+	return f.newOperation(typ, "public_ip", id, time.Now().UTC())
+}
+
+func (f *fakeAPI) publicIPAccepted(rc *reqCtx, ip *fakePublicIP, op wireOperationRef) {
+	rc.json(http.StatusAccepted, map[string]any{"public_ip": ip.wirePublicIpOut, "operation": op},
+		"Location", f.operationLocation(op))
 }
 
 // createPublicIp allocates a public IP in state "pending", or 422
-// quota_exceeded when the org already has one tracked (this fake enforces a
-// quota of one live public IP, matching the real API).
-func (f *fakeAPI) createPublicIp(w http.ResponseWriter, r *http.Request) {
-	var req fakePublicIpCreateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid request body")
+// quota_exceeded at the per-region ceiling (one for customer-default).
+func (f *fakeAPI) createPublicIp(rc *reqCtx) {
+	b := newBodyCheck(rc.r.Body)
+	regionID := b.str("region_id", true, 0, 0)
+	if errs := b.finish(); len(errs) > 0 {
+		rc.invalid(errs...)
 		return
 	}
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if len(f.publicIPs) > 0 {
-		writeProblem(w, http.StatusUnprocessableEntity, "quota_exceeded", "the organization's public IP quota (1) is already in use")
-		return
+	// edge.py allocate_public_ip_request: this org's rows in this region that
+	// are not in error, against QuotaProfile.public_ips.
+	if f.publicIPQuota >= 0 {
+		used := 0
+		for _, other := range f.publicIPs {
+			if other.RegionID == regionID && other.State != "error" {
+				used++
+			}
+		}
+		if used >= f.publicIPQuota {
+			rc.unprocessable("quota_exceeded", fmt.Sprintf(
+				"public IPs: %d in use plus 1 requested exceeds the limit of %d for this account", used, f.publicIPQuota))
+			return
+		}
 	}
 
 	f.pubIPCreateCount++
-	id := fmt.Sprintf("pubip-%d", f.pubIPCreateCount)
+	id := fakeUUID(2, f.pubIPCreateCount)
 	now := time.Now().UTC()
 
-	ip := &client.PublicIp{
+	ip := &fakePublicIP{wirePublicIpOut: wirePublicIpOut{
 		ID:        id,
-		RegionID:  req.RegionID,
-		Address:   nil,
-		VmID:      nil,
+		RegionID:  regionID,
 		State:     "pending",
 		CreatedAt: now,
-	}
+	}}
 	f.publicIPs[id] = ip
 
-	op := client.Operation{
-		ID:           id + "-allocate",
-		Type:         "allocate_public_ip",
-		State:        "pending",
-		ResourceType: "public_ip",
-		ResourceID:   id,
-		CreatedAt:    now,
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.allocate", id))
 }
 
 // listPublicIps is the only read path for public IPs (there is no
 // single-item GET, matching the real API); it advances every tracked public
 // IP one step and drops any that just finished releasing, so it doubles as
 // the state machine driver the client's GetPublicIp/WaitPublicIp rely on.
-func (f *fakeAPI) listPublicIps(w http.ResponseWriter, _ *http.Request) {
+func (f *fakeAPI) listPublicIps(rc *reqCtx) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	items := make([]*client.PublicIp, 0, len(f.publicIPs))
-	for id, ip := range f.publicIPs {
+	ids := make([]string, 0, len(f.publicIPs))
+	for id := range f.publicIPs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	items := make([]wirePublicIpOut, 0, len(ids))
+	for _, id := range ids {
+		ip := f.publicIPs[id]
 		if ip.State == "releasing" {
-			delete(f.publicIPs, id)
+			if ip.releasingLeft <= 0 {
+				delete(f.publicIPs, id)
+				continue
+			}
+			ip.releasingLeft--
+			items = append(items, ip.wirePublicIpOut)
 			continue
 		}
 		f.advancePublicIp(ip)
-		items = append(items, ip)
+		items = append(items, ip.wirePublicIpOut)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+	rc.json(http.StatusOK, wireList[wirePublicIpOut]{Items: items})
 }
 
 // advancePublicIp moves ip one step through pending -> allocated,
@@ -447,7 +1227,7 @@ func (f *fakeAPI) listPublicIps(w http.ResponseWriter, _ *http.Request) {
 // refuses to release the binding). It is a no-op in any other state, so
 // repeated GETs after convergence are stable. Releasing is handled by the
 // caller (listPublicIps) since it removes the entry rather than mutating it.
-func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
+func (f *fakeAPI) advancePublicIp(ip *fakePublicIP) {
 	switch ip.State {
 	case "pending":
 		ip.State = "allocated"
@@ -464,6 +1244,11 @@ func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 			}
 		}
 		ip.State = "associated"
+		if ip.VmID != nil && ip.Address != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok {
+				attachFloating(vm, *ip.Address)
+			}
+		}
 	case "disassociating":
 		if ip.VmID != nil {
 			if vm, ok := f.vms[*ip.VmID]; ok && strings.HasPrefix(vm.Name, "ipdisfail-") {
@@ -473,25 +1258,24 @@ func (f *fakeAPI) advancePublicIp(ip *client.PublicIp) {
 				return
 			}
 		}
+		if ip.VmID != nil && ip.Address != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok {
+				detachFloating(vm, *ip.Address)
+			}
+		}
 		ip.State = "allocated"
 		ip.VmID = nil
 	}
 }
 
-type fakePublicIpAssociateRequest struct {
-	VmID string `json:"vm_id"`
-}
-
-func (f *fakeAPI) associatePublicIp(w http.ResponseWriter, r *http.Request, rawID string) {
-	id, err := url.PathUnescape(rawID)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
-		return
-	}
-
-	var req fakePublicIpAssociateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid request body")
+// associatePublicIp is edge.py associate_public_ip_request, gate by gate: the
+// address must be allocated, the vm must exist, be in the same region and be
+// running, and carry no other address.
+func (f *fakeAPI) associatePublicIp(rc *reqCtx, id string) {
+	b := newBodyCheck(rc.r.Body)
+	vmID := b.uuid("vm_id", true)
+	if errs := b.finish(); len(errs) > 0 {
+		rc.invalid(errs...)
 		return
 	}
 
@@ -500,120 +1284,122 @@ func (f *fakeAPI) associatePublicIp(w http.ResponseWriter, r *http.Request, rawI
 
 	ip, ok := f.publicIPs[id]
 	if !ok {
-		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		rc.notFound("public_ip")
 		return
+	}
+	if ip.State != "allocated" {
+		rc.conflict("public_ip_not_allocated", fmt.Sprintf("this public IP is %s, so it cannot be associated", ip.State))
+		return
+	}
+	vm, ok := f.vms[vmID]
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	if vm.RegionID != ip.RegionID {
+		rc.unprocessable("region_mismatch", "a public IP can only be associated with a VM in the same region")
+		return
+	}
+	if vm.State != "running" {
+		rc.conflict("vm_not_in_a_state_for_this", "this VM is not running, so a public IP cannot be attached to it")
+		return
+	}
+	for _, other := range f.publicIPs {
+		if other.ID != ip.ID && other.VmID != nil && *other.VmID == vm.ID &&
+			(other.State == "associating" || other.State == "associated") {
+			rc.conflict("public_ip_already_associated", "this VM already has a public IP associated with it")
+			return
+		}
 	}
 
 	ip.State = "associating"
-	ip.VmID = &req.VmID
+	ip.VmID = &vmID
 
-	op := client.Operation{
-		ID:           id + "-associate",
-		Type:         "associate_public_ip",
-		State:        "pending",
-		ResourceType: "public_ip",
-		ResourceID:   id,
-		CreatedAt:    time.Now().UTC(),
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.associate", id))
 }
 
-func (f *fakeAPI) disassociatePublicIp(w http.ResponseWriter, rawID string) {
-	id, err := url.PathUnescape(rawID)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
-		return
-	}
-
+func (f *fakeAPI) disassociatePublicIp(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	ip, ok := f.publicIPs[id]
 	if !ok {
-		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		rc.notFound("public_ip")
+		return
+	}
+	if ip.State != "associated" {
+		rc.conflict("public_ip_not_associated", fmt.Sprintf("this public IP is %s, so it cannot be disassociated", ip.State))
 		return
 	}
 
 	ip.State = "disassociating"
 	f.callSeq[id] = append(f.callSeq[id], "disassociate")
 
-	op := client.Operation{
-		ID:           id + "-disassociate",
-		Type:         "disassociate_public_ip",
-		State:        "pending",
-		ResourceType: "public_ip",
-		ResourceID:   id,
-		CreatedAt:    time.Now().UTC(),
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.disassociate", id))
 }
 
-func (f *fakeAPI) releasePublicIp(w http.ResponseWriter, rawID string) {
-	id, err := url.PathUnescape(rawID)
-	if err != nil {
-		writeProblem(w, http.StatusBadRequest, "bad_request", "invalid id")
-		return
-	}
-
+// releasePublicIp accepts a release from allocated, associated or error; the
+// executor disassociates first when the row still names a vm.
+func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
 	ip, ok := f.publicIPs[id]
 	if !ok {
-		writeProblem(w, http.StatusNotFound, "public_ip_not_found", fmt.Sprintf("public ip %s not found", id))
+		rc.notFound("public_ip")
+		return
+	}
+	switch ip.State {
+	case "allocated", "associated", "error":
+	default:
+		rc.conflict("public_ip_not_releasable", fmt.Sprintf("this public IP is %s, so it cannot be released", ip.State))
 		return
 	}
 
+	// The executor disassociates first when the row still names a vm.
+	if ip.VmID != nil && ip.Address != nil {
+		if vm, ok := f.vms[*ip.VmID]; ok {
+			detachFloating(vm, *ip.Address)
+		}
+	}
 	ip.State = "releasing"
+	ip.releasingLeft = f.releaseSteps
 	f.callSeq[id] = append(f.callSeq[id], "release")
 
-	op := client.Operation{
-		ID:           id + "-release",
-		Type:         "release_public_ip",
-		State:        "pending",
-		ResourceType: "public_ip",
-		ResourceID:   id,
-		CreatedAt:    time.Now().UTC(),
-	}
-
-	writeJSON(w, http.StatusAccepted, map[string]any{"public_ip": ip, "operation": op})
+	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.release", id))
 }
 
 // --- Images handler ------------------------------------------------------
 
 // listImages returns a fixed two-image catalogue for region "gro" and an
-// empty one for any other region; region is required, matching the real
-// API's per-region catalogue.
-func (f *fakeAPI) listImages(w http.ResponseWriter, r *http.Request) {
-	region := r.URL.Query().Get("region")
-	if region == "" {
-		writeProblem(w, http.StatusUnprocessableEntity, "region_required", "region is required")
+// empty one for any other region. region is a required query parameter, so
+// leaving it out is a 400 invalid_request like any other validation failure.
+func (f *fakeAPI) listImages(rc *reqCtx) {
+	region, ok := rc.r.URL.Query()["region"]
+	if !ok {
+		rc.invalid(wireFieldError{Field: "region", Message: "Field required"})
 		return
 	}
 
-	if region != "gro" {
-		writeJSON(w, http.StatusOK, map[string]any{"items": []client.Image{}, "next_cursor": nil})
+	if len(region) == 0 || region[0] != "gro" {
+		rc.json(http.StatusOK, wireList[wireImageOut]{Items: []wireImageOut{}})
 		return
 	}
 
 	debianDistro, debianVersion := "debian", "12"
 	ubuntuDistro, ubuntuVersion := "ubuntu", "22.04"
-	items := []client.Image{
+	rc.json(http.StatusOK, wireList[wireImageOut]{Items: []wireImageOut{
 		{ID: "image-debian-12", Name: "Debian 12", OSDistro: &debianDistro, OSVersion: &debianVersion, MinDiskGB: 10, MinRAMMB: 512},
 		{ID: "image-ubuntu-2204", Name: "Ubuntu 22.04", OSDistro: &ubuntuDistro, OSVersion: &ubuntuVersion, MinDiskGB: 10, MinRAMMB: 512},
-	}
-
-	writeJSON(w, http.StatusOK, map[string]any{"items": items, "next_cursor": nil})
+	}})
 }
 
 // --- Direct tests of the fake itself ---------------------------------------
 
 func TestFakeAPI_AuthRejectsWrongBearer(t *testing.T) {
-	f := newFakeAPI(t, "good-key", "org-1")
+	f := newFakeAPI(t, "good-key", testOrgID)
 
-	req, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/org-1/compute/vms/does-not-exist", nil)
+	req, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/"+testOrgID+"/compute/vms/"+testSomeUUID, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -634,7 +1420,7 @@ func TestFakeAPI_AuthRejectsWrongBearer(t *testing.T) {
 }
 
 func TestFakeAPI_DuplicateLiveNameConflicts(t *testing.T) {
-	f := newFakeAPI(t, "good-key", "org-1")
+	f := newFakeAPI(t, "good-key", testOrgID)
 
 	body := `{"name":"dup","image":"img","vcpus":1,"memory_mb":256,"disk_gb":10,"storage_pool":"pool","region":"gro","network_profile":"net"}`
 
@@ -666,52 +1452,1004 @@ func doCreate(t *testing.T, f *fakeAPI, body string) int {
 	return resp.StatusCode
 }
 
-func TestFakeAPI_DeleteThenGetShowsDeleted(t *testing.T) {
-	f := newFakeAPI(t, "good-key", "org-1")
+// --- Contract tests of the fake against the 94f5021f customer API ----------
+//
+// The provider's own tests are only as good as the fake they run against, and
+// until this file the fake serialised internal/client's own structs: a wrong
+// JSON tag in the client was mirrored on the way out and never noticed. These
+// tests pin the fake to the deployed API (s3-control-plane 94f5021f, spec
+// docs/openapi/generated/customer-v1.json plus the handlers) with wire shapes
+// transcribed from the spec, independent of internal/client.
 
-	body := `{"name":"to-delete","image":"img","vcpus":1,"memory_mb":256,"disk_gb":10,"storage_pool":"pool","region":"gro","network_profile":"net"}`
-	if status := doCreate(t, f, body); status != http.StatusAccepted {
-		t.Fatalf("create: expected 202, got %d", status)
+const (
+	testOrgID     = "7b2c1f10-52a1-4c3e-9d57-0a1b2c3d4e5f"
+	testOtherOrg  = "0d9c8b7a-6f5e-4d3c-8b2a-1f0e9d8c7b6a"
+	testSomeUUID  = "00000000-0000-4000-8000-0000000000aa"
+	testValidVmJS = `{"name":"web-01","image":"image-1","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"pool-1","region":"gro","network_profile":"net-1"}`
+)
+
+// Required keys per schema, transcribed from customer-v1.json. The API always
+// serialises every field (null for an unset optional one), so the set a client
+// sees is exactly this.
+var (
+	specVmOutKeys = []string{
+		"id", "org_id", "region_id", "name", "fqdn", "image", "vcpus", "memory_mb", "disk_gb",
+		"storage_pool_id", "workload_type", "network_profile_id", "state", "desired_state",
+		"error_class", "error_detail", "observed_status", "observed_addresses", "observed_at",
+		"ssh_key_names", "user_data_present", "protected", "allowed_actions", "created_at", "updated_at",
 	}
-
-	if f.CreateCount() != 1 {
-		t.Fatalf("expected create count 1, got %d", f.CreateCount())
+	specOperationRefKeys = []string{
+		"id", "type", "state", "resource_type", "resource_id", "attempt", "max_attempts",
+		"created_at", "error_class", "error_detail", "finished_at",
 	}
+	specPublicIpOutKeys = []string{"id", "region_id", "address", "vm_id", "state", "error", "created_at"}
+	specImageOutKeys    = []string{"id", "name", "os_distro", "os_version", "min_disk_gb", "min_ram_mb"}
+	specProblemKeys     = []string{"type", "title", "status", "detail", "instance", "code", "request_id"}
+	specListKeys        = []string{"items", "next_cursor"}
+)
 
-	id := "vm-1"
+var uuidRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-	req, err := http.NewRequest(http.MethodDelete, f.URL()+"/v1/orgs/"+f.org+"/compute/vms/"+id, nil)
+// fakeHTTP performs one request against f with the given bearer key (none when
+// key is empty) and returns status, headers and the raw body. extra is a flat
+// list of header name/value pairs.
+func fakeHTTP(t *testing.T, f *fakeAPI, key, method, path, body string, extra ...string) (int, http.Header, []byte) {
+	t.Helper()
+	var rdr io.Reader
+	if body != "" {
+		rdr = strings.NewReader(body)
+	}
+	req, err := http.NewRequest(method, f.URL()+path, rdr)
 	if err != nil {
-		t.Fatalf("build delete request: %v", err)
+		t.Fatalf("build request: %v", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+f.apiKey)
+	if key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
+	}
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	for i := 0; i+1 < len(extra); i += 2 {
+		req.Header.Set(extra[i], extra[i+1])
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("do delete: %v", err)
+		t.Fatalf("%s %s: %v", method, path, err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusAccepted {
-		t.Fatalf("delete: expected 202, got %d", resp.StatusCode)
-	}
-
-	state, ok := f.VmState(id)
-	if !ok || state != "deleting" {
-		t.Fatalf("expected state deleting after delete, got %q (ok=%v)", state, ok)
-	}
-
-	getReq, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/"+f.org+"/compute/vms/"+id, nil)
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Fatalf("build get request: %v", err)
+		t.Fatalf("read body: %v", err)
 	}
-	getReq.Header.Set("Authorization", "Bearer "+f.apiKey)
-	getResp, err := http.DefaultClient.Do(getReq)
-	if err != nil {
-		t.Fatalf("do get: %v", err)
-	}
-	getResp.Body.Close()
+	return resp.StatusCode, resp.Header, b
+}
 
-	state, ok = f.VmState(id)
-	if !ok || state != "deleted" {
-		t.Fatalf("expected state deleted after get, got %q (ok=%v)", state, ok)
+func decodeObject(t *testing.T, b []byte) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("response is not a JSON object: %v\n%s", err, b)
+	}
+	return m
+}
+
+func sortedKeys(m map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func wantKeys(t *testing.T, what string, got map[string]any, want []string) {
+	t.Helper()
+	w := append([]string(nil), want...)
+	sort.Strings(w)
+	g := sortedKeys(got)
+	if strings.Join(g, ",") != strings.Join(w, ",") {
+		t.Errorf("%s keys = %v, want exactly %v", what, g, w)
+	}
+}
+
+func vmsPath(org string) string { return "/v1/orgs/" + org + "/compute/vms" }
+
+func TestFakeAPI_ProblemEnvelopeMatchesSpec(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	path := vmsPath(testOrgID) + "/" + testSomeUUID
+	status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodGet, path, "")
+	if status != http.StatusNotFound {
+		t.Fatalf("unknown vm: status = %d, want 404 (%s)", status, body)
+	}
+	if ct := hdr.Get("Content-Type"); ct != "application/problem+json" {
+		t.Errorf("Content-Type = %q, want application/problem+json", ct)
+	}
+	p := decodeObject(t, body)
+	wantKeys(t, "problem", p, specProblemKeys)
+	if p["code"] != "not_found" || p["title"] != "Resource not found" {
+		t.Errorf("code/title = %v/%v, want not_found/Resource not found", p["code"], p["title"])
+	}
+	if p["detail"] != "no vm matching that identifier is visible to this organization" {
+		t.Errorf("detail = %q", p["detail"])
+	}
+	if p["instance"] != path || p["status"] != float64(404) {
+		t.Errorf("instance/status = %v/%v", p["instance"], p["status"])
+	}
+	if p["type"] != "https://docs.virtscale.nl/s3/problems/not_found" {
+		t.Errorf("type = %v", p["type"])
+	}
+	rid, _ := p["request_id"].(string)
+	if rid == "" || hdr.Get("X-Request-ID") != rid {
+		t.Errorf("request_id %q must be non-empty and equal the X-Request-ID header %q", rid, hdr.Get("X-Request-ID"))
+	}
+}
+
+func TestFakeAPI_ForeignOrgIsTheSame404AsAMissingResource(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOtherOrg)+"/"+testSomeUUID, "")
+	if status != http.StatusNotFound {
+		t.Fatalf("foreign org: status = %d, want 404", status)
+	}
+	p := decodeObject(t, body)
+	if p["code"] != "not_found" || p["detail"] != "no organization matching that identifier is visible to this organization" {
+		t.Errorf("foreign org problem = %v / %v", p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_BadKeyIs401UnauthorizedWithTheDeployedDetail(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, _, body := fakeHTTP(t, f, "wrong-key", http.MethodGet, vmsPath(testOrgID)+"/"+testSomeUUID, "")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("bad key: status = %d, want 401", status)
+	}
+	p := decodeObject(t, body)
+	if p["code"] != "unauthorized" || p["detail"] != "the presented API token is not valid" {
+		t.Errorf("401 problem = %v / %v", p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_PathIDsMustBeUUIDs(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	// A malformed id in the path is 400 invalid_request naming the parameter.
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOrgID)+"/not-a-uuid", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("malformed vm id: status = %d, want 400 (%s)", status, body)
+	}
+	p := decodeObject(t, body)
+	if p["code"] != "invalid_request" || p["detail"] != "the request body or parameters failed validation" {
+		t.Errorf("problem = %v / %v", p["code"], p["detail"])
+	}
+	errs, _ := p["errors"].([]any)
+	if len(errs) != 1 || errs[0].(map[string]any)["field"] != "vm_id" {
+		t.Errorf("errors = %v, want one entry for field vm_id", p["errors"])
+	}
+
+	// A malformed organization is refused before the credential is looked at
+	// (deps.py current_principal), so even a missing key gets the 400.
+	status, _, body = fakeHTTP(t, f, "", http.MethodGet, vmsPath("not-a-uuid")+"/"+testSomeUUID, "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("malformed org: status = %d, want 400 (%s)", status, body)
+	}
+	errs, _ = decodeObject(t, body)["errors"].([]any)
+	if len(errs) != 1 || errs[0].(map[string]any)["field"] != "org" {
+		t.Errorf("errors = %v, want one entry for field org", errs)
+	}
+}
+
+func TestFakeAPI_RequestBodiesAreStrict(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	cases := []struct {
+		name, body, field, message string
+	}{
+		{"unknown field", `{"name":"web-01","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n","bogus":1}`, "bogus", "Extra inputs are not permitted"},
+		{"missing required", `{"image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`, "name", "Field required"},
+		{"vcpus below minimum", `{"name":"web-01","image":"i","vcpus":0,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`, "vcpus", "Input should be greater than or equal to 1"},
+		{"memory below minimum", `{"name":"web-01","image":"i","vcpus":1,"memory_mb":128,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`, "memory_mb", "Input should be greater than or equal to 256"},
+		{"wrong type", `{"name":"web-01","image":"i","vcpus":"one","memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`, "vcpus", "Input should be a valid integer, unable to parse string as an integer"},
+		{"name too long", `{"name":"` + strings.Repeat("a", 81) + `","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`, "name", "String should have at most 80 characters"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%s)", status, body)
+			}
+			p := decodeObject(t, body)
+			if p["code"] != "invalid_request" {
+				t.Errorf("code = %v, want invalid_request", p["code"])
+			}
+			errs, _ := p["errors"].([]any)
+			found := false
+			for _, e := range errs {
+				m := e.(map[string]any)
+				if m["field"] == tc.field && m["message"] == tc.message {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("errors = %v, want an entry {%s: %s}", p["errors"], tc.field, tc.message)
+			}
+		})
+	}
+	if f.CreateCount() != 0 {
+		t.Errorf("a refused body created %d vms", f.CreateCount())
+	}
+}
+
+func TestFakeAPI_ResponseShapesMatchSpec(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	// POST /compute/vms -> 202 {vm, operation} with a Location header.
+	status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS)
+	if status != http.StatusAccepted {
+		t.Fatalf("create: status = %d, want 202 (%s)", status, body)
+	}
+	created := decodeObject(t, body)
+	wantKeys(t, "VmAccepted", created, []string{"vm", "operation"})
+	vm := created["vm"].(map[string]any)
+	op := created["operation"].(map[string]any)
+	wantKeys(t, "VmOut", vm, specVmOutKeys)
+	wantKeys(t, "OperationRef", op, specOperationRefKeys)
+	wantKeys(t, "ImageRef", vm["image"].(map[string]any), []string{"glance_id", "name"})
+	if id, _ := vm["id"].(string); !uuidRE.MatchString(id) {
+		t.Errorf("vm id %q is not a UUID", vm["id"])
+	}
+	if id, _ := op["id"].(string); !uuidRE.MatchString(id) {
+		t.Errorf("operation id %q is not a UUID", op["id"])
+	}
+	if want := "/v1/orgs/" + testOrgID + "/operations/" + op["id"].(string); hdr.Get("Location") != want {
+		t.Errorf("Location = %q, want %q", hdr.Get("Location"), want)
+	}
+	if op["type"] != "vm.create" || op["resource_type"] != "vm" || op["resource_id"] != vm["id"] {
+		t.Errorf("operation = %v, want vm.create on the new vm", op)
+	}
+	if vm["state"] != "pending" || vm["desired_state"] != "running" || vm["workload_type"] != "customer" {
+		t.Errorf("vm state/desired/workload = %v/%v/%v", vm["state"], vm["desired_state"], vm["workload_type"])
+	}
+
+	// GET /compute/vms/{id} -> VmOut.
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOrgID)+"/"+vm["id"].(string), "")
+	if status != http.StatusOK {
+		t.Fatalf("get: status = %d (%s)", status, body)
+	}
+	wantKeys(t, "VmOut (GET)", decodeObject(t, body), specVmOutKeys)
+
+	// GET /compute/images?region= -> ListResponse[ImageOut].
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodGet, "/v1/orgs/"+testOrgID+"/compute/images?region=gro", "")
+	if status != http.StatusOK {
+		t.Fatalf("images: status = %d (%s)", status, body)
+	}
+	list := decodeObject(t, body)
+	wantKeys(t, "ListResponse[ImageOut]", list, specListKeys)
+	items := list["items"].([]any)
+	if len(items) == 0 {
+		t.Fatal("images: empty catalogue for region gro")
+	}
+	wantKeys(t, "ImageOut", items[0].(map[string]any), specImageOutKeys)
+
+	// POST /compute/public-ips -> 202 {public_ip, operation}; list -> ListResponse[PublicIpOut].
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodPost, "/v1/orgs/"+testOrgID+"/compute/public-ips", `{"region_id":"gro"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("allocate: status = %d (%s)", status, body)
+	}
+	acc := decodeObject(t, body)
+	wantKeys(t, "PublicIpAccepted", acc, []string{"public_ip", "operation"})
+	wantKeys(t, "PublicIpOut", acc["public_ip"].(map[string]any), specPublicIpOutKeys)
+	wantKeys(t, "OperationRef (ip)", acc["operation"].(map[string]any), specOperationRefKeys)
+	if acc["operation"].(map[string]any)["type"] != "ip.allocate" {
+		t.Errorf("ip operation type = %v, want ip.allocate", acc["operation"].(map[string]any)["type"])
+	}
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodGet, "/v1/orgs/"+testOrgID+"/compute/public-ips", "")
+	if status != http.StatusOK {
+		t.Fatalf("list public ips: status = %d (%s)", status, body)
+	}
+	pl := decodeObject(t, body)
+	wantKeys(t, "ListResponse[PublicIpOut]", pl, specListKeys)
+	wantKeys(t, "PublicIpOut (list)", pl["items"].([]any)[0].(map[string]any), specPublicIpOutKeys)
+}
+
+func TestFakeAPI_ImagesRequireRegionAs400(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodGet, "/v1/orgs/"+testOrgID+"/compute/images", "")
+	if status != http.StatusBadRequest {
+		t.Fatalf("images without region: status = %d, want 400 (%s)", status, body)
+	}
+	p := decodeObject(t, body)
+	errs, _ := p["errors"].([]any)
+	if p["code"] != "invalid_request" || len(errs) != 1 || errs[0].(map[string]any)["field"] != "region" {
+		t.Errorf("problem = %v errors = %v, want invalid_request naming region", p["code"], p["errors"])
+	}
+}
+
+// createVmVia posts a create and returns the decoded {vm, operation} body.
+func createVmVia(t *testing.T, f *fakeAPI, key, body string, extra ...string) jsonObject {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodPost, vmsPath(f.org), body, extra...)
+	if status != http.StatusAccepted {
+		t.Fatalf("create: status = %d, want 202 (%s)", status, resp)
+	}
+	return jsonObject(decodeObject(t, resp))
+}
+
+func getVmVia(t *testing.T, f *fakeAPI, key, id string) (int, map[string]any) {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodGet, vmsPath(f.org)+"/"+id, "")
+	if status == http.StatusOK {
+		return status, decodeObject(t, resp)
+	}
+	return status, decodeObject(t, resp)
+}
+
+func deleteVmVia(t *testing.T, f *fakeAPI, key, id string) (int, map[string]any) {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, key, http.MethodDelete, vmsPath(f.org)+"/"+id, "")
+	return status, decodeObject(t, resp)
+}
+
+// runVm polls a freshly created vm until it is running, as a waiter would.
+func runVm(t *testing.T, f *fakeAPI, key, id string) {
+	t.Helper()
+	for i := 0; i < 5; i++ {
+		_, vm := getVmVia(t, f, key, id)
+		if vm["state"] == "running" {
+			return
+		}
+	}
+	t.Fatalf("vm %s never reached running", id)
+}
+
+// TestFakeAPI_DeleteFlowEndsIn404 pins what a delete looks like from outside
+// (compute.py delete_vm, executors/compute.py): the 202 body still shows the
+// old state with desired_state=deleted, then the executor commits deleting,
+// then state=deleted together with deleted_at -- and a soft-deleted row reads
+// as absent, so the GET that would have shown "deleted" is a 404.
+func TestFakeAPI_DeleteFlowEndsIn404(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS)["vm"].(map[string]any)["id"].(string)
+	runVm(t, f, "good-key", id)
+
+	status, body := deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusAccepted {
+		t.Fatalf("delete: status = %d, want 202 (%v)", status, body)
+	}
+	vm, op := body["vm"].(map[string]any), body["operation"].(map[string]any)
+	if vm["state"] != "running" || vm["desired_state"] != "deleted" {
+		t.Errorf("202 body vm state/desired = %v/%v, want running/deleted (state is not moved by the delete)", vm["state"], vm["desired_state"])
+	}
+	if op["type"] != "vm.delete" {
+		t.Errorf("operation type = %v, want vm.delete", op["type"])
+	}
+
+	status, got := getVmVia(t, f, "good-key", id)
+	if status != http.StatusOK || got["state"] != "deleting" {
+		t.Fatalf("first GET after delete: status %d state %v, want 200 deleting", status, got["state"])
+	}
+	status, got = getVmVia(t, f, "good-key", id)
+	if status != http.StatusNotFound || got["code"] != "not_found" {
+		t.Fatalf("GET of a deleted vm: status %d code %v, want 404 not_found", status, got["code"])
+	}
+	if state, ok := f.VmState(id); !ok || state != "deleted" {
+		t.Errorf("the fake keeps the row for inspection: VmState = %q ok=%v, want deleted", state, ok)
+	}
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusNotFound {
+		t.Errorf("delete of a gone vm: status = %d, want 404", status)
+	}
+}
+
+// TestFakeAPI_SecondDeleteIs409OperationInFlight pins uq_operations_one_in_flight:
+// one operation per resource, so a second request while one runs is a 409 --
+// during the create as much as during a delete.
+func TestFakeAPI_SecondDeleteIs409OperationInFlight(t *testing.T) {
+	const detail = "another operation is already running for this VM; wait for it to finish and retry"
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS)["vm"].(map[string]any)["id"].(string)
+
+	status, p := deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusConflict || p["code"] != "operation_in_flight" || p["detail"] != detail {
+		t.Fatalf("delete during create: %d %v %v, want 409 operation_in_flight", status, p["code"], p["detail"])
+	}
+
+	runVm(t, f, "good-key", id)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Fatalf("delete of a running vm: status = %d, want 202", status)
+	}
+	status, p = deleteVmVia(t, f, "good-key", id)
+	if status != http.StatusConflict || p["code"] != "operation_in_flight" || p["detail"] != detail {
+		t.Fatalf("second delete: %d %v %v, want 409 operation_in_flight", status, p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_NamesAreCanonicalisedLikeTheAPI(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	body := func(name string) string {
+		return `{"name":` + fmt.Sprintf("%q", name) + `,"image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`
+	}
+
+	// Lower-cased, trimmed, and a trailing .virtscale.nl stripped (naming.py).
+	vm := createVmVia(t, f, "good-key", body("  Web-01.virtscale.nl ")).get("vm")
+	if vm["name"] != "web-01" {
+		t.Errorf("name = %q, want the canonical web-01", vm["name"])
+	}
+
+	// Anything that is not a DNS label afterwards is 422 invalid_name.
+	for _, bad := range []string{"under_score", "-lead", "trail-", "has space", strings.Repeat("a", 64)} {
+		status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body(bad))
+		p := decodeObject(t, resp)
+		if status != http.StatusUnprocessableEntity || p["code"] != "invalid_name" {
+			t.Errorf("name %q: %d %v, want 422 invalid_name", bad, status, p["code"])
+		}
+		if p["detail"] != "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'" {
+			t.Errorf("name %q: detail = %q", bad, p["detail"])
+		}
+	}
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body(strings.Repeat("a", 63))); status != http.StatusAccepted {
+		t.Errorf("a 63 character name: status = %d, want 202", status)
+	}
+
+	// Uniqueness is on the canonical name, among live vms of the region.
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body("WEB-01"))
+	p := decodeObject(t, resp)
+	if status != http.StatusConflict || p["code"] != "name_taken" || p["detail"] != "a VM named 'web-01' already exists in gro" {
+		t.Errorf("duplicate canonical name: %d %v %v", status, p["code"], p["detail"])
+	}
+}
+
+func TestFakeAPI_RefusesWhatTheAPIRefuses(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	withExtra := func(extra string) string {
+		return `{"name":"web-01","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n",` + extra + `}`
+	}
+	cases := []struct {
+		name, extra, code, detail string
+	}{
+		{"two ssh keys", `"ssh_keys":["a","b"]`, "too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use"},
+		{"user_data", `"user_data":"#cloud-config"`, "user_data_unsupported", "user_data is not accepted: the instance is built asynchronously, so cloud-init would have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, so where such a payload may live is still an open design question"},
+		{"empty user_data", `"user_data":""`, "user_data_unsupported", ""},
+		{"infra workload", `"workload_type":"infra"`, "workload_not_allowed", "a customer account cannot request infra workloads"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), withExtra(tc.extra))
+			p := decodeObject(t, resp)
+			if status != http.StatusUnprocessableEntity || p["code"] != tc.code {
+				t.Fatalf("%d %v, want 422 %s (%s)", status, p["code"], tc.code, resp)
+			}
+			if tc.detail != "" && p["detail"] != tc.detail {
+				t.Errorf("detail = %q, want %q", p["detail"], tc.detail)
+			}
+		})
+	}
+	if f.CreateCount() != 0 {
+		t.Errorf("refused requests created %d vms", f.CreateCount())
+	}
+
+	// The allowed shapes still work: one keypair name, null user_data, customer workload.
+	vm := createVmVia(t, f, "good-key", withExtra(`"ssh_keys":["k1"],"user_data":null,"workload_type":"customer"`)).get("vm")
+	if names, _ := vm["ssh_key_names"].([]any); len(names) != 1 || names[0] != "k1" {
+		t.Errorf("ssh_key_names = %v, want [k1]", vm["ssh_key_names"])
+	}
+	if vm["user_data_present"] != false {
+		t.Errorf("user_data_present = %v, want false", vm["user_data_present"])
+	}
+}
+
+// TestFakeAPI_IdempotencyKeyReplaysTheStoredResponse pins db/idempotency.py:
+// same key and same body replays the stored 202 (no second vm, same ids);
+// same key and another body is 409 idempotency_key_reused.
+func TestFakeAPI_IdempotencyKeyReplaysTheStoredResponse(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, hdr1, first := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "key-1")
+	if status != http.StatusAccepted {
+		t.Fatalf("first: status = %d (%s)", status, first)
+	}
+	status, hdr2, second := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "key-1")
+	if status != http.StatusAccepted {
+		t.Fatalf("replay: status = %d, want the stored 202 (%s)", status, second)
+	}
+	if string(first) != string(second) {
+		t.Errorf("replayed body differs:\nfirst  %s\nreplay %s", first, second)
+	}
+	if hdr1.Get("Location") != hdr2.Get("Location") || hdr1.Get("Location") == "" {
+		t.Errorf("Location %q vs %q, want the same non-empty value", hdr1.Get("Location"), hdr2.Get("Location"))
+	}
+	if f.CreateCount() != 1 {
+		t.Errorf("CreateCount = %d, want 1: a replay must not build a second vm", f.CreateCount())
+	}
+
+	other := strings.Replace(testValidVmJS, `"vcpus":1`, `"vcpus":2`, 1)
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), other, "Idempotency-Key", "key-1")
+	p := decodeObject(t, resp)
+	if status != http.StatusConflict || p["code"] != "idempotency_key_reused" ||
+		p["detail"] != "this Idempotency-Key was already used with a different request body" {
+		t.Errorf("reused key: %d %v %v, want 409 idempotency_key_reused", status, p["code"], p["detail"])
+	}
+
+	// Without a key the natural uniqueness answers instead.
+	status, _, resp = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS)
+	if status != http.StatusConflict || decodeObject(t, resp)["code"] != "name_taken" {
+		t.Errorf("keyless duplicate: %d, want 409 name_taken (%s)", status, resp)
+	}
+}
+
+// get returns the nested object under key; it exists so tests can chain off
+// createVmVia without a type assertion at every call site.
+type jsonObject map[string]any
+
+func (o jsonObject) get(key string) map[string]any { return o[key].(map[string]any) }
+
+// --- public IP gates (domain/compute/edge.py) -------------------------------
+
+func ipsPath(org string) string { return "/v1/orgs/" + org + "/compute/public-ips" }
+
+// allocateIPVia allocates a public IP in region and returns its id.
+func allocateIPVia(t *testing.T, f *fakeAPI, region string) string {
+	t.Helper()
+	status, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodPost, ipsPath(f.org), `{"region_id":"`+region+`"}`)
+	if status != http.StatusAccepted {
+		t.Fatalf("allocate in %s: status = %d (%s)", region, status, resp)
+	}
+	return decodeObject(t, resp)["public_ip"].(map[string]any)["id"].(string)
+}
+
+// ipStateVia reads a public IP's state through the list, which also advances it.
+func ipStateVia(t *testing.T, f *fakeAPI, id string) string {
+	t.Helper()
+	_, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodGet, ipsPath(f.org), "")
+	for _, it := range decodeObject(t, resp)["items"].([]any) {
+		if m := it.(map[string]any); m["id"] == id {
+			return m["state"].(string)
+		}
+	}
+	return "absent"
+}
+
+func settleIP(t *testing.T, f *fakeAPI, id, want string) {
+	t.Helper()
+	for i := 0; i < 5; i++ {
+		if ipStateVia(t, f, id) == want {
+			return
+		}
+	}
+	t.Fatalf("public ip %s never reached %s (now %s)", id, want, ipStateVia(t, f, id))
+}
+
+func ipAction(t *testing.T, f *fakeAPI, id, action, body string) (int, map[string]any) {
+	t.Helper()
+	method, path := http.MethodPost, ipsPath(f.org)+"/"+id+"/"+action
+	if action == "" {
+		method, path = http.MethodDelete, ipsPath(f.org)+"/"+id
+	}
+	status, _, resp := fakeHTTP(t, f, f.apiKey, method, path, body)
+	return status, decodeObject(t, resp)
+}
+
+func wantProblem(t *testing.T, what string, status int, p map[string]any, wantStatus int, code, detail string) {
+	t.Helper()
+	if status != wantStatus || p["code"] != code {
+		t.Errorf("%s: %d %v, want %d %s (%v)", what, status, p["code"], wantStatus, code, p["detail"])
+		return
+	}
+	if detail != "" && p["detail"] != detail {
+		t.Errorf("%s: detail = %q, want %q", what, p["detail"], detail)
+	}
+}
+
+func TestFakeAPI_PublicIPGatesMatchTheDeployedAPI(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	ipID := allocateIPVia(t, f, "gro")
+	assocBody := `{"vm_id":"` + vmID + `"}`
+
+	// pending: not associable, not releasable, not disassociable.
+	st, p := ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate while pending", st, p, 409, "public_ip_not_allocated", "this public IP is pending, so it cannot be associated")
+	st, p = ipAction(t, f, ipID, "", "")
+	wantProblem(t, "release while pending", st, p, 409, "public_ip_not_releasable", "this public IP is pending, so it cannot be released")
+	st, p = ipAction(t, f, ipID, "disassociate", "")
+	wantProblem(t, "disassociate while pending", st, p, 409, "public_ip_not_associated", "this public IP is pending, so it cannot be disassociated")
+
+	settleIP(t, f, ipID, "allocated")
+
+	// allocated: disassociate has nothing to undo; an unknown or foreign vm is 404.
+	st, p = ipAction(t, f, ipID, "disassociate", "")
+	wantProblem(t, "disassociate while allocated", st, p, 409, "public_ip_not_associated", "this public IP is allocated, so it cannot be disassociated")
+	st, p = ipAction(t, f, ipID, "associate", `{"vm_id":"`+testSomeUUID+`"}`)
+	wantProblem(t, "associate an unknown vm", st, p, 404, "not_found", "no vm matching that identifier is visible to this organization")
+	st, p = ipAction(t, f, testSomeUUID, "associate", assocBody)
+	wantProblem(t, "associate an unknown ip", st, p, 404, "not_found", "no public_ip matching that identifier is visible to this organization")
+
+	// the vm is still pending: not running, so nothing can be attached to it.
+	st, p = ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate to a vm that is not running", st, p, 409, "vm_not_in_a_state_for_this", "this VM is not running, so a public IP cannot be attached to it")
+
+	runVm(t, f, "good-key", vmID)
+	st, _ = ipAction(t, f, ipID, "associate", assocBody)
+	if st != http.StatusAccepted {
+		t.Fatalf("associate to a running vm: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, ipID, "associate", assocBody)
+	wantProblem(t, "associate twice", st, p, 409, "public_ip_not_allocated", "this public IP is associating, so it cannot be associated")
+	settleIP(t, f, ipID, "associated")
+
+	// an associated address can be released directly: the executor disassociates first.
+	st, _ = ipAction(t, f, ipID, "", "")
+	if st != http.StatusAccepted {
+		t.Errorf("release of an associated ip: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, ipID, "", "")
+	wantProblem(t, "release while releasing", st, p, 409, "public_ip_not_releasable", "this public IP is releasing, so it cannot be released")
+	if got := ipStateVia(t, f, ipID); got != "absent" {
+		t.Errorf("after a release the row is gone from the list, got state %q", got)
+	}
+}
+
+func TestFakeAPI_PublicIPRegionAndOneAddressPerVm(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.SetPublicIPQuota(2)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+
+	other := allocateIPVia(t, f, "ams")
+	settleIP(t, f, other, "allocated")
+	st, p := ipAction(t, f, other, "associate", `{"vm_id":"`+vmID+`"}`)
+	wantProblem(t, "associate across regions", st, p, 422, "region_mismatch", "a public IP can only be associated with a VM in the same region")
+
+	first, second := allocateIPVia(t, f, "gro"), allocateIPVia(t, f, "gro")
+	settleIP(t, f, first, "allocated")
+	settleIP(t, f, second, "allocated")
+	if st, _ := ipAction(t, f, first, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("first association: status = %d, want 202", st)
+	}
+	st, p = ipAction(t, f, second, "associate", `{"vm_id":"`+vmID+`"}`)
+	wantProblem(t, "second address on one vm", st, p, 409, "public_ip_already_associated", "this VM already has a public IP associated with it")
+}
+
+// TestFakeAPI_PublicIPQuotaIsPerRegionAndIgnoresErrorRows pins edge.py
+// allocate_public_ip_request: the count is of this org's rows in this region
+// that are not in error, against QuotaProfile.public_ips (1 for customer-default).
+func TestFakeAPI_PublicIPQuotaIsPerRegionAndIgnoresErrorRows(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	first := allocateIPVia(t, f, "gro")
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, ipsPath(testOrgID), `{"region_id":"gro"}`)
+	wantProblem(t, "second ip in the region", status, decodeObject(t, resp), 422, "quota_exceeded",
+		"public IPs: 1 in use plus 1 requested exceeds the limit of 1 for this account")
+
+	other := allocateIPVia(t, f, "ams") // another region has its own count
+	_ = other
+
+	// A row in error holds no address and does not count: drive the first one
+	// into error (a vm named ipfail-* refuses the bind) and allocate again.
+	vm := `{"name":"ipfail-x","image":"i","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"p","region":"gro","network_profile":"n"}`
+	vmID := createVmVia(t, f, "good-key", vm).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+	settleIP(t, f, first, "allocated")
+	if st, _ := ipAction(t, f, first, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("associate: status = %d", st)
+	}
+	settleIP(t, f, first, "error")
+	if id := allocateIPVia(t, f, "gro"); id == "" {
+		t.Error("an error row must not count against the quota")
+	}
+}
+
+// --- keys, scopes and refusals (deps.py, permissions.py) --------------------
+
+func TestFakeAPI_KeyScopesGatePermissions(t *testing.T) {
+	f := newFakeAPI(t, "full-key", testOrgID)
+	f.AddKey("compute-read", "compute:read")
+	f.AddKey("compute-write", "compute:write")
+	f.AddKey("network-write", "network:write")
+	f.AddKey("read-halves", "compute:read", "network:read")
+	f.AddKey("legacy-read", "read")
+	f.AddKey("legacy-write", "write")
+
+	vmPath := vmsPath(testOrgID) + "/" + testSomeUUID
+	ips := ipsPath(testOrgID)
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+	denied := func(perm string) string { return "this credential does not carry the '" + perm + "' permission" }
+
+	type call struct {
+		method, path, body string
+		perm               string // permission the route needs
+	}
+	create := call{http.MethodPost, vmsPath(testOrgID), testValidVmJS, "compute.instance.create"}
+	getVm := call{http.MethodGet, vmPath, "", "compute.instance.read"}
+	delVm := call{http.MethodDelete, vmPath, "", "compute.instance.delete"}
+	listImages := call{http.MethodGet, images, "", "compute.instance.list"}
+	listIPs := call{http.MethodGet, ips, "", "edge.public_ip.read"}
+	allocate := call{http.MethodPost, ips, `{"region_id":"gro"}`, "edge.public_ip.allocate"}
+	associate := call{http.MethodPost, ips + "/" + testSomeUUID + "/associate", `{"vm_id":"` + testSomeUUID + `"}`, "edge.public_ip.allocate"}
+	disassociate := call{http.MethodPost, ips + "/" + testSomeUUID + "/disassociate", "", "edge.public_ip.release"}
+	release := call{http.MethodDelete, ips + "/" + testSomeUUID, "", "edge.public_ip.release"}
+
+	cases := []struct {
+		key     string
+		allowed []call
+		refused []call
+	}{
+		{"compute-read", []call{getVm, listImages}, []call{create, delVm, listIPs, allocate, associate, disassociate, release}},
+		{"compute-write", []call{create, getVm, delVm, listImages}, []call{listIPs, allocate, associate, disassociate, release}},
+		{"network-write", []call{listIPs, allocate, associate, disassociate, release}, []call{create, getVm, delVm, listImages}},
+		{"read-halves", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, associate, disassociate, release}},
+		{"legacy-read", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, release}},
+		{"legacy-write", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
+		{"full-key", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
+	}
+	for _, tc := range cases {
+		for _, c := range tc.refused {
+			status, _, body := fakeHTTP(t, f, tc.key, c.method, c.path, c.body)
+			p := decodeObject(t, body)
+			if status != http.StatusForbidden || p["code"] != "permission_denied" || p["detail"] != denied(c.perm) || p["title"] != "Forbidden" {
+				t.Errorf("%s %s %s: %d %v %v, want 403 permission_denied naming %s", tc.key, c.method, c.path, status, p["code"], p["detail"], c.perm)
+			}
+		}
+		for _, c := range tc.allowed {
+			status, _, body := fakeHTTP(t, f, tc.key, c.method, c.path, c.body)
+			if status == http.StatusForbidden || status == http.StatusUnauthorized {
+				t.Errorf("%s %s %s: %d, want the request to pass the permission check (%s)", tc.key, c.method, c.path, status, body)
+			}
+		}
+	}
+
+	// The order of the gates: the credential, then the org boundary, then the
+	// permission, then the body -- so a read-only key posting garbage is told
+	// it may not post, and a foreign org is 404 whatever the key holds.
+	status, _, _ := fakeHTTP(t, f, "compute-read", http.MethodPost, vmsPath(testOrgID), `{"bogus":1}`)
+	if status != http.StatusForbidden {
+		t.Errorf("permission before body validation: status = %d, want 403", status)
+	}
+	status, _, _ = fakeHTTP(t, f, "compute-read", http.MethodPost, vmsPath(testOtherOrg), testValidVmJS)
+	if status != http.StatusNotFound {
+		t.Errorf("foreign org with a limited key: status = %d, want 404", status)
+	}
+}
+
+func TestFakeAPI_SourceAddressRestriction(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.DenySourceAddress()
+
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodGet, images, "")
+	p := decodeObject(t, body)
+	if status != http.StatusForbidden || p["code"] != "source_address_not_allowed" ||
+		p["detail"] != "this API token cannot be used from this network address" || p["title"] != "Forbidden" {
+		t.Errorf("restricted key: %d %v %v, want 403 source_address_not_allowed", status, p["code"], p["detail"])
+	}
+	// The credential is checked first: a wrong key learns nothing about the restriction.
+	if status, _, _ := fakeHTTP(t, f, "wrong-key", http.MethodGet, images, ""); status != http.StatusUnauthorized {
+		t.Errorf("wrong key: status = %d, want 401", status)
+	}
+}
+
+func matchAny(*http.Request) bool { return true }
+
+func matchMethod(method string) func(*http.Request) bool {
+	return func(r *http.Request) bool { return r.Method == method }
+}
+
+// respondThrottle is the deployed 429 (middleware/rate_limit.py).
+func respondThrottle(retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		rc.problem(http.StatusTooManyRequests, "rate_limited", "Too Many Requests",
+			"too many requests for this organization; wait for the duration in the Retry-After header before retrying")
+	}
+}
+
+// respondGateway is what a proxy in front of the API answers: not problem+json.
+func respondGateway(status int) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Content-Type", "text/html")
+		rc.w.WriteHeader(status)
+		_, _ = rc.w.Write([]byte("<html><body>" + http.StatusText(status) + "</body></html>"))
+	}
+}
+
+// respondGatewayRetryAfter is respondGateway with a Retry-After, which some
+// proxies add; tests use "0" so a retry does not wait.
+func respondGatewayRetryAfter(status int, retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		respondGateway(status)(rc)
+	}
+}
+
+// respondUnavailable is the deployed 503 for an unreachable dependency, which
+// carries a Retry-After.
+func respondUnavailable(retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		rc.problem(http.StatusServiceUnavailable, "dependency_unavailable", "Service unavailable",
+			"a dependency this request needs is temporarily unreachable; this is not a problem with the request -- retry it shortly")
+	}
+}
+
+// respondDrop closes the connection without a response: a transport error.
+func respondDrop(rc *reqCtx) {
+	if hj, ok := rc.w.(http.Hijacker); ok {
+		if conn, _, err := hj.Hijack(); err == nil {
+			_ = conn.Close()
+		}
+	}
+}
+
+func TestFakeAPI_FaultInjection(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	images := "/v1/orgs/" + testOrgID + "/compute/images?region=gro"
+
+	f.FailNext(2, matchAny, respondThrottle("1"))
+	for i := 0; i < 2; i++ {
+		status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodGet, images, "")
+		p := decodeObject(t, body)
+		if status != http.StatusTooManyRequests || hdr.Get("Retry-After") != "1" ||
+			p["code"] != "rate_limited" || p["request_id"] == "" {
+			t.Fatalf("throttled request %d: %d %q %v", i, status, hdr.Get("Retry-After"), p["code"])
+		}
+	}
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodGet, images, ""); status != http.StatusOK {
+		t.Errorf("after the injected failures: status = %d, want 200", status)
+	}
+	if f.FaultsServed() != 2 {
+		t.Errorf("FaultsServed = %d, want 2", f.FaultsServed())
+	}
+
+	// "After handling": the request is processed, the answer is replaced. The
+	// vm exists although the caller saw a 502, which is what makes a retry of
+	// a create without an Idempotency-Key dangerous.
+	f.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGateway(502))
+	status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "k1")
+	if status != http.StatusBadGateway {
+		t.Fatalf("lost response: status = %d, want 502", status)
+	}
+	if f.CreateCount() != 1 {
+		t.Errorf("CreateCount = %d, want 1: the create was processed before the response was lost", f.CreateCount())
+	}
+	status, _, _ = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "k1")
+	if status != http.StatusAccepted || f.CreateCount() != 1 {
+		t.Errorf("retry with the same key: status %d, creates %d, want the replayed 202 and still 1 create", status, f.CreateCount())
+	}
+	if keys := f.IdempotencyKeys(); len(keys) != 2 || keys[0] != "k1" || keys[1] != "k1" {
+		t.Errorf("IdempotencyKeys = %v, want [k1 k1]", keys)
+	}
+
+	// A dropped connection is a transport error for the caller. A fresh
+	// connection is used on purpose: net/http silently re-sends an idempotent
+	// request when a *reused* keep-alive connection dies before any response.
+	f.FailNext(1, matchAny, respondDrop)
+	req, _ := http.NewRequest(http.MethodGet, f.URL()+images, nil)
+	req.Header.Set("Authorization", "Bearer good-key")
+	fresh := &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
+	if resp, err := fresh.Do(req); err == nil {
+		resp.Body.Close()
+		t.Error("a dropped connection must surface as a transport error")
+	}
+}
+
+// TestFakeAPI_ProtectedVmRefusesDelete pins compute.py _refuse_while_protected:
+// while protected, a delete is 409 vm_protected whoever asks, and nothing is
+// written (so no operation is left in flight).
+func TestFakeAPI_ProtectedVmRefusesDelete(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+
+	f.Protect(id, true)
+	_, vm := getVmVia(t, f, "good-key", id)
+	if vm["protected"] != true {
+		t.Errorf("protected = %v, want true", vm["protected"])
+	}
+	status, p := deleteVmVia(t, f, "good-key", id)
+	wantProblem(t, "delete of a protected vm", status, p, 409, "vm_protected",
+		"this VM is protected against deletion; an owner of this organization has to switch that off first, with PUT /v1/orgs/"+testOrgID+"/compute/vms/"+id+"/protection")
+
+	f.Protect(id, false)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Errorf("delete after unprotecting: status = %d, want 202 (a refused delete must leave nothing in flight)", status)
+	}
+}
+
+// TestFakeAPI_PacingKnobsKeepDeletesVisible: SetDeleteSteps and SetReleaseSteps
+// only slow the state machines down; they exist so acceptance tests can act
+// while a delete or release is running.
+func TestFakeAPI_PacingKnobsKeepDeletesVisible(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.SetDeleteSteps(3)
+	f.SetReleaseSteps(3)
+
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Fatalf("delete: status = %d", status)
+	}
+	for i := 0; i < 3; i++ {
+		if status, vm := getVmVia(t, f, "good-key", id); status != http.StatusOK || vm["state"] != "deleting" {
+			t.Fatalf("read %d of a slow delete: %d %v, want 200 deleting", i+1, status, vm["state"])
+		}
+	}
+	if status, _ := getVmVia(t, f, "good-key", id); status != http.StatusNotFound {
+		t.Errorf("after the slow delete: status = %d, want 404", status)
+	}
+
+	ip := allocateIPVia(t, f, "gro")
+	settleIP(t, f, ip, "allocated")
+	if st, _ := ipAction(t, f, ip, "", ""); st != http.StatusAccepted {
+		t.Fatalf("release: status = %d", st)
+	}
+	for i := 0; i < 3; i++ {
+		if got := ipStateVia(t, f, ip); got != "releasing" {
+			t.Fatalf("list %d of a slow release: state %q, want releasing", i+1, got)
+		}
+	}
+	if got := ipStateVia(t, f, ip); got != "absent" {
+		t.Errorf("after the slow release: %q, want absent", got)
+	}
+}
+
+// TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry: Nova lists a floating
+// IP in the server's addresses with OS-EXT-IPS:type floating, next to the
+// fixed one, and removes it again on disassociation. The fake puts it FIRST so
+// a reader that takes the first IPv4 reports the public address as private.
+func TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+	ipID := allocateIPVia(t, f, "gro")
+	settleIP(t, f, ipID, "allocated")
+	if st, _ := ipAction(t, f, ipID, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("associate: status = %d", st)
+	}
+	settleIP(t, f, ipID, "associated")
+
+	entries := func() []any {
+		_, vm := getVmVia(t, f, "good-key", vmID)
+		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)
+	}
+	got := entries()
+	if len(got) != 2 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "floating" || got[1].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
+		t.Fatalf("addresses after association = %v, want [floating, fixed]", got)
+	}
+
+	if st, _ := ipAction(t, f, ipID, "disassociate", ""); st != http.StatusAccepted {
+		t.Fatalf("disassociate: status = %d", st)
+	}
+	settleIP(t, f, ipID, "allocated")
+	if got := entries(); len(got) != 1 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
+		t.Errorf("addresses after disassociation = %v, want only the fixed one", got)
+	}
+}
+
+// TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys: the contract promises
+// "addr" and little more, so a vm named notype-* reports entries without the
+// OS-EXT-IPS keys and one named bare-* reports entries with nothing but addr.
+func TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	named := func(name string) string {
+		return strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"`+name+`"`, 1)
+	}
+	entry := func(name string) map[string]any {
+		id := createVmVia(t, f, "good-key", named(name)).get("vm")["id"].(string)
+		runVm(t, f, "good-key", id)
+		_, vm := getVmVia(t, f, "good-key", id)
+		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)[0].(map[string]any)
+	}
+
+	if e := entry("notype-vm"); e["OS-EXT-IPS:type"] != nil || e["version"] != float64(4) || e["addr"] == nil {
+		t.Errorf("notype-* entry = %v, want addr and version only", e)
+	}
+	if e := entry("bare-vm"); len(e) != 1 || e["addr"] == nil {
+		t.Errorf("bare-* entry = %v, want addr only", e)
+	}
+	if e := entry("plain-vm"); e["OS-EXT-IPS:type"] != "fixed" || e["version"] != float64(4) {
+		t.Errorf("ordinary entry = %v, want the full Nova shape with type fixed", e)
 	}
 }
