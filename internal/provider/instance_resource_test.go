@@ -533,3 +533,30 @@ func TestAccInstanceResource_ReplacingAProtectedVmKeepsTheRefusal(t *testing.T) 
 		},
 	})
 }
+
+// TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises covers M5.
+// observed_addresses is Nova's address map, stored verbatim; the contract
+// promises "addr" and little else (OS-EXT-IPS:type is an extension, and the
+// platform's own readers and fixtures accept entries with nothing but addr).
+// private_ipv4 must come out for entries without the type key, and without
+// the version key, and must not take an explicitly floating entry for the
+// private address.
+func TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises(t *testing.T) {
+	for _, name := range []string{"notype-vm", "bare-vm"} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+			resource.Test(t, resource.TestCase{
+				PreCheck:                 func() { testAccPreCheck(t) },
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+				CheckDestroy:             testAccCheckInstanceDestroy(fake),
+				Steps: []resource.TestStep{
+					{
+						Config: testAccInstanceConfig(fake, name, 1),
+						Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
+					},
+				},
+			})
+		})
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"regexp"
 	"sort"
 	"time"
@@ -477,9 +478,17 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.PrivateIPv4 = types.StringValue(firstIPv4(vm.ObservedAddresses))
 }
 
-// firstIPv4 returns the first fixed IPv4 address from a Nova-shaped
+// firstIPv4 returns the instance's private IPv4 address from the
 // observed_addresses map, iterating network names in sorted order for
 // determinism. It returns "" when there is none.
+//
+// The map is Nova's addresses structure, stored verbatim: network name to a
+// list of entries. The contract promises "addr" and little else -- the
+// platform's own readers and fixtures accept entries with just addr, or bare
+// address strings -- so an entry counts when its addr parses as IPv4 and it is
+// not explicitly marked as anything but fixed. A floating entry (an associated
+// public IP, which Nova lists next to the fixed address) is never the private
+// address.
 func firstIPv4(observed map[string]any) string {
 	if observed == nil {
 		return ""
@@ -497,37 +506,33 @@ func firstIPv4(observed map[string]any) string {
 			continue
 		}
 		for _, e := range entries {
-			addr, ok := e.(map[string]any)
-			if !ok {
-				continue
-			}
-
-			if !isIPv4(addr["version"]) {
-				continue
-			}
-			addrType, _ := addr["OS-EXT-IPS:type"].(string)
-			if addrType != "fixed" {
-				continue
-			}
-			if a, ok := addr["addr"].(string); ok {
-				return a
+			if addr := fixedIPv4Of(e); addr != "" {
+				return addr
 			}
 		}
 	}
 	return ""
 }
 
-func isIPv4(v any) bool {
-	switch t := v.(type) {
-	case float64:
-		return t == 4
-	case int:
-		return t == 4
+// fixedIPv4Of returns the IPv4 address of one addresses entry, or "" when the
+// entry is not an IPv4 address or is marked as other than fixed.
+func fixedIPv4Of(entry any) string {
+	var raw string
+	switch e := entry.(type) {
 	case string:
-		return t == "4"
+		raw = e
+	case map[string]any:
+		if kind, ok := e["OS-EXT-IPS:type"].(string); ok && kind != "fixed" {
+			return ""
+		}
+		raw, _ = e["addr"].(string)
 	default:
-		return false
+		return ""
 	}
+	if ip, err := netip.ParseAddr(raw); err == nil && ip.Is4() {
+		return ip.String()
+	}
+	return ""
 }
 
 func ptrOrEmpty(s *string) string {

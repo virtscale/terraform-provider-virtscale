@@ -1026,21 +1026,62 @@ func (f *fakeAPI) advance(vm *fakeVm) {
 		} else {
 			vm.State = "running"
 			f.nextOctet++
-			vm.ObservedAddresses = map[string]any{
-				"gro-tenant-default": []any{
-					map[string]any{
-						"addr":                    fmt.Sprintf("10.128.3.%d", f.nextOctet),
-						"version":                 4,
-						"OS-EXT-IPS:type":         "fixed",
-						"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
-					},
-				},
+			addr := fmt.Sprintf("10.128.3.%d", f.nextOctet)
+			entry := map[string]any{
+				"addr":                    addr,
+				"version":                 4,
+				"OS-EXT-IPS:type":         "fixed",
+				"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
 			}
+			switch {
+			case strings.HasPrefix(vm.Name, "notype-"):
+				// The contract only promises addr; OS-EXT-IPS is a Nova extension.
+				entry = map[string]any{"addr": addr, "version": 4}
+			case strings.HasPrefix(vm.Name, "bare-"):
+				entry = map[string]any{"addr": addr}
+			}
+			vm.ObservedAddresses = map[string]any{fakeNetwork: []any{entry}}
 			observed := time.Now().UTC()
 			vm.ObservedAt = &observed
 		}
 	}
 	vm.UpdatedAt = time.Now().UTC()
+}
+
+// fakeNetwork is the one network the fake's vms sit on.
+const fakeNetwork = "gro-tenant-default"
+
+// attachFloating lists an associated public IP in the vm's addresses, FIRST,
+// as a floating entry: Nova reports it there next to the fixed address, and a
+// reader that takes the first IPv4 would mistake it for the private one.
+func attachFloating(vm *fakeVm, addr string) {
+	if vm.ObservedAddresses == nil {
+		return
+	}
+	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
+	floating := map[string]any{
+		"addr":                    addr,
+		"version":                 4,
+		"OS-EXT-IPS:type":         "floating",
+		"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
+	}
+	vm.ObservedAddresses[fakeNetwork] = append([]any{floating}, list...)
+}
+
+// detachFloating removes the floating entry for addr again.
+func detachFloating(vm *fakeVm, addr string) {
+	if vm.ObservedAddresses == nil {
+		return
+	}
+	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
+	kept := make([]any, 0, len(list))
+	for _, e := range list {
+		if m, ok := e.(map[string]any); ok && m["addr"] == addr && m["OS-EXT-IPS:type"] == "floating" {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	vm.ObservedAddresses[fakeNetwork] = kept
 }
 
 // deleteVm declares desired_state=deleted and queues the teardown; state is
@@ -1192,6 +1233,11 @@ func (f *fakeAPI) advancePublicIp(ip *fakePublicIP) {
 			}
 		}
 		ip.State = "associated"
+		if ip.VmID != nil && ip.Address != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok {
+				attachFloating(vm, *ip.Address)
+			}
+		}
 	case "disassociating":
 		if ip.VmID != nil {
 			if vm, ok := f.vms[*ip.VmID]; ok && strings.HasPrefix(vm.Name, "ipdisfail-") {
@@ -1199,6 +1245,11 @@ func (f *fakeAPI) advancePublicIp(ip *fakePublicIP) {
 				ip.State = "error"
 				ip.Error = &errMsg
 				return
+			}
+		}
+		if ip.VmID != nil && ip.Address != nil {
+			if vm, ok := f.vms[*ip.VmID]; ok {
+				detachFloating(vm, *ip.Address)
 			}
 		}
 		ip.State = "allocated"
@@ -1294,6 +1345,12 @@ func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 		return
 	}
 
+	// The executor disassociates first when the row still names a vm.
+	if ip.VmID != nil && ip.Address != nil {
+		if vm, ok := f.vms[*ip.VmID]; ok {
+			detachFloating(vm, *ip.Address)
+		}
+	}
 	ip.State = "releasing"
 	ip.releasingLeft = f.releaseSteps
 	f.callSeq[id] = append(f.callSeq[id], "release")
@@ -2305,5 +2362,64 @@ func TestFakeAPI_PacingKnobsKeepDeletesVisible(t *testing.T) {
 	}
 	if got := ipStateVia(t, f, ip); got != "absent" {
 		t.Errorf("after the slow release: %q, want absent", got)
+	}
+}
+
+// TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry: Nova lists a floating
+// IP in the server's addresses with OS-EXT-IPS:type floating, next to the
+// fixed one, and removes it again on disassociation. The fake puts it FIRST so
+// a reader that takes the first IPv4 reports the public address as private.
+func TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", vmID)
+	ipID := allocateIPVia(t, f, "gro")
+	settleIP(t, f, ipID, "allocated")
+	if st, _ := ipAction(t, f, ipID, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
+		t.Fatalf("associate: status = %d", st)
+	}
+	settleIP(t, f, ipID, "associated")
+
+	entries := func() []any {
+		_, vm := getVmVia(t, f, "good-key", vmID)
+		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)
+	}
+	got := entries()
+	if len(got) != 2 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "floating" || got[1].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
+		t.Fatalf("addresses after association = %v, want [floating, fixed]", got)
+	}
+
+	if st, _ := ipAction(t, f, ipID, "disassociate", ""); st != http.StatusAccepted {
+		t.Fatalf("disassociate: status = %d", st)
+	}
+	settleIP(t, f, ipID, "allocated")
+	if got := entries(); len(got) != 1 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
+		t.Errorf("addresses after disassociation = %v, want only the fixed one", got)
+	}
+}
+
+// TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys: the contract promises
+// "addr" and little more, so a vm named notype-* reports entries without the
+// OS-EXT-IPS keys and one named bare-* reports entries with nothing but addr.
+func TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	named := func(name string) string {
+		return strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"`+name+`"`, 1)
+	}
+	entry := func(name string) map[string]any {
+		id := createVmVia(t, f, "good-key", named(name)).get("vm")["id"].(string)
+		runVm(t, f, "good-key", id)
+		_, vm := getVmVia(t, f, "good-key", id)
+		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)[0].(map[string]any)
+	}
+
+	if e := entry("notype-vm"); e["OS-EXT-IPS:type"] != nil || e["version"] != float64(4) || e["addr"] == nil {
+		t.Errorf("notype-* entry = %v, want addr and version only", e)
+	}
+	if e := entry("bare-vm"); len(e) != 1 || e["addr"] == nil {
+		t.Errorf("bare-* entry = %v, want addr only", e)
+	}
+	if e := entry("plain-vm"); e["OS-EXT-IPS:type"] != "fixed" || e["version"] != float64(4) {
+		t.Errorf("ordinary entry = %v, want the full Nova shape with type fixed", e)
 	}
 }

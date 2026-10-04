@@ -80,6 +80,10 @@ func TestAccPublicIpResource_Lifecycle(t *testing.T) {
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "allocated"),
 					resource.TestCheckNoResourceAttr("virtscale_public_ip.test", "instance_id"),
+					// The refresh before this step read the vm while the
+					// address was attached: Nova lists it, as a floating entry,
+					// ahead of the fixed one. It is not the private address.
+					resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
 				),
 			},
 			{
