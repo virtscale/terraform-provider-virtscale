@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -405,6 +406,53 @@ func TestAccInstanceResource_MalformedOrganizationNamesTheField(t *testing.T) {
 			{
 				Config:      testAccProviderBlockWith(fake, fake.apiKey, "my-company") + testAccInstanceBlock("bad-org"),
 				ExpectError: regexp.MustCompile(`org: Input should be a valid UUID`),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_NameMustMatchWhatTheAPIStores covers M1. The API
+// canonicalises a name (lower-case, trimmed, a trailing .virtscale.nl
+// stripped; naming.py) and answers with the canonical one, so a configured
+// "Web-01" would come back as "web-01" and fail the apply with "inconsistent
+// result" after the VM already exists. The documented rule is therefore
+// enforced at plan time, before anything is created.
+func TestAccInstanceResource_NameMustMatchWhatTheAPIStores(t *testing.T) {
+	for _, name := range []string{"Web-01", "web_01", "-web", "web-", "web.virtscale.nl", " web", strings.Repeat("a", 64)} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+			resource.Test(t, resource.TestCase{
+				PreCheck:                 func() { testAccPreCheck(t) },
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+				Steps: []resource.TestStep{
+					{
+						Config:      testAccInstanceConfig(fake, name, 1),
+						ExpectError: regexp.MustCompile(`Invalid instance name`),
+					},
+				},
+			})
+			if fake.CreateCount() != 0 {
+				t.Errorf("a name the API would rewrite must be refused at plan time; %d vm(s) were created", fake.CreateCount())
+			}
+		})
+	}
+}
+
+// TestAccInstanceResource_NameAtTheLimitIsAccepted: 63 characters is a DNS
+// label's maximum and the API stores it as given.
+func TestAccInstanceResource_NameAtTheLimitIsAccepted(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	name := strings.Repeat("a", 63)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, name, 1),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "name", name),
 			},
 		},
 	})

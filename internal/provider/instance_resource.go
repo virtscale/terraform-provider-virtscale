@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/client"
@@ -40,6 +42,40 @@ const (
 // errInstanceBuildFailed is the sentinel WaitVm's done callback returns when
 // the observed vm reaches state "error" during create.
 var errInstanceBuildFailed = errors.New("instance entered error state")
+
+// vmNamePattern is the API's stored form of an instance name: a DNS label of
+// 1-63 characters (compute/naming.py NAME_RE).
+var vmNamePattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// vmNameValidator refuses, at plan time, a name the API would not store as
+// given. The API canonicalises names (trims, lower-cases, strips a trailing
+// ".virtscale.nl") and answers with the canonical one; the provider copies
+// that answer into state, so a name that is not already canonical would fail
+// the apply with "inconsistent result" after the instance has been created.
+type vmNameValidator struct{}
+
+func (vmNameValidator) Description(context.Context) string {
+	return "1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit"
+}
+
+func (v vmNameValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (vmNameValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if name := req.ConfigValue.ValueString(); !vmNamePattern.MatchString(name) {
+		resp.Diagnostics.AddAttributeError(
+			req.Path,
+			"Invalid instance name",
+			fmt.Sprintf("%q is not a valid instance name: use 1-63 lowercase letters, digits or hyphens, "+
+				"starting and ending with a letter or digit. The API lower-cases names and strips a trailing "+
+				"\".virtscale.nl\", so any other form would come back different from the configuration.", name),
+		)
+	}
+}
 
 // InstanceResource implements the virtscale_instance resource.
 type InstanceResource struct {
@@ -91,8 +127,10 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 			"name": schema.StringAttribute{
-				Required:    true,
-				Description: "Lowercase letters, digits and hyphens; must start and end alphanumeric. Unique among live instances in the same region -- a deleted instance's name is reusable.",
+				Required: true,
+				Description: "1-63 lowercase letters, digits or hyphens; must start and end alphanumeric. " +
+					"Unique among live instances in the same region -- a deleted instance's name is reusable.",
+				Validators: []validator.String{vmNameValidator{}},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.RequiresReplace(),
 				},
