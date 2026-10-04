@@ -46,7 +46,7 @@ output "private_ipv4" {
   value = virtscale_instance.example.private_ipv4
 }
 
-# A customer organization's public IP quota is one. Uncomment to allocate
+# A customer organization's public IP quota is one per region. Uncomment to allocate
 # one and associate it with the instance above.
 #
 # resource "virtscale_public_ip" "example" {

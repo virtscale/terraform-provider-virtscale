@@ -476,6 +476,9 @@ func repeatable(method, idempotencyKey string) bool {
 //     repeatable request is retried.
 //   - A 503 whose code is not_ready says a feature flag is off; retrying
 //     cannot help.
+//   - A 409 idempotency_in_progress on a request that carries an
+//     Idempotency-Key says the first attempt with that key is still being
+//     processed; the key replays its result once the API has stored it.
 //   - Nothing else is retried: a 4xx is a decision about the request, and a
 //     500 says nothing about whether it ran.
 func retryable(method, idempotencyKey string, ex *exchange, apiErr *APIError, transportErr error) bool {
@@ -489,6 +492,8 @@ func retryable(method, idempotencyKey string, ex *exchange, apiErr *APIError, tr
 		return repeatable(method, idempotencyKey)
 	case http.StatusServiceUnavailable:
 		return repeatable(method, idempotencyKey) && (apiErr == nil || apiErr.Code != "not_ready")
+	case http.StatusConflict:
+		return idempotencyKey != "" && apiErr != nil && apiErr.Code == "idempotency_in_progress"
 	}
 	return false
 }
