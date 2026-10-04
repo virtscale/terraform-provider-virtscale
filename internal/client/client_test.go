@@ -811,9 +811,9 @@ func TestRetry_RetryAfterAsAnHTTPDate(t *testing.T) {
 func TestRetry_BackoffIsExponentialFullJitterUpToTheCap(t *testing.T) {
 	c, _, log := newScriptedClient(t, problemStep(503, "dependency_unavailable"))
 	var ceilings []time.Duration
-	c.retry.jitter = func(max time.Duration) time.Duration {
-		ceilings = append(ceilings, max)
-		return max / 2
+	c.retry.jitter = func(ceiling time.Duration) time.Duration {
+		ceilings = append(ceilings, ceiling)
+		return ceiling / 2
 	}
 
 	if _, err := c.GetVm(context.Background(), "vm-1"); err == nil {
@@ -838,7 +838,7 @@ func TestRetry_BackoffIsExponentialFullJitterUpToTheCap(t *testing.T) {
 	c2, _, _ := newScriptedClient(t, problemStep(503, "dependency_unavailable"))
 	c2.retry.baseDelay = 10 * time.Second
 	var capped []time.Duration
-	c2.retry.jitter = func(max time.Duration) time.Duration { capped = append(capped, max); return max }
+	c2.retry.jitter = func(ceiling time.Duration) time.Duration { capped = append(capped, ceiling); return ceiling }
 	_, _ = c2.GetVm(context.Background(), "vm-1")
 	want := []time.Duration{10 * time.Second, 20 * time.Second, 20 * time.Second, 20 * time.Second}
 	for i, w := range want {
@@ -889,7 +889,7 @@ func TestRetry_AnUnusableRetryAfterFallsBackToBackoff(t *testing.T) {
 	for _, header := range []string{"soon", "-5", "1.5", ""} {
 		t.Run("Retry-After: "+header, func(t *testing.T) {
 			c, _, log := newScriptedClient(t, problemStep(429, "rate_limited", "Retry-After", header), jsonStep(200, testVmJSON))
-			c.retry.jitter = func(max time.Duration) time.Duration { return max }
+			c.retry.jitter = func(ceiling time.Duration) time.Duration { return ceiling }
 
 			if _, err := c.GetVm(context.Background(), "vm-1"); err != nil {
 				t.Fatalf("GetVm() error = %v", err)

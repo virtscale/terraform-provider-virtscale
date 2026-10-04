@@ -47,7 +47,7 @@ type retryConfig struct {
 	maxRetryAfter time.Duration // a longer Retry-After is not waited for
 	sleep         func(ctx context.Context, d time.Duration) error
 	now           func() time.Time
-	jitter        func(max time.Duration) time.Duration
+	jitter        func(ceiling time.Duration) time.Duration
 }
 
 const (
@@ -85,15 +85,15 @@ func sleepContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// defaultJitter returns a uniformly random duration in [0, max): "full
+// defaultJitter returns a uniformly random duration in [0, ceiling): "full
 // jitter", so clients that were throttled together do not retry together.
-func defaultJitter(max time.Duration) time.Duration {
-	if max <= 0 {
+func defaultJitter(ceiling time.Duration) time.Duration {
+	if ceiling <= 0 {
 		return 0
 	}
-	d := time.Duration(rand.Float64() * float64(max))
-	if d >= max {
-		d = max - 1
+	d := time.Duration(rand.Float64() * float64(ceiling))
+	if d >= ceiling {
+		d = ceiling - 1
 	}
 	return d
 }
@@ -501,7 +501,8 @@ func permanentTransportError(err error) bool {
 		return true
 	}
 	var urlErr *url.Error
-	return errors.As(err, &urlErr) && strings.HasPrefix(urlErr.Err.Error(), "unsupported protocol scheme")
+	return errors.As(err, &urlErr) && urlErr.Err != nil &&
+		strings.HasPrefix(urlErr.Err.Error(), "unsupported protocol scheme")
 }
 
 // maxRetryAfterSeconds saturates absurd delay-seconds values before they can
