@@ -13,6 +13,7 @@ from there.
 
 - Provider `virtscale`: configured with an API key and an organization id.
 - Resource `virtscale_instance`: a VirtScale compute instance (VM).
+- Resource `virtscale_ssh_key`: an SSH public key imported into the organization, which instances take by name.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
 - Data source `virtscale_images`: the image catalogue for a region.
@@ -85,14 +86,16 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | You use | The key needs |
 | ------- | ------------- |
 | `virtscale_instance` (create, destroy, refresh) | `compute:write` |
+| `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
 | `virtscale_images` (data source) | `compute:read` (`compute:write` covers it too) |
-| `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances and images, `network:read` for public IPs |
+| `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances, SSH keys and images, `network:read` for public IPs |
 
 A configuration with an instance and a public IP associated to it needs both `compute:write` and
 `network:write`.
 
-`compute:write` covers every `compute.*` and `operation.*` permission, reads included; `network:write` covers
+`compute:write` covers every `compute.*` and `operation.*` permission, reads included (SSH keys are
+`compute.ssh_key.*`); `network:write` covers
 every `network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`). The `:read` scopes cover the
 `.read` and `.list` permissions of their family. The older all-family scopes also work: `write` for everything
 above, `read` for plan-only use.
@@ -106,17 +109,20 @@ The client retries like the AWS SDK's standard mode, within what this API makes 
 
 - `429` (`rate_limited`) is retried for every request: the rate limiter refuses a request before it runs.
 - `502`, `503`, `504` and transport errors (a dropped connection, a timeout) may have been applied, so they
-  are retried only for requests that are safe to send twice: reads, deletes, and creating an instance, which
-  carries an `Idempotency-Key` (the API answers a repeat of the same request with the first answer, so one
-  create never builds two instances).
+  are retried only for requests that are safe to send twice: reads, deletes, and creating an instance or
+  importing an SSH key, which carry an `Idempotency-Key` (the API answers a repeat of the same request with
+  the first answer, so one create never builds two instances and one import never stores a key twice).
+- A certificate that does not verify, and an endpoint whose scheme is not `http` or `https`, fail at once and
+  are not retried: trying again cannot fix them.
 - Allocating, associating and disassociating a public IP carry no `Idempotency-Key`, so they are never
   retried after a `5xx` or a lost connection. If the API processed one but its answer was lost, the error
   reaches you and the address may exist without being in state: check the panel or `GET .../compute/public-ips`
   and `tofu import` it.
-- A `503` with code `not_ready` (the feature is switched off) is never retried.
-- A `409` with code `idempotency_in_progress` is retried for creating an instance: the first attempt with
-  the same `Idempotency-Key` is still being processed, and the key returns its answer once the API has
-  stored it. Every other `409` is returned at once.
+- A `503` with code `not_ready` (the feature is switched off, for example SSH keys that are not switched on
+  yet) is never retried.
+- A `409` with code `idempotency_in_progress` is retried for creating an instance or importing an SSH key: the
+  first attempt with the same `Idempotency-Key` is still being processed, and the key returns its answer
+  once the API has stored it. Every other `409` is returned at once.
 - The wait is the `Retry-After` header (seconds or an HTTP date) when the API sends one, otherwise exponential
   backoff with full jitter: a random wait between zero and a ceiling that starts at 1 second, doubles with
   each retry and is capped at 20 seconds. A `Retry-After` above 60 seconds is not waited for: the error is
@@ -126,6 +132,13 @@ The client retries like the AWS SDK's standard mode, within what this API makes 
 
 When it gives up, the error is still the API's own (status, code, detail, request id) followed by
 `gave up after N attempts`.
+
+When creating an instance or importing an SSH key gives up after a lost answer, a gateway error, a duplicate
+that is still being processed or a lost connection, the first request may have been processed anyway, so the
+resource may exist without being in state. The error says so and says what to do: if the next apply reports
+`name_taken`, find the resource in the panel or with the API and bring it under management with `tofu import`
+(`tofu import virtscale_instance.<name> <id>`, `tofu import virtscale_ssh_key.<name> <id>`). A `429`, a
+`not_ready`, a refusal of the API and a certificate error carry no such hint: nothing was created.
 
 Waiting for a result is separate from retrying a request: creating an instance waits up to 20 minutes for
 state `running` and fails at once, with the API's `error_class` and `error_detail`, if it reaches `error`;
@@ -139,12 +152,19 @@ including the field list the API sends with a `400`. Where the fix is on your si
 | Response | Hint |
 | -------- | ---- |
 | `401 unauthorized` | check `VIRTSCALE_API_KEY`: the key may be wrong, revoked or expired |
-| `403 permission_denied` | the scope that grants the permission it names: `compute:write` or `compute:read` for `compute.*` and `operation.*`, `network:write` or `network:read` for `edge.*` and `network.*` |
+| `403 permission_denied` | the scope that grants the permission it names: `compute:write` or `compute:read` for `compute.*` (instances, SSH keys, images) and `operation.*`, `network:write` or `network:read` for `edge.*` and `network.*` |
 | `403 source_address_not_allowed` | the key's network limits do not include this address |
 | `404` about the organization | check `VIRTSCALE_ORGANIZATION`, or that the key belongs to that organization |
 
-A `404` about the organization is not read as "the resource is gone": pointing the provider at the wrong
-organization fails the refresh instead of dropping your instances from state.
+Only a `404` that says the resource itself is gone is read as "gone": its code is `not_found` and its detail is
+the API's sentence for that kind of resource (an instance, a public IP or an SSH key, as asked about). Every other
+`404` is an error with the API's own detail, and the resource stays in state: a `404` about the organization
+(pointing the provider at the wrong organization), about the compute service or a region, an unknown route (a
+mistyped `endpoint`) and a proxy's error page. Dropping a live resource on a wrong `404` would orphan it, and a
+destroy that waits for "gone" would report a deletion nobody saw.
+
+Error text that came from the response has your API key replaced by `[redacted]`, in case a proxy in front of
+the API prints the request.
 
 ## Resources and data sources
 
@@ -160,7 +180,7 @@ organization fails the refresh instead of dropping your instances from state.
 | `disk_gb`         | number | Required, forces replacement | |
 | `storage_pool`    | string | Required, forces replacement | |
 | `network_profile` | string | Required, forces replacement | |
-| `ssh_keys`        | list(string) | Optional, forces replacement | Nova keypair *names*, at most one (the API refuses more with `422 too_many_ssh_keys`). Customer projects have no keypairs and no API route creates one yet, so leave it unset: an unknown name makes the instance fail to build. The API also refuses `user_data`, so the provider has no such attribute. Not read back on import. |
+| `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. The API refuses `user_data`, so the provider has no such attribute. |
 | `id`              | string | Computed | |
 | `state`           | string | Computed | |
 | `fqdn`            | string | Computed | Null for a customer account. |
@@ -172,6 +192,51 @@ The API checks `vcpus`, `memory_mb` and `disk_gb` against the platform's size li
 minimums (`min_disk_gb` and `min_ram_mb` in `virtscale_images`); a refusal lists every violation
 (`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute forces replacement: there
 are no in-place changes yet.
+
+### `virtscale_ssh_key`
+
+An SSH public key imported into the organization, like AWS's `ImportKeyPair`. Instances take keys by name
+(`virtscale_instance.ssh_keys`), and cloud-init installs them for the image's default user when an instance first
+boots. Only the public key is stored.
+
+| Attribute     | Type   | Required/Computed | Notes |
+| ------------- | ------ | ------------------ | ----- |
+| `name`        | string | Required, forces replacement | Unique within the organization and case-sensitive: 1 to 64 characters from letters, digits, `.`, `_`, `@` and `-`, starting with a letter or digit. A name that is taken is `409 name_taken`; one that breaks the rule is `422 invalid_name`. |
+| `public_key`  | string | Required | One OpenSSH line, `<type> <base64> [comment]`, for example `file("~/.ssh/id_ed25519.pub")`. Types: `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521`, and `ssh-rsa` of 2048 to 16384 bits. A key the API does not take is `422 invalid_public_key`, and its detail says why. A different key forces replacement; a change that leaves the key alone does not (below). |
+| `id`          | string | Computed | |
+| `key_type`    | string | Computed | The type the API recognised, for example `ssh-ed25519`. |
+| `fingerprint` | string | Computed | `SHA256:` and the unpadded base64 of the SHA-256 of the key, as `ssh-keygen -lf` prints it. |
+| `created_at`  | string | Computed | RFC 3339. |
+
+```hcl
+resource "virtscale_ssh_key" "laptop" {
+  name       = "laptop"
+  public_key = file("~/.ssh/id_ed25519.pub")
+}
+
+resource "virtscale_instance" "web" {
+  # ...
+  ssh_keys = [virtscale_ssh_key.laptop.name]
+}
+```
+
+**One key, one meaning, whatever the text.** The API stores the key in canonical form, `<type> <base64>`, with the
+comment dropped. The provider compares the key type and the decoded key bytes, not the text. So
+`file("~/.ssh/id_ed25519.pub")`, with its comment and trailing newline, never differs from what the API stores;
+surrounding whitespace and CRLF line endings do not matter; and two spellings of one base64 string (spare bits in
+its last character) are one key. A plan that only changes the text of the same key is an in-place update that stores
+your text and makes no API call. That is what you see right after `tofu import`, where the state holds the API's
+canonical form and your configuration holds the file with its comment. It never replaces the key. A different key
+does: destroy, then import. A text that does not parse (a bad key) is compared exactly, so it still reaches the API,
+which refuses it with `422 invalid_public_key`.
+
+**Keys are a launch-time snapshot.** Deleting or replacing a key does not change instances that were created with
+it: they keep the key they booted with, and `virtscale_instance.ssh_keys` is not touched. Changing an instance's
+`ssh_keys` replaces the instance. The organization has a quota of keys (`422 quota_exceeded` beyond it), and a
+`503 not_ready` on an import, or on creating an instance that names keys, means SSH keys are not switched on for
+this API yet; it is not retried.
+
+Import by id: `tofu import virtscale_ssh_key.laptop <id>`.
 
 ### `virtscale_public_ip`
 
