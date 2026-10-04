@@ -560,3 +560,76 @@ func TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises(t *testing.
 		})
 	}
 }
+
+func testAccInstanceConfigSSHKeys(fake *fakeAPI, name string, keys ...string) string {
+	quoted := make([]string, len(keys))
+	for i, k := range keys {
+		quoted[i] = fmt.Sprintf("%q", k)
+	}
+	return testAccProviderBlock(fake) + fmt.Sprintf(`
+resource "virtscale_instance" "test" {
+  name            = %q
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+  ssh_keys        = [%s]
+}
+`, name, strings.Join(quoted, ", "))
+}
+
+// TestAccInstanceResource_SSHKeyNameReachesTheAPI: ssh_keys carries Nova
+// keypair NAMES (VmCreateRequest.ssh_keys); the API records them as
+// ssh_key_names. (No customer project has a keypair yet, so against the real
+// API a build with a name fails; see README. This pins the request shape.)
+func TestAccInstanceResource_SSHKeyNameReachesTheAPI(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigSSHKeys(fake, "with-key", "deploy"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vmIDFromState(&id),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "1"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.0", "deploy"),
+					func(*terraform.State) error {
+						if got := fake.SSHKeyNames(id); len(got) != 1 || got[0] != "deploy" {
+							return fmt.Errorf("the API recorded ssh_key_names %v, want [deploy]", got)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI: an instance is
+// given exactly one keypair, so the API refuses more with 422
+// too_many_ssh_keys before it builds anything. The refusal and its reason
+// reach the user, and nothing is created.
+func TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccInstanceConfigSSHKeys(fake, "two-keys", "a", "b"),
+				ExpectError: regexp.MustCompile(`too_many_ssh_keys`),
+			},
+		},
+	})
+	if fake.CreateCount() != 0 {
+		t.Errorf("the API refused the request, yet %d vm(s) were created", fake.CreateCount())
+	}
+}

@@ -200,7 +200,11 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"ssh_keys": schema.ListAttribute{
 				ElementType: types.StringType,
 				Optional:    true,
-				Description: "Names of your SSH keys to install on the instance. No key material is stored here.",
+				Description: "Names of Nova keypairs to give the instance; no key material is stored here. " +
+					"At most one name: the API refuses more with 422 too_many_ssh_keys. The keypair must " +
+					"already exist in the organization's cloud project. Customer projects have none and no " +
+					"API route creates one yet, so leave this unset: an unknown name makes the instance " +
+					"fail to build (state error).",
 				PlanModifiers: []planmodifier.List{
 					listplanmodifier.RequiresReplace(),
 				},

@@ -349,6 +349,17 @@ func (f *fakeAPI) takeFault(r *http.Request) *fakeFault {
 	return nil
 }
 
+// SSHKeyNames reports the keypair names the API recorded for vm id.
+func (f *fakeAPI) SSHKeyNames(id string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok {
+		return nil
+	}
+	return append([]string(nil), vm.SSHKeyNames...)
+}
+
 // Protect switches deletion protection on or off for vm id (VmOut.protected).
 // While it is on a delete is 409 vm_protected, and allowed_actions drops delete.
 func (f *fakeAPI) Protect(id string, on bool) {
