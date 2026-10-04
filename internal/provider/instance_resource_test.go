@@ -54,17 +54,40 @@ func testAccPreCheck(t *testing.T) {
 }
 
 func testAccProviderBlock(fake *fakeAPI) string {
+	return testAccProviderBlockWith(fake, fake.apiKey, fake.org)
+}
+
+// testAccProviderBlockWith configures the provider against fake with an
+// explicit key and organization, for tests about the credentials themselves.
+func testAccProviderBlockWith(fake *fakeAPI, key, org string) string {
 	return fmt.Sprintf(`
 provider "virtscale" {
   api_key      = %q
   organization = %q
   endpoint     = %q
 }
-`, fake.apiKey, fake.org, fake.URL())
+`, key, org, fake.URL())
 }
 
 func testAccInstanceConfig(fake *fakeAPI, name string, vcpus int) string {
 	return testAccInstanceConfigImage(fake, name, vcpus, "image-1")
+}
+
+// testAccInstanceBlock is the virtscale_instance resource alone, so a test can
+// pair it with a provider block of its own.
+func testAccInstanceBlock(name string) string {
+	return fmt.Sprintf(`
+resource "virtscale_instance" "test" {
+  name            = %q
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+}
+`, name)
 }
 
 // testAccInstanceConfigImage is testAccInstanceConfig with an explicit image
@@ -332,6 +355,56 @@ func TestAccInstanceResource_VanishedOutOfBand(t *testing.T) {
 				Config:             testAccInstanceConfig(fake, "vanish-me", 1),
 				PlanOnly:           true,
 				ExpectNonEmptyPlan: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_WrongOrganizationKeepsTheResourceInState guards
+// against state loss. The API answers 404 not_found both for a missing vm and
+// for an organization the key cannot see; if Read took the second for the
+// first, pointing the provider at the wrong organization would silently drop
+// every live resource from state (orphaning running, billed VMs). Step 2
+// refreshes against another organization and must fail; step 3 refreshes
+// against the right one and must find the vm still tracked (an empty plan).
+func TestAccInstanceResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "org-guard", 1),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+			},
+			{
+				Config:      testAccProviderBlockWith(fake, fake.apiKey, testOtherOrg) + testAccInstanceBlock("org-guard"),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`no organization matching that identifier`),
+			},
+			{
+				Config:   testAccInstanceConfig(fake, "org-guard", 1),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_MalformedOrganizationNamesTheField: the API wants a
+// UUID in the path and answers 400 invalid_request with errors[]; the
+// diagnostic must carry the field and the reason, not only "failed validation".
+func TestAccInstanceResource_MalformedOrganizationNamesTheField(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccProviderBlockWith(fake, fake.apiKey, "my-company") + testAccInstanceBlock("bad-org"),
+				ExpectError: regexp.MustCompile(`org: Input should be a valid UUID`),
 			},
 		},
 	})

@@ -91,6 +91,14 @@ type APIError struct {
 	Title     string
 	Detail    string
 	RequestID string
+	Errors    []FieldError
+}
+
+// FieldError is one entry of a problem body's errors[]: which request field
+// the API refused and why.
+type FieldError struct {
+	Field   string
+	Message string
 }
 
 func (e *APIError) Error() string {
@@ -99,19 +107,51 @@ func (e *APIError) Error() string {
 		code = "error"
 	}
 	msg := fmt.Sprintf("virtscale API %d %s: %s", e.Status, code, e.Detail)
+	if len(e.Errors) > 0 {
+		parts := make([]string, len(e.Errors))
+		for i, fe := range e.Errors {
+			parts[i] = fe.Message
+			if fe.Field != "" {
+				parts[i] = fe.Field + ": " + fe.Message
+			}
+		}
+		msg += ": " + strings.Join(parts, "; ")
+	}
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
 	}
 	return msg
 }
 
-// IsNotFound reports whether err is an *APIError with Status 404.
+// organizationNotVisiblePrefix starts the detail of the 404 the API gives for
+// an organization the key cannot see (errors.not_found("organization"), raised
+// in customer_api/deps.py). It shares code not_found with a missing vm or
+// public IP, so the detail is the only thing that tells them apart; if the
+// wording ever changes, the check degrades to "any 404 is not found".
+const organizationNotVisiblePrefix = "no organization matching that identifier"
+
+func isOrganizationNotVisible(e *APIError) bool {
+	return e.Status == http.StatusNotFound && strings.HasPrefix(e.Detail, organizationNotVisiblePrefix)
+}
+
+// IsNotFound reports whether err is an *APIError with Status 404 that says the
+// resource is not there. A 404 about the organization itself (a wrong
+// organization id, or a key issued for another organization) is not: it says
+// nothing about the resource, and treating it as "gone" would drop a live
+// resource from state.
 func IsNotFound(err error) bool {
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
-		return apiErr.Status == http.StatusNotFound
+		return apiErr.Status == http.StatusNotFound && !isOrganizationNotVisible(apiErr)
 	}
 	return false
+}
+
+// IsOrganizationNotVisible reports whether err is the 404 the API gives for an
+// organization the key cannot see.
+func IsOrganizationNotVisible(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && isOrganizationNotVisible(apiErr)
 }
 
 type problemBody struct {
@@ -135,13 +175,17 @@ const maxTruncatedBodyLen = 200
 func newAPIError(status int, body []byte) *APIError {
 	var p problemBody
 	if err := json.Unmarshal(body, &p); err == nil && (p.Type != "" || p.Title != "" || p.Code != "") {
-		return &APIError{
+		apiErr := &APIError{
 			Status:    status,
 			Code:      p.Code,
 			Title:     p.Title,
 			Detail:    p.Detail,
 			RequestID: p.RequestID,
 		}
+		for _, fe := range p.Errors {
+			apiErr.Errors = append(apiErr.Errors, FieldError{Field: fe.Field, Message: fe.Message})
+		}
+		return apiErr
 	}
 
 	detail := strings.TrimSpace(string(body))
@@ -403,7 +447,8 @@ func (c *Client) ListPublicIps(ctx context.Context) ([]PublicIp, error) {
 }
 
 // GetPublicIp has no single-item GET counterpart in the API; it lists and
-// filters, returning an *APIError with Status 404 when id is absent.
+// filters, returning an *APIError with Status 404 (code not_found, like the
+// API's own answer for a missing public IP) when id is absent.
 func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) {
 	ips, err := c.ListPublicIps(ctx)
 	if err != nil {
@@ -416,7 +461,7 @@ func (c *Client) GetPublicIp(ctx context.Context, id string) (*PublicIp, error) 
 	}
 	return nil, &APIError{
 		Status: http.StatusNotFound,
-		Code:   "public_ip_not_found",
+		Code:   "not_found",
 		Detail: fmt.Sprintf("public ip %s not found", id),
 	}
 }

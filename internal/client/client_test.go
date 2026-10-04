@@ -311,3 +311,71 @@ func TestWaitVm_404PassedAsNilVm(t *testing.T) {
 		t.Error("done() was never called with vm == nil on 404")
 	}
 }
+
+func TestAPIError_FieldErrorsAreKeptAndShown(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/invalid_request","title":"Invalid request","status":400,"detail":"the request body or parameters failed validation","instance":"/v1/orgs/x/compute/vms","code":"invalid_request","request_id":"req-9","errors":[{"field":"vcpus","message":"Input should be greater than or equal to 1"},{"field":"name","message":"Field required"}]}`))
+	})
+
+	_, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, "")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("err = %v (%T), want *APIError", err, err)
+	}
+	if len(apiErr.Errors) != 2 || apiErr.Errors[0] != (FieldError{Field: "vcpus", Message: "Input should be greater than or equal to 1"}) ||
+		apiErr.Errors[1] != (FieldError{Field: "name", Message: "Field required"}) {
+		t.Errorf("Errors = %+v, want the two field errors in order", apiErr.Errors)
+	}
+	want := "virtscale API 400 invalid_request: the request body or parameters failed validation: " +
+		"vcpus: Input should be greater than or equal to 1; name: Field required (request req-9)"
+	if apiErr.Error() != want {
+		t.Errorf("Error() = %q\nwant      %q", apiErr.Error(), want)
+	}
+}
+
+// The API answers 404 not_found for a missing vm and for an organization the
+// key cannot see (deps.py, errors.not_found); only the detail differs. Reading
+// the second as "the resource is gone" would drop real resources from state.
+func TestIsNotFound_AnUnseenOrganizationIsNotAMissingResource(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(http.StatusNotFound)
+		detail := "no vm matching that identifier is visible to this organization"
+		if strings.Contains(r.URL.Path, "/orgs/other-org/") {
+			detail = "no organization matching that identifier is visible to this organization"
+		}
+		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/not_found","title":"Resource not found","status":404,"detail":"` + detail + `","instance":"` + r.URL.Path + `","code":"not_found","request_id":"req-1"}`))
+	})
+
+	_, err := c.GetVm(context.Background(), "vm-1")
+	if !IsNotFound(err) || IsOrganizationNotVisible(err) {
+		t.Errorf("missing vm: IsNotFound=%v IsOrganizationNotVisible=%v, want true/false", IsNotFound(err), IsOrganizationNotVisible(err))
+	}
+
+	other, err := New(c.endpoint, "test-key", "other-org")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = other.GetVm(context.Background(), "vm-1")
+	if IsNotFound(err) || !IsOrganizationNotVisible(err) {
+		t.Errorf("unseen organization: IsNotFound=%v IsOrganizationNotVisible=%v, want false/true", IsNotFound(err), IsOrganizationNotVisible(err))
+	}
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 404 {
+		t.Errorf("the error must still be the *APIError (404), got %v", err)
+	}
+}
+
+func TestGetPublicIp_AbsentUsesTheAPIsNotFoundCode(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":null}`))
+	})
+	_, err := c.GetPublicIp(context.Background(), "ip-9")
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Code != "not_found" {
+		t.Errorf("err = %+v, want a 404 with the API's own code not_found", apiErr)
+	}
+}
