@@ -62,6 +62,11 @@ type fakeAPI struct {
 	// negative for unlimited.
 	publicIPQuota int
 
+	// Pacing: how many reads a delete stays in "deleting", and how many list
+	// reads still show a release as "releasing".
+	deleteSteps  int
+	releaseSteps int
+
 	// callSeq records, per public IP id, the order "disassociate"/"release"
 	// calls were observed -- used to assert Delete disassociates before it
 	// releases.
@@ -157,6 +162,8 @@ type fakeVm struct {
 	// deletedAt is the soft-delete tombstone the executor writes together with
 	// state=deleted; a row carrying it reads as absent.
 	deletedAt *time.Time
+	// deletingLeft counts the reads the vm still stays in state deleting.
+	deletingLeft int
 }
 
 // fakeFault is one injected failure.
@@ -178,6 +185,9 @@ type idemRecord struct {
 // fakePublicIP is one public IP row.
 type fakePublicIP struct {
 	wirePublicIpOut
+
+	// releasingLeft counts the list reads that still show the row releasing.
+	releasingLeft int
 }
 
 // allVmActions is VmOut.allowed_actions for a VM in an ordinary region.
@@ -209,6 +219,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		publicIPs:      make(map[string]*fakePublicIP),
 		pubIPNextOctet: 10,
 		publicIPQuota:  1,
+		deleteSteps:    1,
 		callSeq:        make(map[string][]string),
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
@@ -336,6 +347,40 @@ func (f *fakeAPI) takeFault(r *http.Request) *fakeFault {
 		}
 	}
 	return nil
+}
+
+// Protect switches deletion protection on or off for vm id (VmOut.protected).
+// While it is on a delete is 409 vm_protected, and allowed_actions drops delete.
+func (f *fakeAPI) Protect(id string, on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok {
+		return
+	}
+	vm.Protected = on
+	vm.AllowedActions = nil
+	for _, action := range allVmActions {
+		if !(on && action == "delete") {
+			vm.AllowedActions = append(vm.AllowedActions, action)
+		}
+	}
+}
+
+// SetDeleteSteps makes a delete stay in state "deleting" for n reads before
+// the vm is gone (the default is one), so a test can act while it runs.
+func (f *fakeAPI) SetDeleteSteps(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.deleteSteps = n
+}
+
+// SetReleaseSteps makes a release keep its row, in state "releasing", for n
+// list reads before it disappears (the default is zero: the first list drops it).
+func (f *fakeAPI) SetReleaseSteps(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseSteps = n
 }
 
 // Vanish removes vm id from the store entirely, so the next GetVm returns a
@@ -958,11 +1003,14 @@ func (f *fakeAPI) getVm(rc *reqCtx, id string) {
 func (f *fakeAPI) advance(vm *fakeVm) {
 	switch {
 	case vm.State == "deleting":
-		vm.State = "deleted"
-		now := time.Now().UTC()
-		vm.deletedAt = &now
-		vm.inFlight = false
-		vm.ErrorClass, vm.ErrorDetail = nil, nil
+		vm.deletingLeft--
+		if vm.deletingLeft <= 0 {
+			vm.State = "deleted"
+			now := time.Now().UTC()
+			vm.deletedAt = &now
+			vm.inFlight = false
+			vm.ErrorClass, vm.ErrorDetail = nil, nil
+		}
 	case vm.DesiredState == "deleted":
 		vm.State = "deleting"
 	case vm.State == "pending":
@@ -1005,6 +1053,13 @@ func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	defer f.mu.Unlock()
 
 	vm, ok := f.vms[id]
+	// _refuse_while_protected comes first and only looks at a live vm; an
+	// unknown or gone one falls through to the 404 below.
+	if ok && vm.deletedAt == nil && vm.Protected {
+		rc.conflict("vm_protected", fmt.Sprintf("this VM is protected against deletion; an owner of this "+
+			"organization has to switch that off first, with PUT /v1/orgs/%s/compute/vms/%s/protection", f.org, id))
+		return
+	}
 	if !ok || vm.deletedAt != nil {
 		rc.notFound("vm")
 		return
@@ -1015,6 +1070,7 @@ func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	}
 
 	vm.DesiredState = "deleted"
+	vm.deletingLeft = f.deleteSteps
 	vm.inFlight = true
 	vm.UpdatedAt = time.Now().UTC()
 
@@ -1067,7 +1123,7 @@ func (f *fakeAPI) createPublicIp(rc *reqCtx) {
 	id := fakeUUID(2, f.pubIPCreateCount)
 	now := time.Now().UTC()
 
-	ip := &fakePublicIP{wirePublicIpOut{
+	ip := &fakePublicIP{wirePublicIpOut: wirePublicIpOut{
 		ID:        id,
 		RegionID:  regionID,
 		State:     "pending",
@@ -1096,7 +1152,12 @@ func (f *fakeAPI) listPublicIps(rc *reqCtx) {
 	for _, id := range ids {
 		ip := f.publicIPs[id]
 		if ip.State == "releasing" {
-			delete(f.publicIPs, id)
+			if ip.releasingLeft <= 0 {
+				delete(f.publicIPs, id)
+				continue
+			}
+			ip.releasingLeft--
+			items = append(items, ip.wirePublicIpOut)
 			continue
 		}
 		f.advancePublicIp(ip)
@@ -1234,6 +1295,7 @@ func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 	}
 
 	ip.State = "releasing"
+	ip.releasingLeft = f.releaseSteps
 	f.callSeq[id] = append(f.callSeq[id], "release")
 
 	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.release", id))
@@ -2183,5 +2245,65 @@ func TestFakeAPI_FaultInjection(t *testing.T) {
 	if resp, err := fresh.Do(req); err == nil {
 		resp.Body.Close()
 		t.Error("a dropped connection must surface as a transport error")
+	}
+}
+
+// TestFakeAPI_ProtectedVmRefusesDelete pins compute.py _refuse_while_protected:
+// while protected, a delete is 409 vm_protected whoever asks, and nothing is
+// written (so no operation is left in flight).
+func TestFakeAPI_ProtectedVmRefusesDelete(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+
+	f.Protect(id, true)
+	_, vm := getVmVia(t, f, "good-key", id)
+	if vm["protected"] != true {
+		t.Errorf("protected = %v, want true", vm["protected"])
+	}
+	status, p := deleteVmVia(t, f, "good-key", id)
+	wantProblem(t, "delete of a protected vm", status, p, 409, "vm_protected",
+		"this VM is protected against deletion; an owner of this organization has to switch that off first, with PUT /v1/orgs/"+testOrgID+"/compute/vms/"+id+"/protection")
+
+	f.Protect(id, false)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Errorf("delete after unprotecting: status = %d, want 202 (a refused delete must leave nothing in flight)", status)
+	}
+}
+
+// TestFakeAPI_PacingKnobsKeepDeletesVisible: SetDeleteSteps and SetReleaseSteps
+// only slow the state machines down; they exist so acceptance tests can act
+// while a delete or release is running.
+func TestFakeAPI_PacingKnobsKeepDeletesVisible(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	f.SetDeleteSteps(3)
+	f.SetReleaseSteps(3)
+
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
+		t.Fatalf("delete: status = %d", status)
+	}
+	for i := 0; i < 3; i++ {
+		if status, vm := getVmVia(t, f, "good-key", id); status != http.StatusOK || vm["state"] != "deleting" {
+			t.Fatalf("read %d of a slow delete: %d %v, want 200 deleting", i+1, status, vm["state"])
+		}
+	}
+	if status, _ := getVmVia(t, f, "good-key", id); status != http.StatusNotFound {
+		t.Errorf("after the slow delete: status = %d, want 404", status)
+	}
+
+	ip := allocateIPVia(t, f, "gro")
+	settleIP(t, f, ip, "allocated")
+	if st, _ := ipAction(t, f, ip, "", ""); st != http.StatusAccepted {
+		t.Fatalf("release: status = %d", st)
+	}
+	for i := 0; i < 3; i++ {
+		if got := ipStateVia(t, f, ip); got != "releasing" {
+			t.Fatalf("list %d of a slow release: state %q, want releasing", i+1, got)
+		}
+	}
+	if got := ipStateVia(t, f, ip); got != "absent" {
+		t.Errorf("after the slow release: %q, want absent", got)
 	}
 }
