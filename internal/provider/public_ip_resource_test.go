@@ -7,6 +7,7 @@ package provider
 
 import (
 	"fmt"
+	"net/http"
 	"regexp"
 	"testing"
 
@@ -301,6 +302,49 @@ func TestAccImagesDataSource(t *testing.T) {
 					resource.TestCheckResourceAttr("data.virtscale_images.test", "images.0.os_version", "12"),
 					resource.TestCheckResourceAttr("data.virtscale_images.test", "images.1.name", "Ubuntu 22.04"),
 				),
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_DestroyWhileAReleaseIsAlreadyRunning covers M3 for
+// public IPs: releasing an address that is already being released is 409
+// public_ip_not_releasable ("this public IP is releasing"). The release is
+// underway, so destroy waits for the address to go instead of failing.
+func TestAccPublicIpResource_DestroyWhileAReleaseIsAlreadyRunning(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetReleaseSteps(4)
+	config := testAccProviderBlock(fake) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: func(s *terraform.State) error {
+					rs, ok := s.RootModule().Resources["virtscale_public_ip.test"]
+					if !ok {
+						return fmt.Errorf("virtscale_public_ip.test not found in state")
+					}
+					id = rs.Primary.ID
+					return nil
+				},
+			},
+			{
+				PreConfig: func() {
+					if status, _ := ipAction(t, fake, id, "", ""); status != http.StatusAccepted {
+						t.Errorf("out-of-band release: status = %d, want 202", status)
+					}
+				},
+				Config:  config,
+				Destroy: true,
 			},
 		},
 	})

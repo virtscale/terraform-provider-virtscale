@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"sort"
 	"time"
@@ -387,8 +388,10 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Delete requests deletion (a 404 counts as already gone) and waits for the
-// vm to report state deleted or disappear entirely.
+// Delete requests deletion and waits for the vm to report state deleted or
+// disappear entirely. A 404 counts as already gone, and so does a 409 that
+// turns out to mean the vm is already being deleted (see
+// removalAlreadyUnderway).
 func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state instanceResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -397,7 +400,7 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	}
 
 	_, _, err := r.client.DeleteVm(ctx, state.ID.ValueString())
-	if err != nil && !client.IsNotFound(err) {
+	if err != nil && !client.IsNotFound(err) && !r.removalAlreadyUnderway(ctx, state.ID.ValueString(), err) {
 		resp.Diagnostics.AddError("Unable to Delete Instance", apiErrorDetail(err))
 		return
 	}
@@ -414,6 +417,29 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Wait for Instance Deletion", err.Error())
 	}
+}
+
+// removalAlreadyUnderway reports whether err, from a DELETE, only says that the
+// vm is already on its way out. The API allows one operation per vm, so a
+// second DELETE while the first runs is 409 operation_in_flight -- what an
+// interrupted destroy meets on its next run, and what a DELETE retried after a
+// lost response meets. Other 409s are real refusals (vm_protected,
+// vm_action_not_allowed, an operation that is not a delete), so the vm is read
+// back before the 409 is believed: it is underway only when it is gone, or the
+// delete is recorded (desired_state deleted) or running (deleting).
+func (r *InstanceResource) removalAlreadyUnderway(ctx context.Context, id string, err error) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusConflict {
+		return false
+	}
+	vm, getErr := r.client.GetVm(ctx, id)
+	if client.IsNotFound(getErr) {
+		return true
+	}
+	if getErr != nil {
+		return false
+	}
+	return vm.DesiredState == "deleted" || vm.State == "deleting" || vm.State == "deleted"
 }
 
 // ImportState imports by id, passthrough.

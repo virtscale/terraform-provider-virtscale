@@ -17,6 +17,7 @@ package provider
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"regexp"
@@ -453,6 +454,81 @@ func TestAccInstanceResource_NameAtTheLimitIsAccepted(t *testing.T) {
 			{
 				Config: testAccInstanceConfig(fake, name, 1),
 				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "name", name),
+			},
+		},
+	})
+}
+
+// vmIDFromState captures the id of virtscale_instance.test into *dst.
+func vmIDFromState(dst *string) resource.TestCheckFunc {
+	return func(s *terraform.State) error {
+		rs, ok := s.RootModule().Resources["virtscale_instance.test"]
+		if !ok {
+			return fmt.Errorf("virtscale_instance.test not found in state")
+		}
+		*dst = rs.Primary.ID
+		return nil
+	}
+}
+
+// TestAccInstanceResource_DestroyWhileADeleteIsAlreadyRunning covers M3. A
+// second DELETE while the first is still being carried out is 409
+// operation_in_flight (uq_operations_one_in_flight): what an interrupted
+// destroy, or a retried DELETE whose first answer was lost, runs into. The
+// vm is on its way out, so destroy has to wait for it, not fail.
+func TestAccInstanceResource_DestroyWhileADeleteIsAlreadyRunning(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetDeleteSteps(4)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "delete-twice", 1),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				PreConfig: func() {
+					if status, _ := deleteVmVia(t, fake, fake.apiKey, id); status != http.StatusAccepted {
+						t.Errorf("out-of-band delete: status = %d, want 202", status)
+					}
+				},
+				Config:  testAccInstanceConfig(fake, "delete-twice", 1),
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ReplacingAProtectedVmKeepsTheRefusal: not every 409
+// on a delete means "already going". A protected vm answers 409 vm_protected
+// and is not being deleted; that refusal has to reach the user unchanged, and
+// the replace has to go through once protection is lifted.
+func TestAccInstanceResource_ReplacingAProtectedVmKeepsTheRefusal(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "protected-vm", 1),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				PreConfig:   func() { fake.Protect(id, true) },
+				Config:      testAccInstanceConfig(fake, "protected-vm", 2),
+				ExpectError: regexp.MustCompile(`vm_protected`),
+			},
+			{
+				PreConfig: func() { fake.Protect(id, false) },
+				Config:    testAccInstanceConfig(fake, "protected-vm", 2),
+				Check:     resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "2"),
 			},
 		},
 	})
