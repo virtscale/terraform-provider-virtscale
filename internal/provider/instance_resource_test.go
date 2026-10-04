@@ -633,3 +633,53 @@ func TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI(t *testing.T) {
 		t.Errorf("the API refused the request, yet %d vm(s) were created", fake.CreateCount())
 	}
 }
+
+// TestAccInstanceResource_SurvivesThrottlingAndLostResponses runs a whole
+// create and destroy through the failures the client retries: two 429s, a
+// create whose 202 is lost after the API processed it (the retry reuses the
+// Idempotency-Key and gets the stored answer, so exactly one VM exists), a 503
+// on a poll, and a DELETE whose answer is lost (the retry meets 409
+// operation_in_flight, which destroy takes as "already going"). Every Retry-After
+// is 0 so the test does not wait.
+func TestAccInstanceResource_SurvivesThrottlingAndLostResponses(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					fake.FailNext(2, matchAny, respondThrottle("0"))
+					fake.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGatewayRetryAfter(502, "0"))
+					fake.FailNext(1, matchMethod(http.MethodGet), respondUnavailable("0"))
+				},
+				Config: testAccInstanceConfig(fake, "flaky-net", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+					func(*terraform.State) error {
+						if n := fake.CreateCount(); n != 1 {
+							return fmt.Errorf("the retried create built %d vms, want exactly 1", n)
+						}
+						keys := fake.IdempotencyKeys()
+						if len(keys) != 2 || keys[0] == "" || keys[0] != keys[1] {
+							return fmt.Errorf("Idempotency-Keys of the create attempts that reached the API = %v, want the same key twice", keys)
+						}
+						if n := fake.FaultsServed(); n != 4 {
+							return fmt.Errorf("faults served = %d, want 4 (2 throttles, 1 lost create, 1 poll)", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(1, matchMethod(http.MethodDelete), respondGatewayRetryAfter(504, "0"))
+				},
+				Config:  testAccInstanceConfig(fake, "flaky-net", 1),
+				Destroy: true,
+			},
+		},
+	})
+}

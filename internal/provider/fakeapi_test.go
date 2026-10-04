@@ -2255,6 +2255,25 @@ func respondGateway(status int) func(*reqCtx) {
 	}
 }
 
+// respondGatewayRetryAfter is respondGateway with a Retry-After, which some
+// proxies add; tests use "0" so a retry does not wait.
+func respondGatewayRetryAfter(status int, retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		respondGateway(status)(rc)
+	}
+}
+
+// respondUnavailable is the deployed 503 for an unreachable dependency, which
+// carries a Retry-After.
+func respondUnavailable(retryAfter string) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Retry-After", retryAfter)
+		rc.problem(http.StatusServiceUnavailable, "dependency_unavailable", "Service unavailable",
+			"a dependency this request needs is temporarily unreachable; this is not a problem with the request -- retry it shortly")
+	}
+}
+
 // respondDrop closes the connection without a response: a transport error.
 func respondDrop(rc *reqCtx) {
 	if hj, ok := rc.w.(http.Hijacker); ok {

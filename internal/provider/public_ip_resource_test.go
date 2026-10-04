@@ -353,3 +353,60 @@ resource "virtscale_public_ip" "test" {
 		},
 	})
 }
+
+// TestAccPublicIpResource_SurvivesALostReleaseResponse: the release (a DELETE,
+// safe to repeat) is processed but its answer is lost; the retry meets 409
+// public_ip_not_releasable because the address is already going, which destroy
+// takes as underway. The disassociate before it (an unkeyed POST) is not retried
+// and does not need to be.
+func TestAccPublicIpResource_SurvivesALostReleaseResponse(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetReleaseSteps(2)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckPublicIpDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccPublicIpInstanceAndIpConfig(fake, true),
+				Check:  resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "associated"),
+			},
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(1, matchMethod(http.MethodDelete), respondGatewayRetryAfter(504, "0"))
+				},
+				Config:  testAccPublicIpInstanceAndIpConfig(fake, true),
+				Destroy: true,
+			},
+		},
+	})
+}
+
+// TestAccPublicIpResource_AnUnkeyedAllocateIsNeverRepeated is the other side:
+// allocating an address has no Idempotency-Key, so when the API processed it
+// but the answer was lost, repeating it would take a second address. The client
+// does not; the error reaches the user, and exactly one address exists.
+func TestAccPublicIpResource_AnUnkeyedAllocateIsNeverRepeated(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetPublicIPQuota(5)
+	fake.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGateway(502))
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccProviderBlock(fake) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`,
+				ExpectError: regexp.MustCompile(`Unable to Allocate Public IP`),
+			},
+		},
+	})
+	if n := fake.PublicIPCount(); n != 1 {
+		t.Errorf("addresses after one lost allocate answer = %d, want exactly 1: a repeated allocate would have taken a second", n)
+	}
+}
