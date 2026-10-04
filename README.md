@@ -268,7 +268,8 @@ tests (`terraform-plugin-testing`) against an in-process fake of the customer AP
 (s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
 own types, so a wrong field name or status in the client fails a test instead of being mirrored back. Its SSH-key
 routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
-parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made:
+parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Run
+everything with:
 
 ```bash
 TF_ACC=1 \
