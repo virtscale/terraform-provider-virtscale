@@ -14,6 +14,7 @@ import (
 	"math/rand/v2"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -192,7 +193,62 @@ func (e *APIError) Error() string {
 	if e.Attempts > 1 {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
+	if hint := e.hint(); hint != "" {
+		msg += "; " + hint
+	}
 	return msg
+}
+
+// permissionNameRE finds the permission a 403 permission_denied names: "this
+// credential does not carry the '<permission>' permission" (customer_api/deps.py).
+var permissionNameRE = regexp.MustCompile(`'([A-Za-z0-9_.]+)' permission`)
+
+// hint says what to change for the failures a user can fix themselves: the
+// API's own message stays in front of it, this only adds the next step.
+func (e *APIError) hint() string {
+	switch {
+	case e.Status == http.StatusUnauthorized:
+		// One answer for a wrong, revoked or expired key: the API does not say which.
+		return "check VIRTSCALE_API_KEY: the key may be wrong, revoked or expired"
+	case e.Status == http.StatusForbidden && e.Code == "permission_denied":
+		return scopeHint(e.Detail)
+	case e.Status == http.StatusForbidden && e.Code == "source_address_not_allowed":
+		return "the key's network limits do not include this address; " +
+			"run Terraform from an allowed address or widen the key's network limits"
+	case isOrganizationNotVisible(e):
+		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
+			"or VIRTSCALE_API_KEY belongs to another organization"
+	}
+	return ""
+}
+
+// scopeHint maps the permission a 403 names to the key scope that grants it
+// (permissions.py SCOPE_PERMISSIONS): compute.* and operation.* come with
+// compute:write, edge.* and network.* with network:write, and the read halves
+// (permissions ending .read or .list) with the :read scope as well. Any other
+// family, or a detail it cannot read, only sends the user to the key's scopes.
+func scopeHint(detail string) string {
+	const generic = "check the scopes of the API key (VIRTSCALE_API_KEY)"
+
+	m := permissionNameRE.FindStringSubmatch(detail)
+	if m == nil {
+		return generic
+	}
+	permission := m[1]
+
+	var family string
+	switch {
+	case strings.HasPrefix(permission, "compute."), strings.HasPrefix(permission, "operation."):
+		family = "compute"
+	case strings.HasPrefix(permission, "edge."), strings.HasPrefix(permission, "network."):
+		family = "network"
+	default:
+		return generic
+	}
+	if strings.HasSuffix(permission, ".read") || strings.HasSuffix(permission, ".list") {
+		return fmt.Sprintf("the API key needs the '%s:read' or '%s:write' scope", family, family)
+	}
+	return fmt.Sprintf("the API key needs the '%s:write' scope", family)
 }
 
 // organizationNotVisiblePrefix starts the detail of the 404 the API gives for

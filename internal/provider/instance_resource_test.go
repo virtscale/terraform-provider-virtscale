@@ -48,6 +48,16 @@ func testAccProtoV6ProviderFactories() map[string]func() (tfprotov6.ProviderServ
 	}
 }
 
+// wrapSafe matches phrase however tofu wraps its diagnostic: any run of spaces
+// in phrase matches any whitespace, newlines included.
+func wrapSafe(phrase string) *regexp.Regexp {
+	words := strings.Fields(phrase)
+	for i, w := range words {
+		words[i] = regexp.QuoteMeta(w)
+	}
+	return regexp.MustCompile(strings.Join(words, `\s+`))
+}
+
 func testAccPreCheck(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("tofu"); err != nil {
@@ -254,7 +264,12 @@ resource "virtscale_instance" "test" {
 		Steps: []resource.TestStep{
 			{
 				Config:      badConfig,
-				ExpectError: regexp.MustCompile(`the presented API token is not valid`),
+				ExpectError: wrapSafe("the presented API token is not valid"),
+			},
+			{
+				// ...and says where to look: the key may be wrong, revoked or expired.
+				Config:      badConfig,
+				ExpectError: wrapSafe("check VIRTSCALE_API_KEY: the key may be wrong, revoked or expired"),
 			},
 		},
 	})
@@ -384,7 +399,8 @@ func TestAccInstanceResource_WrongOrganizationKeepsTheResourceInState(t *testing
 			{
 				Config:      testAccProviderBlockWith(fake, fake.apiKey, testOtherOrg) + testAccInstanceBlock("org-guard"),
 				PlanOnly:    true,
-				ExpectError: regexp.MustCompile(`no organization matching that identifier`),
+				// The API's own words, then where to look.
+				ExpectError: regexp.MustCompile(`(?s)no\s+organization\s+matching.*check\s+VIRTSCALE_ORGANIZATION`),
 			},
 			{
 				Config:   testAccInstanceConfig(fake, "org-guard", 1),
@@ -679,6 +695,117 @@ func TestAccInstanceResource_SurvivesThrottlingAndLostResponses(t *testing.T) {
 				},
 				Config:  testAccInstanceConfig(fake, "flaky-net", 1),
 				Destroy: true,
+			},
+		},
+	})
+}
+
+// --- diagnostics as the user sees them -------------------------------------
+
+// testAccStackConfig is an instance, a public IP associated to it and the
+// images catalogue, configured with the given API key: everything the provider
+// can read or write.
+func testAccStackConfig(fake *fakeAPI, key string) string {
+	return testAccProviderBlockWith(fake, key, fake.org) + `
+data "virtscale_images" "gro" {
+  region = "gro"
+}
+
+resource "virtscale_instance" "test" {
+  name            = "scoped"
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = 1
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+}
+
+resource "virtscale_public_ip" "test" {
+  region      = "gro"
+  instance_id = virtscale_instance.test.id
+}
+`
+}
+
+// TestAccStack_KeyScopesMatchWhatTheREADMESays pins the README's "API key
+// scopes" section against the deployed permission table (permissions.py,
+// transcribed into the fake). The default test key holds exactly compute:write
+// and network:write, and applies the whole stack. Plan-only use, which only
+// reads, works with the two read halves. Without network:read the refresh of a
+// public IP fails, and the message says which scope to add.
+func TestAccStack_KeyScopesMatchWhatTheREADMESays(t *testing.T) {
+	fake := newFakeAPI(t, "write-key", testOrgID)
+	fake.AddKey("read-halves", "compute:read", "network:read")
+	fake.AddKey("compute-read", "compute:read")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccStackConfig(fake, "write-key"),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+					resource.TestCheckResourceAttr("virtscale_public_ip.test", "state", "associated"),
+					resource.TestCheckResourceAttr("data.virtscale_images.gro", "images.#", "2"),
+				),
+			},
+			{
+				// refresh + plan with the read halves: no change, no error.
+				Config:   testAccStackConfig(fake, "read-halves"),
+				PlanOnly: true,
+			},
+			{
+				Config:      testAccStackConfig(fake, "compute-read"),
+				PlanOnly:    true,
+				ExpectError: wrapSafe("the API key needs the 'network:read' or 'network:write' scope"),
+			},
+			{
+				// back to the key that can destroy what step 1 built
+				Config:   testAccStackConfig(fake, "write-key"),
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+func TestAccInstanceResource_ReadOnlyKeyIsToldWhichScopeItLacks(t *testing.T) {
+	fake := newFakeAPI(t, "write-key", testOrgID)
+	fake.AddKey("read-halves", "compute:read", "network:read")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccProviderBlockWith(fake, "read-halves", fake.org) + testAccInstanceBlock("read-only"),
+				ExpectError: wrapSafe("this credential does not carry the 'compute.instance.create' permission"),
+			},
+			{
+				Config:      testAccProviderBlockWith(fake, "read-halves", fake.org) + testAccInstanceBlock("read-only"),
+				ExpectError: wrapSafe("the API key needs the 'compute:write' scope"),
+			},
+		},
+	})
+	if fake.CreateCount() != 0 {
+		t.Errorf("the API refused the request, yet %d vm(s) were created", fake.CreateCount())
+	}
+}
+
+func TestAccInstanceResource_SourceAddressNotAllowedSaysTheKeyIsRestricted(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.DenySourceAddress()
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccInstanceConfig(fake, "restricted", 1),
+				ExpectError: wrapSafe("the key's network limits do not include this address"),
 			},
 		},
 	})

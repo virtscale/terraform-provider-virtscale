@@ -410,3 +410,29 @@ resource "virtscale_public_ip" "test" {
 		t.Errorf("addresses after one lost allocate answer = %d, want exactly 1: a repeated allocate would have taken a second", n)
 	}
 }
+
+// TestAccPublicIpResource_KeyWithoutNetworkWriteIsToldSo: public IPs are edge.*
+// permissions, so compute:write alone cannot allocate one, and the message
+// names the scope that can.
+func TestAccPublicIpResource_KeyWithoutNetworkWriteIsToldSo(t *testing.T) {
+	fake := newFakeAPI(t, "write-key", testOrgID)
+	fake.AddKey("compute-only", "compute:write")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccProviderBlockWith(fake, "compute-only", fake.org) + `
+resource "virtscale_public_ip" "test" {
+  region = "gro"
+}
+`,
+				ExpectError: wrapSafe("the API key needs the 'network:write' scope"),
+			},
+		},
+	})
+	if fake.PublicIPCount() != 0 {
+		t.Errorf("the API refused the request, yet %d public ip(s) exist", fake.PublicIPCount())
+	}
+}

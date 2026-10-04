@@ -888,3 +888,124 @@ func TestRetry_OtherStatusesAreNotRetried(t *testing.T) {
 		})
 	}
 }
+
+// --- diagnostics: say what to change, keep what the API said ---------------
+
+// failWith serves one problem+json answer with the given detail.
+func failWith(t *testing.T, status int, code, detail string) *Client {
+	t.Helper()
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/problem+json")
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/` + code + `","title":"x","status":` + itoa(status) + `,"detail":"` + detail + `","instance":"/","code":"` + code + `","request_id":"req-7"}`))
+	})
+	return c
+}
+
+// permission_denied names the permission it wants (permissions.py); the
+// diagnostic adds the key scope that grants it: compute.* and operation.* come
+// with compute:write (compute:read for the reads), edge.* and network.* with
+// network:write (network:read for the reads).
+func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
+	const compute, network = "compute", "network"
+	cases := []struct {
+		permission, family string
+		read               bool
+	}{
+		{"compute.instance.create", compute, false},
+		{"compute.instance.delete", compute, false},
+		{"compute.instance.update", compute, false},
+		{"compute.instance.read", compute, true},
+		{"compute.instance.list", compute, true},
+		{"operation.read", compute, true},
+		{"operation.cancel", compute, false},
+		{"edge.public_ip.allocate", network, false},
+		{"edge.public_ip.release", network, false},
+		{"edge.public_ip.read", network, true},
+		{"network.firewall.update", network, false},
+		{"network.read", network, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.permission, func(t *testing.T) {
+			detail := "this credential does not carry the '" + tc.permission + "' permission"
+			c := failWith(t, 403, "permission_denied", detail)
+
+			_, err := c.GetVm(context.Background(), "vm-1")
+			want := "virtscale API 403 permission_denied: " + detail + " (request req-7); the API key needs the '" + tc.family + ":write' scope"
+			if tc.read {
+				want = "virtscale API 403 permission_denied: " + detail + " (request req-7); the API key needs the '" + tc.family + ":read' or '" + tc.family + ":write' scope"
+			}
+			if err == nil || err.Error() != want {
+				t.Errorf("Error() = %v\nwant        %q", err, want)
+			}
+		})
+	}
+}
+
+func TestAPIError_PermissionDeniedForAnotherFamilyOnlySendsYouToTheScopes(t *testing.T) {
+	for _, perm := range []string{"iam.token.read", "storage.bucket.create", "billing.update"} {
+		detail := "this credential does not carry the '" + perm + "' permission"
+		c := failWith(t, 403, "permission_denied", detail)
+
+		_, err := c.GetVm(context.Background(), "vm-1")
+		want := "virtscale API 403 permission_denied: " + detail + " (request req-7); check the scopes of the API key (VIRTSCALE_API_KEY)"
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: Error() = %v\nwant %q", perm, err, want)
+		}
+	}
+}
+
+func TestAPIError_UnauthorizedAsksYouToCheckTheKey(t *testing.T) {
+	c := failWith(t, 401, "unauthorized", "the presented API token is not valid")
+
+	_, err := c.GetVm(context.Background(), "vm-1")
+	want := "virtscale API 401 unauthorized: the presented API token is not valid (request req-7); " +
+		"check VIRTSCALE_API_KEY: the key may be wrong, revoked or expired"
+	if err == nil || err.Error() != want {
+		t.Errorf("Error() = %v\nwant        %q", err, want)
+	}
+}
+
+func TestAPIError_SourceAddressNotAllowedSaysTheKeyIsRestricted(t *testing.T) {
+	c := failWith(t, 403, "source_address_not_allowed", "this API token cannot be used from this network address")
+
+	_, err := c.GetVm(context.Background(), "vm-1")
+	want := "virtscale API 403 source_address_not_allowed: this API token cannot be used from this network address (request req-7); " +
+		"the key's network limits do not include this address; run Terraform from an allowed address or widen the key's network limits"
+	if err == nil || err.Error() != want {
+		t.Errorf("Error() = %v\nwant        %q", err, want)
+	}
+}
+
+func TestAPIError_UnseenOrganizationPointsAtTheOrganizationSetting(t *testing.T) {
+	c := failWith(t, 404, "not_found", "no organization matching that identifier is visible to this organization")
+
+	_, err := c.GetVm(context.Background(), "vm-1")
+	want := "virtscale API 404 not_found: no organization matching that identifier is visible to this organization (request req-7); " +
+		"check VIRTSCALE_ORGANIZATION: the organization id may be wrong, or VIRTSCALE_API_KEY belongs to another organization"
+	if err == nil || err.Error() != want {
+		t.Errorf("Error() = %v\nwant        %q", err, want)
+	}
+}
+
+// Everything else says what the API said and nothing more.
+func TestAPIError_OtherErrorsGetNoHint(t *testing.T) {
+	cases := []struct {
+		status       int
+		code, detail string
+	}{
+		{404, "not_found", "no vm matching that identifier is visible to this organization"},
+		{403, "forbidden", "this API token does not carry the 'write' scope"},
+		{409, "name_taken", "a VM named 'web-01' already exists in gro"},
+		{422, "quota_exceeded", "public IPs: 1 in use plus 1 requested exceeds the limit of 1 for this account"},
+	}
+	for _, tc := range cases {
+		c := failWith(t, tc.status, tc.code, tc.detail)
+
+		_, err := c.GetVm(context.Background(), "vm-1")
+		want := "virtscale API " + itoa(tc.status) + " " + tc.code + ": " + tc.detail + " (request req-7)"
+		if err == nil || err.Error() != want {
+			t.Errorf("%d %s: Error() = %v\nwant %q", tc.status, tc.code, err, want)
+		}
+	}
+}
