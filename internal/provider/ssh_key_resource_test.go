@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -22,8 +23,10 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/knownvalue"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/hashicorp/terraform-plugin-testing/tfjsonpath"
 )
 
 // Public keys that OpenSSH (ssh-keygen 10.0p2) made for these tests, and the
@@ -209,7 +212,17 @@ func TestAccSshKeyResource_TheSameKeyInAnotherFormIsAnUpdateWithoutAnAPICall(t *
 			PreConfig: func() { before = len(fake.Calls()) },
 			Config:    testAccSshKeyConfig(fake, "laptop", text),
 			ConfigPlanChecks: resource.ConfigPlanChecks{
-				PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction(sshKeyAddr, plancheck.ResourceActionUpdate)},
+				PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction(sshKeyAddr, plancheck.ResourceActionUpdate),
+					// The attributes the API owns stay known through a text-only update
+					// (UseStateForUnknown): without it the plan would show them as "known
+					// after apply" and anything reading them, such as the example's
+					// fingerprint output, would show a change.
+					plancheck.ExpectKnownValue(sshKeyAddr, tfjsonpath.New("fingerprint"), knownvalue.StringExact(testKeyECDSA256Fingerprint)),
+					plancheck.ExpectKnownValue(sshKeyAddr, tfjsonpath.New("key_type"), knownvalue.StringExact("ecdsa-sha2-nistp256")),
+					plancheck.ExpectKnownValue(sshKeyAddr, tfjsonpath.New("id"), knownvalue.StringRegexp(regexp.MustCompile(`.+`))),
+					plancheck.ExpectKnownValue(sshKeyAddr, tfjsonpath.New("created_at"), knownvalue.StringRegexp(regexp.MustCompile(`.+`))),
+				},
 			},
 			Check: resource.ComposeAggregateTestCheckFunc(
 				resource.TestCheckResourceAttr(sshKeyAddr, "public_key", text),

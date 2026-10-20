@@ -226,7 +226,7 @@ surrounding whitespace and CRLF line endings do not matter; and two spellings of
 its last character) are one key. A plan that only changes the text of the same key is an in-place update that stores
 your text and makes no API call. That is what you see right after `tofu import`, where the state holds the API's
 canonical form and your configuration holds the file with its comment. It never replaces the key. A different key
-does: destroy, then import. A text that does not parse (a bad key) is compared exactly, so it still reaches the API,
+does: the old key is destroyed and the new one is created (the API's import, not `tofu import`). A text that does not parse (a bad key) is compared exactly, so it still reaches the API,
 which refuses it with `422 invalid_public_key`.
 
 **Keys are a launch-time snapshot.** Deleting or replacing a key does not change instances that were created with

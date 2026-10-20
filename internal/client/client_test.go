@@ -1313,7 +1313,7 @@ func TestAPIError_RawBodyNeverCarriesTheAPIKey(t *testing.T) {
 		{"the key twice", "text/plain", key + " and again " + key, 500},
 		{"the key split by the truncation", "text/plain", strings.Repeat("x", 195) + key, 500},
 		{"a JSON error that quotes it", "application/problem+json",
-			`{"type":"t","title":"bad ` + key + `","status":400,"detail":"Authorization: Bearer ` + key + `","code":"invalid_request","request_id":"req-1","errors":[{"field":"` + key + `","message":"nope ` + key + `"}]}`, 400},
+			`{"type":"t","title":"bad ` + key + `","status":400,"detail":"Authorization: Bearer ` + key + `","code":"invalid_` + key + `","request_id":"req-` + key + `","errors":[{"field":"` + key + `","message":"nope ` + key + `"}]}`, 400},
 	}
 	for _, tc := range cases {
 		for _, call := range []struct {
@@ -1349,7 +1349,8 @@ func TestAPIError_RawBodyNeverCarriesTheAPIKey(t *testing.T) {
 				if !errors.As(err, &apiErr) || apiErr.Status != tc.status {
 					t.Errorf("err = %v, want the *APIError with status %d", err, tc.status)
 				}
-				if apiErr != nil && (strings.Contains(apiErr.Detail, key) || strings.Contains(apiErr.Title, key)) {
+				if apiErr != nil && (strings.Contains(apiErr.Detail, key) || strings.Contains(apiErr.Title, key) ||
+					strings.Contains(apiErr.Code, key) || strings.Contains(apiErr.RequestID, key)) {
 					t.Errorf("the key is in the APIError fields: %+v", apiErr)
 				}
 			})
