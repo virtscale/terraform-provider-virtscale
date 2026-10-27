@@ -591,7 +591,7 @@ type VmCreateRequest struct {
 // ImageRef is the embedded image summary on a Vm.
 type ImageRef struct {
 	ImageID string `json:"image_id"`
-	Name     string `json:"name"`
+	Name    string `json:"name"`
 }
 
 // Vm is the VmOut representation returned by the compute/vms endpoints.

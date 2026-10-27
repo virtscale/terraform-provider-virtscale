@@ -77,7 +77,7 @@ type fakeAPI struct {
 
 type wireImageRef struct {
 	ImageID string `json:"image_id"`
-	Name     string `json:"name"`
+	Name    string `json:"name"`
 }
 
 type wireVmOut struct {
