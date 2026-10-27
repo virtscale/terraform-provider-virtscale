@@ -76,7 +76,7 @@ type fakeAPI struct {
 // --- wire types (customer-v1.json) ---------------------------------------
 
 type wireImageRef struct {
-	GlanceID string `json:"glance_id"`
+	ImageID string `json:"image_id"`
 	Name     string `json:"name"`
 }
 
@@ -938,12 +938,12 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 	now := time.Now().UTC()
 
 	// An "alias-" prefixed image id simulates a catalogue id (ImageOut.id)
-	// that diverges from the glance_id the API echoes back on the created vm
-	// (VmOut.image.glance_id) -- see Finding 1. Every other image id echoes
+	// that diverges from the image_id the API echoes back on the created vm
+	// (VmOut.image.image_id) -- see Finding 1. Every other image id echoes
 	// back unchanged, matching prior behavior.
-	glanceID := req.Image
+	imageID := req.Image
 	if strings.HasPrefix(req.Image, "alias-") {
-		glanceID = req.Image + "-glance-uuid"
+		imageID = req.Image + "-image-uuid"
 	}
 
 	vm := &fakeVm{
@@ -952,7 +952,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			OrgID:            f.org,
 			RegionID:         req.Region,
 			Name:             name,
-			Image:            wireImageRef{GlanceID: glanceID, Name: req.Image},
+			Image:            wireImageRef{ImageID: imageID, Name: req.Image},
 			VCPUs:            req.VCPUs,
 			MemoryMB:         req.MemoryMB,
 			DiskGB:           req.DiskGB,
@@ -1695,7 +1695,7 @@ func TestFakeAPI_ResponseShapesMatchSpec(t *testing.T) {
 	op := created["operation"].(map[string]any)
 	wantKeys(t, "VmOut", vm, specVmOutKeys)
 	wantKeys(t, "OperationRef", op, specOperationRefKeys)
-	wantKeys(t, "ImageRef", vm["image"].(map[string]any), []string{"glance_id", "name"})
+	wantKeys(t, "ImageRef", vm["image"].(map[string]any), []string{"image_id", "name"})
 	if id, _ := vm["id"].(string); !uuidRE.MatchString(id) {
 		t.Errorf("vm id %q is not a UUID", vm["id"])
 	}

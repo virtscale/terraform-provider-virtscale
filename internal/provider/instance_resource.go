@@ -369,12 +369,12 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 	// image is a create-time input (plan D4): Read never overwrites it once
 	// there is a prior value to preserve. The one exception is import, where
 	// state.Image starts empty -- this seeds it once from the observed
-	// glance_id so ImportStateVerify has something to compare against.
+	// image_id so ImportStateVerify has something to compare against.
 	// There is no image-drift detection in v0 (see the image attribute's own
 	// description); what the instance is actually running is reported
 	// separately via image_name, which applyVmToModel always refreshes.
 	if state.Image.IsNull() || state.Image.ValueString() == "" {
-		state.Image = types.StringValue(vm.Image.GlanceID)
+		state.Image = types.StringValue(vm.Image.ImageID)
 	}
 
 	applyVmToModel(&state, vm)

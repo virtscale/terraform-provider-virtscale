@@ -590,7 +590,7 @@ type VmCreateRequest struct {
 
 // ImageRef is the embedded image summary on a Vm.
 type ImageRef struct {
-	GlanceID string `json:"glance_id"`
+	ImageID string `json:"image_id"`
 	Name     string `json:"name"`
 }
 

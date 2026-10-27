@@ -62,7 +62,7 @@ func TestRequest_AuthAndUserAgentHeaders(t *testing.T) {
 		gotUA = r.Header.Get("User-Agent")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
 	}, WithUserAgentVersion("0.1.0"))
 
 	_, err := c.GetVm(context.Background(), "vm-1")
@@ -90,7 +90,7 @@ func TestCreateVm_SendsIdempotencyKeyAndParsesResponse(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"vm":{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"operation":{"id":"op-1","type":"vm.create","state":"running","resource_type":"vm","resource_id":"vm-1","attempt":1,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}}`))
+		_, _ = w.Write([]byte(`{"vm":{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"operation":{"id":"op-1","type":"vm.create","state":"running","resource_type":"vm","resource_id":"vm-1","attempt":1,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}}`))
 	})
 
 	req := VmCreateRequest{
@@ -128,7 +128,7 @@ func TestCreateVm_NoIdempotencyKeyWhenEmpty(t *testing.T) {
 			sawHeader = true
 		}
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"vm":{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"operation":{"id":"op-1","type":"vm.create","state":"running","resource_type":"vm","resource_id":"vm-1","attempt":1,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}}`))
+		_, _ = w.Write([]byte(`{"vm":{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},"operation":{"id":"op-1","type":"vm.create","state":"running","resource_type":"vm","resource_id":"vm-1","attempt":1,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}}`))
 	})
 	if _, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, ""); err != nil {
 		t.Fatalf("CreateVm() error = %v", err)
@@ -247,7 +247,7 @@ func TestWaitVm_ReturnsWhenDoneAfterNPolls(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"` + state + `","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"` + state + `","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -271,7 +271,7 @@ func TestWaitVm_DeadlineReturnsErrorWithLastState(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
+		_, _ = w.Write([]byte(`{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"pending","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
@@ -404,7 +404,7 @@ func TestGetPublicIp_AbsentUsesTheAPIsNotFoundCode(t *testing.T) {
 // --- retries (the AWS SDK's standard mode, adapted to this API) ------------
 
 const (
-	testVmJSON        = `{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"glance_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`
+	testVmJSON        = `{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`
 	testOperationJSON = `{"id":"op-1","type":"vm.create","state":"pending","resource_type":"vm","resource_id":"vm-1","attempt":0,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}`
 	testIPJSON        = `{"id":"ip-1","region_id":"gro","address":null,"vm_id":null,"state":"pending","error":null,"created_at":"2026-01-01T00:00:00Z"}`
 )
