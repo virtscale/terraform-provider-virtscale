@@ -12,6 +12,10 @@ variables:
 test:
   stage: test
   image: golang:1.25-bookworm
+  # An API pipeline started with PROVIDER_STAGING_LIVE=1 runs only provider-staging-live (below); every other
+  # pipeline runs this job as before.
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "api" || $PROVIDER_STAGING_LIVE != "1"
   cache:
     key:
       files:
@@ -32,7 +36,50 @@ test:
     - unzip -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$(go env GOPATH)/bin"
     - chmod +x "$(go env GOPATH)/bin/tofu"
   script:
+    - sh ci/check-provider-staging-live.sh   # the live job's hardening lines must stay (it carries the staging API key)
     - test -z "$(gofmt -l $(git ls-files '*.go'))"   # tracked files only: the restored GOMODCACHE lives under .cache/
     - go vet ./...
     - go build ./...
     - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v
+
+# Live acceptance of virtscale_ssh_key against the staging customer API (PROV-001 criterion 6). Started by an
+# orchestrator through the GitLab API on main, never by a push, a schedule or a merge request:
+#
+#   POST /api/v4/projects/225/pipeline  {"ref":"main","variables":[{"key":"PROVIDER_STAGING_LIVE","value":"1"}]}
+#
+# How the key reaches the test without anyone seeing it: the job asks GitLab for an id_token (audience
+# openbao.virtscale.nl), logs in to OpenBao with JWT role `provider-staging-live` (terraform-openbao: this project,
+# protected main, API pipelines only; it reads kv/platform/s3-staging/test-keys and nothing else), keeps stg-org-a's
+# key in shell variables, hands it to the one `go test` process and revokes the OpenBao token. ci/provider-staging-live.sh
+# has the steps; the key is never exported, written to disk or printed, and the log is withheld if it contains it.
+# The staging API is reached on its in-cluster name, which the s3-staging NetworkPolicy admits from CI job pods only
+# (the gitlab-runner namespace). The OpenBao CA is a committed public certificate (ci/bao-ca.pem).
+#
+# Hardening (a pipeline variable can reach the job's environment): the script re-executes itself under `env -i` with an
+# allowlist of variables and takes everything else from literals in the file, so nothing a trigger sets (proxy, Go,
+# curl, loader, Terraform, apt, PATH, shell startup) reaches it. There is no before_script (it would run before that
+# allowlist), no cache (the Go module cache is built fresh and verified, never shared with unprivileged branch jobs)
+# and no inherited global variables. The project setting "minimum role to use pipeline variables" is Maintainer.
+# ci/check-provider-staging-live.sh (run by `test`) keeps these lines in place.
+provider-staging-live:
+  stage: test
+  image: golang:1.25-bookworm
+  needs: []
+  interruptible: false
+  timeout: 30m
+  resource_group: provider-staging-live
+  inherit:
+    variables: false
+  id_tokens:
+    BAO_ID_TOKEN:
+      aud: openbao.virtscale.nl
+  script:
+    - /bin/sh ci/provider-staging-live.sh
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - provider-staging-live.log
+    # The log exists only after the secret scan in the script passed.
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "api" && $PROVIDER_STAGING_LIVE == "1" && $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
