@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
@@ -76,6 +77,71 @@ func (vmNameValidator) ValidateString(_ context.Context, req validator.StringReq
 				"starting and ending with a letter or digit. The API lower-cases names and strips a trailing "+
 				"\".virtscale.nl\", so any other form would come back different from the configuration.", name),
 		)
+	}
+}
+
+// maxSSHKeys is how many keys the API gives one instance.
+const maxSSHKeys = 10
+
+// sshKeyCountValidator refuses, at plan time, more than 10 names in ssh_keys,
+// with the API's own sentence (422 too_many_ssh_keys), before anything is sent.
+type sshKeyCountValidator struct{}
+
+func (sshKeyCountValidator) Description(context.Context) string {
+	return fmt.Sprintf("at most %d SSH keys", maxSSHKeys)
+}
+
+func (v sshKeyCountValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (sshKeyCountValidator) ValidateList(_ context.Context, req validator.ListRequest, resp *validator.ListResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if len(req.ConfigValue.Elements()) > maxSSHKeys {
+		resp.Diagnostics.AddAttributeError(
+			req.Path,
+			"Too many SSH keys",
+			fmt.Sprintf("a VM can be given at most %d SSH keys", maxSSHKeys),
+		)
+	}
+}
+
+// sshKeyUniqueValidator refuses, at plan time, a name that is listed twice in
+// ssh_keys, with the API's own sentence (422 duplicate_ssh_key). A name that is
+// not known yet cannot be compared.
+type sshKeyUniqueValidator struct{}
+
+func (sshKeyUniqueValidator) Description(context.Context) string {
+	return "no SSH key name listed more than once"
+}
+
+func (v sshKeyUniqueValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (sshKeyUniqueValidator) ValidateList(_ context.Context, req validator.ListRequest, resp *validator.ListResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	seen := map[string]bool{}
+	reported := map[string]bool{}
+	for _, element := range req.ConfigValue.Elements() {
+		name, ok := element.(types.String)
+		if !ok || name.IsNull() || name.IsUnknown() {
+			continue
+		}
+		n := name.ValueString()
+		if seen[n] && !reported[n] {
+			reported[n] = true
+			resp.Diagnostics.AddAttributeError(
+				req.Path,
+				"Duplicate SSH key",
+				fmt.Sprintf("SSH key '%s' is listed more than once", n),
+			)
+		}
+		seen[n] = true
 	}
 }
 
@@ -200,11 +266,17 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"ssh_keys": schema.ListAttribute{
 				ElementType: types.StringType,
 				Optional:    true,
-				Description: "Names of Nova keypairs to give the instance; no key material is stored here. " +
-					"At most one name: the API refuses more with 422 too_many_ssh_keys. The keypair must " +
-					"already exist in the organization's cloud project. Customer projects have none and no " +
-					"API route creates one yet, so leave this unset: an unknown name makes the instance " +
-					"fail to build (state error).",
+				Description: "Names of SSH keys imported into the organization (see virtscale_ssh_key), at " +
+					"most 10, each listed once; no key material is stored here. cloud-init installs them for " +
+					"the image's default user (for example debian or ubuntu) at first boot, and the instance " +
+					"keeps them if a key is deleted or replaced later. The API refuses a name that was never " +
+					"imported with 422 ssh_key_not_found, and a 503 not_ready means SSH keys are not switched " +
+					"on for this API yet. Changing the list replaces the instance. Importing an instance reads " +
+					"its key names back from the API.",
+				Validators: []validator.List{
+					sshKeyCountValidator{},
+					sshKeyUniqueValidator{},
+				},
 				PlanModifiers: []planmodifier.List{
 					listplanmodifier.RequiresReplace(),
 				},
@@ -342,8 +414,8 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Read refreshes state from the API. A 404 or state "deleted" removes the
-// resource from state.
+// Read refreshes state from the API. The 404 that says the vm is gone, or state
+// "deleted", removes the resource from state; any other 404 is an error.
 func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state instanceResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -353,7 +425,7 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 
 	vm, err := r.client.GetVm(ctx, state.ID.ValueString())
 	if err != nil {
-		if client.IsNotFound(err) {
+		if client.IsNotFound(err, client.ResourceVm) {
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -378,7 +450,63 @@ func (r *InstanceResource) Read(ctx context.Context, req resource.ReadRequest, r
 	}
 
 	applyVmToModel(&state, vm)
+
+	// ssh_keys follows ssh_key_names, so that an imported instance has its keys
+	// and does not plan a replacement for them (M14).
+	sshKeys, diags := sshKeysFromAPI(ctx, state.SSHKeys, vm.SSHKeyNames)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	state.SSHKeys = sshKeys
+
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+}
+
+// sshKeysFromAPI is ssh_keys as Read stores it, given what the state holds and
+// the names the API reports (VmOut.ssh_key_names, a launch-time snapshot).
+//
+//   - No names: null, so a configuration that does not mention keys has nothing
+//     to change. A configured empty list stays an empty list.
+//   - The names the state already holds, in whatever order the API gives them:
+//     the state's list, so a deployment that sorts them does not make every plan
+//     replace the instance.
+//   - Anything else (an import, or a list that differs): what the API reports.
+func sshKeysFromAPI(ctx context.Context, current types.List, names []string) (types.List, diag.Diagnostics) {
+	if len(names) == 0 {
+		if !current.IsNull() && !current.IsUnknown() && len(current.Elements()) == 0 {
+			return current, nil
+		}
+		return types.ListNull(types.StringType), nil
+	}
+
+	if !current.IsNull() && !current.IsUnknown() {
+		var held []string
+		if diags := current.ElementsAs(ctx, &held, false); !diags.HasError() && sameNames(held, names) {
+			return current, nil
+		}
+	}
+	return types.ListValueFrom(ctx, types.StringType, names)
+}
+
+// sameNames reports whether a and b hold the same names, in any order.
+func sameNames(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	counts := map[string]int{}
+	for _, n := range a {
+		counts[n]++
+	}
+	for _, n := range b {
+		counts[n]--
+	}
+	for _, c := range counts {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Update is never reached for a config change: every settable attribute
@@ -394,9 +522,9 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 }
 
 // Delete requests deletion and waits for the vm to report state deleted or
-// disappear entirely. A 404 counts as already gone, and so does a 409 that
-// turns out to mean the vm is already being deleted (see
-// removalAlreadyUnderway).
+// disappear entirely. The 404 that says the vm is gone counts as done, and so
+// does a 409 that turns out to mean the vm is already being deleted (see
+// removalAlreadyUnderway). A 404 about anything else is an error.
 func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state instanceResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -405,7 +533,7 @@ func (r *InstanceResource) Delete(ctx context.Context, req resource.DeleteReques
 	}
 
 	_, _, err := r.client.DeleteVm(ctx, state.ID.ValueString())
-	if err != nil && !client.IsNotFound(err) && !r.removalAlreadyUnderway(ctx, state.ID.ValueString(), err) {
+	if err != nil && !client.IsNotFound(err, client.ResourceVm) && !r.removalAlreadyUnderway(ctx, state.ID.ValueString(), err) {
 		resp.Diagnostics.AddError("Unable to Delete Instance", apiErrorDetail(err))
 		return
 	}
@@ -438,7 +566,7 @@ func (r *InstanceResource) removalAlreadyUnderway(ctx context.Context, id string
 		return false
 	}
 	vm, getErr := r.client.GetVm(ctx, id)
-	if client.IsNotFound(getErr) {
+	if client.IsNotFound(getErr, client.ResourceVm) {
 		return true
 	}
 	if getErr != nil {

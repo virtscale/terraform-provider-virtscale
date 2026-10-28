@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	stdlog "log"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -193,23 +195,105 @@ func TestAPIError_NonJSONBody(t *testing.T) {
 	}
 }
 
-func TestIsNotFound(t *testing.T) {
-	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/problem+json")
-		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"type":"about:blank","title":"Not Found","status":404,"code":"vm_not_found","detail":"no such vm","request_id":"req-1"}`))
-	})
+// helperSentence is the sentence of the API's not_found helper (errors.py
+// not_found(resource)): the detail of every resource 404. It is spelled out
+// here, apart from the client's own, so that a wrong sentence in the client
+// fails a test instead of being mirrored.
+func helperSentence(resource string) string {
+	return "no " + resource + " matching that identifier is visible to this organization"
+}
 
-	_, err := c.GetVm(context.Background(), "missing")
-	if err == nil {
-		t.Fatal("GetVm() error = nil, want error")
-	}
-	if !IsNotFound(err) {
-		t.Errorf("IsNotFound(%v) = false, want true", err)
-	}
+// A 404 says "this resource is gone" only when its code is not_found and its
+// detail is the helper's sentence for the resource the call asked about (V4
+// L4). Everything else is an error that must reach the user: a mistyped
+// endpoint answers not_found with the detail "Not Found", a proxy answers with
+// a page, and the helper also words organization, compute service and region.
+func TestIsNotFound_OnlyTheResourcesOwnSentenceCounts(t *testing.T) {
+	notFound := func(code, detail string) error { return &APIError{Status: 404, Code: code, Detail: detail} }
+	resources := []string{ResourceVm, ResourcePublicIp, ResourceSshKey}
 
-	if IsNotFound(errors.New("some other error")) {
-		t.Error("IsNotFound(plain error) = true, want false")
+	for _, resource := range resources {
+		for _, other := range resources {
+			err := notFound("not_found", helperSentence(other))
+			if got, want := IsNotFound(err, resource), resource == other; got != want {
+				t.Errorf("IsNotFound(the %s sentence, %s) = %v, want %v", other, resource, got, want)
+			}
+		}
+		for name, err := range map[string]error{
+			"an unknown route":                     notFound("not_found", "Not Found"),
+			"the organization":                     notFound("not_found", helperSentence("organization")),
+			"the compute service":                  notFound("not_found", helperSentence("compute service")),
+			"a region":                             notFound("not_found", helperSentence("region")),
+			"another kind of resource":             notFound("not_found", helperSentence("operation")),
+			"the right sentence, another code":     notFound("vm_not_found", helperSentence(resource)),
+			"the right sentence, no code":          notFound("", helperSentence(resource)),
+			"the right sentence with more after":   notFound("not_found", helperSentence(resource)+" (id x)"),
+			"a proxy's page":                       &APIError{Status: 404, Detail: "<html><body>Not Found</body></html>"},
+			"the right sentence on another status": &APIError{Status: 409, Code: "not_found", Detail: helperSentence(resource)},
+			"a plain error":                        errors.New("no " + resource + " matching that identifier is visible to this organization"),
+			"nil":                                  nil,
+		} {
+			if IsNotFound(err, resource) {
+				t.Errorf("IsNotFound(%s, %s) = true, want false", name, resource)
+			}
+		}
+		if wrapped := fmt.Errorf("waiting: %w", notFound("not_found", helperSentence(resource))); !IsNotFound(wrapped, resource) {
+			t.Errorf("IsNotFound(a wrapped %s 404) = false, want true", resource)
+		}
+	}
+}
+
+// The same rule through the client: what a handler answers for a read of one
+// resource, and whether the call reports "gone".
+func TestIsNotFound_ThroughTheClient(t *testing.T) {
+	problem := func(code, title, detail string) (int, string) {
+		return 404, `{"type":"https://docs.virtscale.nl/s3/problems/` + code + `","title":"` + title + `","status":404,"detail":"` + detail + `","instance":"/","code":"` + code + `","request_id":"req-404"}`
+	}
+	reads := []struct {
+		name, resource string
+		read           func(*Client) error
+	}{
+		{"GetVm", ResourceVm, func(c *Client) error { _, err := c.GetVm(context.Background(), "x"); return err }},
+		{"GetSshKey", ResourceSshKey, func(c *Client) error { _, err := c.GetSshKey(context.Background(), "x"); return err }},
+		{"DeleteVm", ResourceVm, func(c *Client) error { _, _, err := c.DeleteVm(context.Background(), "x"); return err }},
+		{"DeleteSshKey", ResourceSshKey, func(c *Client) error { return c.DeleteSshKey(context.Background(), "x") }},
+		{"ReleasePublicIp", ResourcePublicIp, func(c *Client) error { _, _, err := c.ReleasePublicIp(context.Background(), "x"); return err }},
+	}
+	type answer struct {
+		name, contentType, body string
+		gone                    bool
+	}
+	for _, rd := range reads {
+		_, own := problem("not_found", "Resource not found", helperSentence(rd.resource))
+		_, noRoute := problem("not_found", "Not Found", "Not Found")
+		answers := []answer{
+			{"its own sentence", "application/problem+json", own, true},
+			{"an unknown route", "application/problem+json", noRoute, false},
+			{"a proxy's page", "text/html", "<html><body>Not Found</body></html>", false},
+			{"a bare JSON detail", "application/json", `{"detail":"Not Found"}`, false},
+			{"an empty body", "text/plain", "", false},
+		}
+		for _, other := range []string{"organization", "compute service", "region", "operation"} {
+			_, body := problem("not_found", "Resource not found", helperSentence(other))
+			answers = append(answers, answer{"the sentence for " + other, "application/problem+json", body, false})
+		}
+
+		for _, tc := range answers {
+			t.Run(rd.name+"/"+tc.name, func(t *testing.T) {
+				c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", tc.contentType)
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = w.Write([]byte(tc.body))
+				})
+				err := rd.read(c)
+				if !is404(err) {
+					t.Fatalf("err = %v, want the 404 as an *APIError", err)
+				}
+				if got := IsNotFound(err, rd.resource); got != tc.gone {
+					t.Errorf("IsNotFound(%v, %s) = %v, want %v", err, rd.resource, got, tc.gone)
+				}
+			})
+		}
 	}
 }
 
@@ -224,8 +308,11 @@ func TestGetPublicIp_AbsentIsNotFound(t *testing.T) {
 	if err == nil {
 		t.Fatal("GetPublicIp() error = nil, want not-found error")
 	}
-	if !IsNotFound(err) {
-		t.Errorf("IsNotFound(%v) = false, want true", err)
+	if !IsNotFound(err, ResourcePublicIp) {
+		t.Errorf("IsNotFound(%v, public_ip) = false, want true", err)
+	}
+	if IsNotFound(err, ResourceVm) {
+		t.Errorf("IsNotFound(%v, vm) = true, want false: the absent address is not a vm", err)
 	}
 
 	ip, err := c.GetPublicIp(context.Background(), "ip-1")
@@ -292,7 +379,7 @@ func TestWaitVm_404PassedAsNilVm(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/problem+json")
 		w.WriteHeader(http.StatusNotFound)
-		_, _ = w.Write([]byte(`{"type":"about:blank","title":"Not Found","status":404,"code":"vm_not_found","detail":"gone","request_id":"req-9"}`))
+		_, _ = w.Write([]byte(`{"type":"https://docs.virtscale.nl/s3/problems/not_found","title":"Resource not found","status":404,"code":"not_found","detail":"` + helperSentence("vm") + `","request_id":"req-9"}`))
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -315,6 +402,64 @@ func TestWaitVm_404PassedAsNilVm(t *testing.T) {
 	if !sawNil {
 		t.Error("done() was never called with vm == nil on 404")
 	}
+}
+
+// A wait that polls a vm ends on "gone" only when the 404 is about the vm. A
+// mistyped endpoint (an unknown route) is the caller's error, returned at once:
+// done is never asked, and nothing reports a deletion nobody saw.
+func TestWaitVm_AnUnknownRouteIsNotADeletedVm(t *testing.T) {
+	c, sc, _ := newScriptedClient(t, problemStep(404, "not_found"))
+	// problemStep words the detail "detail of not_found": not the vm sentence.
+
+	asked := 0
+	vm, err := c.WaitVm(context.Background(), "vm-1", time.Millisecond, func(v *Vm) (bool, error) {
+		asked++
+		return v == nil, nil
+	})
+	if vm != nil || err == nil || !is404(err) {
+		t.Fatalf("WaitVm() = %v, %v; want no vm and the 404 as an error", vm, err)
+	}
+	if asked != 0 || sc.count() != 1 {
+		t.Errorf("done asked %d times over %d calls, want 0 and 1: a 404 that is not about the vm ends the wait at once", asked, sc.count())
+	}
+}
+
+func TestWaitPublicIp_AnAbsentAddressIsPassedAsNil(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"items":[],"next_cursor":null}`))
+	})
+
+	var sawNil bool
+	ip, err := c.WaitPublicIp(context.Background(), "ip-1", time.Millisecond, func(p *PublicIp) (bool, error) {
+		sawNil = p == nil
+		return p == nil, nil
+	})
+	if err != nil || ip != nil || !sawNil {
+		t.Errorf("WaitPublicIp() = %v, %v (done saw nil: %v), want no address, no error, and done told it is absent", ip, err, sawNil)
+	}
+}
+
+func TestWaitPublicIp_AnUnknownRouteIsNotAReleasedAddress(t *testing.T) {
+	c, sc, _ := newScriptedClient(t, problemStep(404, "not_found"))
+
+	asked := 0
+	ip, err := c.WaitPublicIp(context.Background(), "ip-1", time.Millisecond, func(p *PublicIp) (bool, error) {
+		asked++
+		return p == nil, nil
+	})
+	if ip != nil || err == nil || !is404(err) {
+		t.Fatalf("WaitPublicIp() = %v, %v; want no address and the 404 as an error", ip, err)
+	}
+	if asked != 0 || sc.count() != 1 {
+		t.Errorf("done asked %d times over %d calls, want 0 and 1", asked, sc.count())
+	}
+}
+
+// is404 reports whether err is an *APIError with status 404, whatever it says.
+func is404(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusNotFound
 }
 
 func TestAPIError_FieldErrorsAreKeptAndShown(t *testing.T) {
@@ -371,8 +516,8 @@ func TestIsNotFound_AnUnseenOrganizationIsNotAMissingResource(t *testing.T) {
 	})
 
 	_, err := c.GetVm(context.Background(), "vm-1")
-	if !IsNotFound(err) || IsOrganizationNotVisible(err) {
-		t.Errorf("missing vm: IsNotFound=%v IsOrganizationNotVisible=%v, want true/false", IsNotFound(err), IsOrganizationNotVisible(err))
+	if !IsNotFound(err, ResourceVm) || IsOrganizationNotVisible(err) {
+		t.Errorf("missing vm: IsNotFound=%v IsOrganizationNotVisible=%v, want true/false", IsNotFound(err, ResourceVm), IsOrganizationNotVisible(err))
 	}
 
 	other, err := New(c.endpoint, "test-key", "other-org")
@@ -380,8 +525,8 @@ func TestIsNotFound_AnUnseenOrganizationIsNotAMissingResource(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err = other.GetVm(context.Background(), "vm-1")
-	if IsNotFound(err) || !IsOrganizationNotVisible(err) {
-		t.Errorf("unseen organization: IsNotFound=%v IsOrganizationNotVisible=%v, want false/true", IsNotFound(err), IsOrganizationNotVisible(err))
+	if IsNotFound(err, ResourceVm) || !IsOrganizationNotVisible(err) {
+		t.Errorf("unseen organization: IsNotFound=%v IsOrganizationNotVisible=%v, want false/true", IsNotFound(err, ResourceVm), IsOrganizationNotVisible(err))
 	}
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) || apiErr.Status != 404 {
@@ -399,6 +544,9 @@ func TestGetPublicIp_AbsentUsesTheAPIsNotFoundCode(t *testing.T) {
 	if !errors.As(err, &apiErr) || apiErr.Status != 404 || apiErr.Code != "not_found" {
 		t.Errorf("err = %+v, want a 404 with the API's own code not_found", apiErr)
 	}
+	if apiErr != nil && apiErr.Detail != helperSentence("public_ip") {
+		t.Errorf("Detail = %q, want the helper's sentence %q", apiErr.Detail, helperSentence("public_ip"))
+	}
 }
 
 // --- retries (the AWS SDK's standard mode, adapted to this API) ------------
@@ -408,6 +556,8 @@ const (
 	testOperationJSON = `{"id":"op-1","type":"vm.create","state":"pending","resource_type":"vm","resource_id":"vm-1","attempt":0,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}`
 	testIPJSON        = `{"id":"ip-1","region_id":"gro","address":null,"vm_id":null,"state":"pending","error":null,"created_at":"2026-01-01T00:00:00Z"}`
 )
+
+const testSshKeyJSON = `{"id":"key-1","name":"laptop","key_type":"ssh-ed25519","fingerprint":"SHA256:abc","public_key":"ssh-ed25519 AAAA","created_at":"2026-01-01T00:00:00Z"}`
 
 var (
 	testVmAcceptedJSON = `{"vm":` + testVmJSON + `,"operation":` + testOperationJSON + `}`
@@ -508,6 +658,9 @@ func dropStep(w http.ResponseWriter, _ *http.Request) {
 
 func itoa(n int) string { return strconv.Itoa(n) }
 
+// noContentStep is the 204 of a delete that has nothing to say.
+func noContentStep(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }
+
 // newScriptedClient returns a client whose waits are recorded, not slept, and
 // which never reuses a connection (so a dropped one is a visible transport
 // error, not a silent net/http resend).
@@ -550,6 +703,12 @@ func testOps() []op {
 			return err
 		}},
 		{"DisassociatePublicIp", http.MethodPost, false, jsonStep(202, testIPAcceptedJSON), func(c *Client) error { _, _, err := c.DisassociatePublicIp(context.Background(), "ip-1"); return err }},
+		{"GetSshKey", http.MethodGet, false, jsonStep(200, testSshKeyJSON), func(c *Client) error { _, err := c.GetSshKey(context.Background(), "key-1"); return err }},
+		{"DeleteSshKey", http.MethodDelete, false, noContentStep, func(c *Client) error { return c.DeleteSshKey(context.Background(), "key-1") }},
+		{"CreateSshKey (keyed)", http.MethodPost, true, jsonStep(201, testSshKeyJSON), func(c *Client) error {
+			_, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, "key-1")
+			return err
+		}},
 	}
 }
 
@@ -1038,4 +1197,357 @@ func TestAPIError_OtherErrorsGetNoHint(t *testing.T) {
 			t.Errorf("%d %s: Error() = %v\nwant %q", tc.status, tc.code, err, want)
 		}
 	}
+}
+
+// --- SSH keys (TF7 plan section 4) ---------------------------------------------
+
+func TestCreateSshKey_SendsTheKeyAndTheIdempotencyKeyAndParsesTheAnswer(t *testing.T) {
+	var gotMethod, gotPath, gotIdemp string
+	var gotBody map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotIdemp = r.Method, r.URL.Path, r.Header.Get("Idempotency-Key")
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Location", "/v1/orgs/test-org/compute/ssh-keys/key-1")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(testSshKeyJSON))
+	})
+
+	key, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA tf@host"}, "idem-9")
+	if err != nil {
+		t.Fatalf("CreateSshKey() error = %v", err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/v1/orgs/test-org/compute/ssh-keys" || gotIdemp != "idem-9" {
+		t.Errorf("request = %s %s with Idempotency-Key %q, want POST /v1/orgs/test-org/compute/ssh-keys with idem-9", gotMethod, gotPath, gotIdemp)
+	}
+	if len(gotBody) != 2 || gotBody["name"] != "laptop" || gotBody["public_key"] != "ssh-ed25519 AAAA tf@host" {
+		t.Errorf("body = %v, want exactly name and public_key", gotBody)
+	}
+	want := SshKey{ID: "key-1", Name: "laptop", KeyType: "ssh-ed25519", Fingerprint: "SHA256:abc", PublicKey: "ssh-ed25519 AAAA",
+		CreatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	if key == nil || *key != want {
+		t.Errorf("key = %+v, want %+v", key, want)
+	}
+}
+
+func TestCreateSshKey_NoIdempotencyKeyWhenEmpty(t *testing.T) {
+	sawHeader := false
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_, sawHeader = r.Header["Idempotency-Key"]
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(testSshKeyJSON))
+	})
+	if _, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, ""); err != nil {
+		t.Fatalf("CreateSshKey() error = %v", err)
+	}
+	if sawHeader {
+		t.Error("Idempotency-Key header sent when idempotencyKey was empty")
+	}
+}
+
+func TestGetAndDeleteSshKey_PathsAndAnswers(t *testing.T) {
+	var gotMethod, gotPath string
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.EscapedPath()
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(testSshKeyJSON))
+	})
+
+	key, err := c.GetSshKey(context.Background(), "key 1/x")
+	if err != nil || key == nil || key.ID != "key-1" || key.Fingerprint != "SHA256:abc" {
+		t.Fatalf("GetSshKey() = %+v, %v", key, err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/v1/orgs/test-org/compute/ssh-keys/key%201%2Fx" {
+		t.Errorf("get sent %s %s, want GET with the id path-escaped", gotMethod, gotPath)
+	}
+	if err := c.DeleteSshKey(context.Background(), "key-1"); err != nil {
+		t.Fatalf("DeleteSshKey() error = %v", err)
+	}
+	if gotMethod != http.MethodDelete || gotPath != "/v1/orgs/test-org/compute/ssh-keys/key-1" {
+		t.Errorf("delete sent %s %s, want DELETE /v1/orgs/test-org/compute/ssh-keys/key-1", gotMethod, gotPath)
+	}
+}
+
+// What the API refuses on an import comes back as the API said it, once: none
+// of these is something repeating the request could change.
+func TestCreateSshKey_RefusalsKeepTheAPIsWordsAndAreNotRetried(t *testing.T) {
+	for _, tc := range []struct {
+		status       int
+		code, detail string
+	}{
+		{422, "invalid_public_key", "upload one public key in OpenSSH format: <type> <base64> [comment]"},
+		{422, "invalid_name", "an SSH key name is 1 to 64 characters"},
+		{409, "name_taken", "an SSH key named 'laptop' already exists in this organization"},
+		{422, "quota_exceeded", "ssh_keys: 20 in use plus 1 requested exceeds the limit of 20 for this account"},
+		{409, "compute_not_enabled", "the organization is not enrolled in the compute service"},
+		{503, "not_ready", "SSH keys are not switched on yet"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			c := failWith(t, tc.status, tc.code, tc.detail)
+			_, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "x"}, "key-1")
+			want := "virtscale API " + itoa(tc.status) + " " + tc.code + ": " + tc.detail + " (request req-7)"
+			if err == nil || err.Error() != want {
+				t.Errorf("Error() = %v\nwant        %q", err, want)
+			}
+		})
+	}
+}
+
+// --- the API key never reaches an error text (V4 I1) ------------------------------
+
+func TestAPIError_RawBodyNeverCarriesTheAPIKey(t *testing.T) {
+	const key = "vsk_unit-test-4f9a7c1e2b8d"
+	cases := []struct {
+		name, contentType, body string
+		status                  int
+	}{
+		{"echoed headers", "text/plain", "debug: Authorization: Bearer " + key, 500},
+		{"a proxy's page", "text/html", "<html><body>upstream said: " + key + "</body></html>", 502},
+		{"the key twice", "text/plain", key + " and again " + key, 500},
+		{"the key split by the truncation", "text/plain", strings.Repeat("x", 195) + key, 500},
+		{"a JSON error that quotes it", "application/problem+json",
+			`{"type":"t","title":"bad ` + key + `","status":400,"detail":"Authorization: Bearer ` + key + `","code":"invalid_` + key + `","request_id":"req-` + key + `","errors":[{"field":"` + key + `","message":"nope ` + key + `"}]}`, 400},
+	}
+	for _, tc := range cases {
+		for _, call := range []struct {
+			name string
+			run  func(c *Client) error
+		}{
+			{"GetVm", func(c *Client) error { _, err := c.GetVm(context.Background(), "vm-1"); return err }},
+			{"keyed CreateVm", keyedCreate},
+		} {
+			t.Run(tc.name+"/"+call.name, func(t *testing.T) {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", tc.contentType)
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.body))
+				}))
+				t.Cleanup(srv.Close)
+				c, err := New(srv.URL, key, "org-1")
+				if err != nil {
+					t.Fatal(err)
+				}
+				c.retry.sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+
+				err = call.run(c)
+				if err == nil {
+					t.Fatal("err = nil, want the API error")
+				}
+				msg := err.Error()
+				// Not even the start of it: a key cut by the truncation would leave one.
+				if strings.Contains(msg, key[:4]) {
+					t.Errorf("the API key (or a piece of it) is in the error: %q", msg)
+				}
+				var apiErr *APIError
+				if !errors.As(err, &apiErr) || apiErr.Status != tc.status {
+					t.Errorf("err = %v, want the *APIError with status %d", err, tc.status)
+				}
+				if apiErr != nil && (strings.Contains(apiErr.Detail, key) || strings.Contains(apiErr.Title, key) ||
+					strings.Contains(apiErr.Code, key) || strings.Contains(apiErr.RequestID, key)) {
+					t.Errorf("the key is in the APIError fields: %+v", apiErr)
+				}
+			})
+		}
+	}
+
+	t.Run("it is replaced, not dropped", func(t *testing.T) {
+		c := func() *Client {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.WriteHeader(500)
+				_, _ = w.Write([]byte("debug: Authorization: Bearer " + key))
+			}))
+			t.Cleanup(srv.Close)
+			c, _ := New(srv.URL, key, "org-1")
+			return c
+		}()
+		_, err := c.GetVm(context.Background(), "vm-1")
+		want := "virtscale API 500 error: debug: Authorization: Bearer [redacted]"
+		if err == nil || err.Error() != want {
+			t.Errorf("Error() = %v\nwant        %q", err, want)
+		}
+	})
+}
+
+// --- giving up on a create that may have been applied (V5 I5) -----------------------
+
+const recoveryHint = "the first request may still have created the resource: " +
+	"if the next apply reports name_taken, find it in the panel or with the API " +
+	"and bring it under management with tofu import"
+
+func keyedSshKeyCreate(c *Client) error {
+	_, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, "key-1")
+	return err
+}
+
+// A create that carries an Idempotency-Key and gives up on an answer that
+// leaves open that the API processed it (a lost answer, a gateway error, a
+// duplicate that is still being processed) says so, and says how to find what
+// it may have made. The API's own detail and request id stay in the message.
+func TestRecoveryHint_AKeyedCreateThatGivesUpMayHaveCreatedTheResource(t *testing.T) {
+	creates := map[string]func(*Client) error{"CreateVm": keyedCreate, "CreateSshKey": keyedSshKeyCreate}
+	failures := []struct {
+		name string
+		step func(http.ResponseWriter, *http.Request)
+		want string // what the message must still say before the hint
+	}{
+		{"502 from a proxy", htmlStep(502), "virtscale API 502 error: <html><body>Bad Gateway</body></html>; gave up after 5 attempts; "},
+		{"504 from a proxy", htmlStep(504), "virtscale API 504 error: <html><body>Gateway Timeout</body></html>; gave up after 5 attempts; "},
+		{"503 dependency_unavailable", problemStep(503, "dependency_unavailable"),
+			"virtscale API 503 dependency_unavailable: detail of dependency_unavailable (request req-dependency_unavailable); gave up after 5 attempts; "},
+		{"409 idempotency_in_progress", problemStep(409, "idempotency_in_progress"),
+			"virtscale API 409 idempotency_in_progress: detail of idempotency_in_progress (request req-idempotency_in_progress); gave up after 5 attempts; "},
+		{"a dropped connection", dropStep, ""},
+	}
+	for createName, create := range creates {
+		for _, f := range failures {
+			t.Run(createName+"/"+f.name, func(t *testing.T) {
+				c, sc, _ := newScriptedClient(t, f.step)
+
+				err := create(c)
+				if err == nil || sc.count() != 5 {
+					t.Fatalf("err = %v, calls = %d, want an error after 5 calls", err, sc.count())
+				}
+				msg := err.Error()
+				if !strings.HasSuffix(msg, recoveryHint) {
+					t.Errorf("the message does not end with the recovery hint:\n%s", msg)
+				}
+				if !strings.Contains(msg, f.want) {
+					t.Errorf("the message lost what the API said:\n got %s\nwant it to contain %q", msg, f.want)
+				}
+				if strings.Count(msg, "gave up after 5 attempts") != 1 {
+					t.Errorf("the message should say once that it gave up after 5 attempts:\n%s", msg)
+				}
+			})
+		}
+	}
+}
+
+// The hint is about the create that was lost, nothing else: a 429 was refused
+// before it ran, not_ready and a refusal were decided, a read or a delete
+// creates nothing, and a bad certificate never reached the API.
+func TestRecoveryHint_OnlyWhenTheCreateMayHaveBeenApplied(t *testing.T) {
+	cases := []struct {
+		name  string
+		run   func(c *Client) error
+		steps []func(http.ResponseWriter, *http.Request)
+	}{
+		{"keyed create, 429 until it gives up", keyedCreate, []func(http.ResponseWriter, *http.Request){problemStep(429, "rate_limited")}},
+		{"keyed create, 503 not_ready", keyedCreate, []func(http.ResponseWriter, *http.Request){problemStep(503, "not_ready")}},
+		{"keyed create, 409 name_taken", keyedCreate, []func(http.ResponseWriter, *http.Request){problemStep(409, "name_taken")}},
+		{"keyed create, 422", keyedCreate, []func(http.ResponseWriter, *http.Request){problemStep(422, "quota_exceeded")}},
+		{"keyed create, plain 500", keyedCreate, []func(http.ResponseWriter, *http.Request){problemStep(500, "internal_error")}},
+		{"keyed ssh key create, 429 until it gives up", keyedSshKeyCreate, []func(http.ResponseWriter, *http.Request){problemStep(429, "rate_limited")}},
+		{"keyed ssh key create, 503 not_ready", keyedSshKeyCreate, []func(http.ResponseWriter, *http.Request){problemStep(503, "not_ready")}},
+		{"a read that gives up", func(c *Client) error { _, err := c.GetVm(context.Background(), "vm-1"); return err }, []func(http.ResponseWriter, *http.Request){htmlStep(502)}},
+		{"a delete that gives up", func(c *Client) error { _, _, err := c.DeleteVm(context.Background(), "vm-1"); return err }, []func(http.ResponseWriter, *http.Request){htmlStep(504)}},
+		{"an ssh key delete that gives up", func(c *Client) error { return c.DeleteSshKey(context.Background(), "key-1") }, []func(http.ResponseWriter, *http.Request){htmlStep(502)}},
+		{"an unkeyed create after a 502 (never retried)", func(c *Client) error { _, _, err := c.AllocatePublicIp(context.Background(), "gro"); return err }, []func(http.ResponseWriter, *http.Request){htmlStep(502)}},
+		{"a read, dropped connections", func(c *Client) error { _, err := c.GetVm(context.Background(), "vm-1"); return err }, []func(http.ResponseWriter, *http.Request){dropStep}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _, _ := newScriptedClient(t, tc.steps...)
+			err := tc.run(c)
+			if err == nil {
+				t.Fatal("err = nil, want an error")
+			}
+			if strings.Contains(err.Error(), "tofu import") || strings.Contains(err.Error(), "may still have created") {
+				t.Errorf("a recovery hint where nothing may have been created:\n%s", err)
+			}
+			if apiErr := (*APIError)(nil); errors.As(err, &apiErr) && apiErr.MayHaveBeenApplied {
+				t.Errorf("MayHaveBeenApplied is set on %v", err)
+			}
+		})
+	}
+
+	t.Run("a certificate that does not verify never reached the API", func(t *testing.T) {
+		srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusCreated) }))
+		srv.Config.ErrorLog = stdlog.New(io.Discard, "", 0)
+		srv.StartTLS()
+		t.Cleanup(srv.Close)
+		c, err := New(srv.URL, "test-key", "org-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.retry.sleep = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+
+		err = keyedCreate(c)
+		if err == nil || strings.Contains(err.Error(), "tofu import") {
+			t.Errorf("err = %v, want the certificate error without a recovery hint", err)
+		}
+	})
+}
+
+// The other ways to stop short: a wait that would run past the deadline, a
+// Retry-After beyond the limit, and Ctrl-C. For a keyed create each leaves the
+// first request possibly applied.
+func TestRecoveryHint_AlsoWhenTheWaitCannotBeAfforded(t *testing.T) {
+	t.Run("the deadline is shorter than the wait", func(t *testing.T) {
+		c, sc, _ := newScriptedClient(t, problemStep(503, "dependency_unavailable", "Retry-After", "30"))
+		c.retry.sleep = sleepContext
+		// 30 seconds of Retry-After against 20 seconds of deadline: no need to be quick.
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+
+		_, err := c.CreateSshKey(ctx, SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, "key-1")
+		if err == nil || sc.count() != 1 || !strings.HasSuffix(err.Error(), recoveryHint) {
+			t.Errorf("err = %v after %d calls, want the 503 with the recovery hint after 1", err, sc.count())
+		}
+	})
+
+	t.Run("the server asks for longer than anyone waits", func(t *testing.T) {
+		c, sc, _ := newScriptedClient(t, problemStep(504, "upstream_timeout", "Retry-After", "3600"))
+
+		err := keyedCreate(c)
+		if err == nil || sc.count() != 1 || !strings.HasSuffix(err.Error(), recoveryHint) {
+			t.Errorf("err = %v after %d calls, want the 504 with the recovery hint after 1", err, sc.count())
+		}
+	})
+
+	t.Run("cancelled while waiting", func(t *testing.T) {
+		c, sc, _ := newScriptedClient(t, problemStep(502, "bad_gateway", "Retry-After", "20"))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// Ctrl-C arrives as the client starts to wait for the retry.
+		c.retry.sleep = func(ctx context.Context, _ time.Duration) error {
+			cancel()
+			return ctx.Err()
+		}
+
+		_, _, err := c.CreateVm(ctx, VmCreateRequest{Name: "web-01"}, "key-1")
+		if err == nil || sc.count() != 1 || !strings.HasSuffix(err.Error(), recoveryHint) {
+			t.Errorf("err = %v after %d calls, want the 502 with the recovery hint after 1", err, sc.count())
+		}
+	})
+
+	t.Run("cancelled while the request is out", func(t *testing.T) {
+		started := make(chan struct{})
+		c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+			// The server only watches for a closed connection once the body has
+			// been read to its end.
+			_, _ = io.Copy(io.Discard, r.Body)
+			close(started)
+			select {
+			case <-r.Context().Done():
+			case <-time.After(10 * time.Second):
+			}
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			<-started
+			cancel()
+		}()
+
+		_, _, err := c.CreateVm(ctx, VmCreateRequest{Name: "web-01"}, "key-1")
+		if err == nil || !strings.HasSuffix(err.Error(), recoveryHint) {
+			t.Errorf("err = %v, want the transport error with the recovery hint: the request was sent", err)
+		}
+	})
 }

@@ -46,9 +46,12 @@ func TestRetry_IdempotencyInProgressIsRetriedOnlyForAKeyedRequest(t *testing.T) 
 	}
 }
 
-// Any other conflict is a decision about the request, keyed or not.
+// Any other conflict is a decision about the request, keyed or not. That
+// includes idempotency_key_reused, the one other conflict the idempotency layer
+// itself makes: the same key with a different body is a client bug, and waiting
+// cannot fix it (V5 L1).
 func TestRetry_OtherConflictsOnAKeyedCreateAreNotRetried(t *testing.T) {
-	for _, code := range []string{"name_taken", "operation_in_flight", "compute_not_enabled"} {
+	for _, code := range []string{"name_taken", "operation_in_flight", "compute_not_enabled", "idempotency_key_reused"} {
 		t.Run(code, func(t *testing.T) {
 			c, sc, _ := newScriptedClient(t, problemStep(409, code), jsonStep(202, testVmAcceptedJSON))
 

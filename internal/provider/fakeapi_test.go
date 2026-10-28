@@ -3,10 +3,13 @@ package provider
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/bits"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -19,14 +22,18 @@ import (
 )
 
 // fakeAPI is an in-process httptest fake of the VirtScale customer API
-// (s3-control-plane 94f5021f), scoped to the compute surface the provider
-// needs: VMs, public IPs and the image catalogue.
+// (s3-control-plane 94f5021f, plus the SSH-key keystore of the TF7 plan §4),
+// scoped to the compute surface the provider needs: VMs, public IPs, SSH keys
+// and the image catalogue.
 //
 // It deliberately does NOT reuse internal/client's types. Its wire structs
 // below are transcribed from the deployed OpenAPI spec, so a wrong JSON tag in
 // the client shows up as a failing test instead of being mirrored on the way
 // out. docs/verification/terraform-provider-virtscale/04-contract-94f5021f.md
-// lists, behaviour by behaviour, what is emulated and from which handler.
+// lists, behaviour by behaviour, what is emulated and from which handler. The
+// keystore routes follow docs/plans/terraform-tf7-ssh-keys.md §4 (the s3cp
+// branch tf7/ssh-keys is not merged yet), and parse and fingerprint keys with
+// code of their own, not the provider's.
 type fakeAPI struct {
 	apiKey string
 	org    string
@@ -71,6 +78,25 @@ type fakeAPI struct {
 	// calls were observed -- used to assert Delete disassociates before it
 	// releases.
 	callSeq map[string][]string
+
+	// The SSH-key keystore (TF7 plan §4). sshKeysOff is
+	// S3CP_COMPUTE_SSH_KEYS_ENABLED=false: importing a key, and creating a VM
+	// with a non-empty ssh_keys, answer 503 not_ready. sshKeyQuota is
+	// QuotaProfile.ssh_keys (20 for customer-default, negative: unlimited).
+	sshKeys         map[string]*wireSshKeyOut
+	sshKeySeq       int
+	sshKeysOff      bool
+	sshKeyQuota     int
+	sshIdemKeysSeen []string
+
+	// inProgressLeft is how many repeats of an already-claimed Idempotency-Key
+	// still answer 409 idempotency_in_progress before the stored replay: the
+	// duplicate lost the insert race while the first request is still inside
+	// its transaction (db/idempotency.py claim()).
+	inProgressLeft int
+
+	// calls records "METHOD route" for every request that reached a route.
+	calls []string
 }
 
 // --- wire types (customer-v1.json) ---------------------------------------
@@ -139,6 +165,17 @@ type wireImageOut struct {
 	OSVersion *string `json:"os_version"`
 	MinDiskGB int     `json:"min_disk_gb"`
 	MinRAMMB  int     `json:"min_ram_mb"`
+}
+
+// wireSshKeyOut is SshKeyOut (TF7 plan §4): the key as the keystore holds it,
+// public_key in canonical form "<type> <base64>" with the comment dropped.
+type wireSshKeyOut struct {
+	ID          string    `json:"id"`
+	Name        string    `json:"name"`
+	KeyType     string    `json:"key_type"`
+	Fingerprint string    `json:"fingerprint"`
+	PublicKey   string    `json:"public_key"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type wireList[T any] struct {
@@ -221,6 +258,8 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		publicIPQuota:  1,
 		deleteSteps:    1,
 		callSeq:        make(map[string][]string),
+		sshKeys:        make(map[string]*wireSshKeyOut),
+		sshKeyQuota:    20,
 	}
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
@@ -349,7 +388,16 @@ func (f *fakeAPI) takeFault(r *http.Request) *fakeFault {
 	return nil
 }
 
-// SSHKeyNames reports the keypair names the API recorded for vm id.
+// ClearFaults forgets every injected failure, served or not.
+func (f *fakeAPI) ClearFaults() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.faults = nil
+}
+
+// SSHKeyNames reports the key names the API recorded for vm id
+// (VmOut.ssh_key_names): a launch-time snapshot, so deleting a key from the
+// keystore later does not change it.
 func (f *fakeAPI) SSHKeyNames(id string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -358,6 +406,141 @@ func (f *fakeAPI) SSHKeyNames(id string) []string {
 		return nil
 	}
 	return append([]string(nil), vm.SSHKeyNames...)
+}
+
+// VmIDByName returns the id of the live vm called name, or "" when there is none.
+func (f *fakeAPI) VmIDByName(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for id, vm := range f.vms {
+		if vm.Name == name && vm.deletedAt == nil {
+			return id
+		}
+	}
+	return ""
+}
+
+// SetSSHKeyNames overwrites VmOut.ssh_key_names of vm id, as a deployment that
+// reports the names in another order would.
+func (f *fakeAPI) SetSSHKeyNames(id string, names ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vm, ok := f.vms[id]; ok {
+		vm.SSHKeyNames = append([]string{}, names...)
+	}
+}
+
+// SetSSHKeysOn switches the keystore on or off (S3CP_COMPUTE_SSH_KEYS_ENABLED).
+// It is on by default; while it is off, importing a key and creating a VM with
+// a non-empty ssh_keys answer 503 not_ready, and reading or deleting keys is
+// still served.
+func (f *fakeAPI) SetSSHKeysOn(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sshKeysOff = !on
+}
+
+// SetSSHKeyQuota sets the per-organization ceiling on keys (negative:
+// unlimited). The default is 20, customer-default's.
+func (f *fakeAPI) SetSSHKeyQuota(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sshKeyQuota = n
+}
+
+// SSHKeyCount reports how many keys the keystore holds.
+func (f *fakeAPI) SSHKeyCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.sshKeys)
+}
+
+// SSHKey returns a copy of key id, and whether the keystore holds it.
+func (f *fakeAPI) SSHKey(id string) (wireSshKeyOut, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	k, ok := f.sshKeys[id]
+	if !ok {
+		return wireSshKeyOut{}, false
+	}
+	return *k, true
+}
+
+// SSHKeyID returns the id of the key called name, or "" when there is none.
+func (f *fakeAPI) SSHKeyID(name string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, k := range f.sshKeys {
+		if k.Name == name {
+			return k.ID
+		}
+	}
+	return ""
+}
+
+// VanishSSHKey removes key id, as a deletion out of band.
+func (f *fakeAPI) VanishSSHKey(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.sshKeys, id)
+}
+
+// SSHKeyIdempotencyKeys lists the Idempotency-Key of every key import that
+// reached the API.
+func (f *fakeAPI) SSHKeyIdempotencyKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.sshIdemKeysSeen...)
+}
+
+// InProgressFor makes the next n repeats of an already-claimed Idempotency-Key
+// (on the VM create or on the key import) answer 409 idempotency_in_progress
+// before the stored replay: the first request is still inside its transaction.
+func (f *fakeAPI) InProgressFor(n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inProgressLeft = n
+}
+
+// Calls lists "METHOD route" of every request that reached a route, in order,
+// whatever its outcome (a request answered by an injected fault before it
+// reached the fake is not listed).
+func (f *fakeAPI) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
+// CallsSince lists the calls recorded after the first n.
+func (f *fakeAPI) CallsSince(n int) []string {
+	calls := f.Calls()
+	if n >= len(calls) {
+		return nil
+	}
+	return calls[n:]
+}
+
+// CallCount counts the recorded calls of route ("POST compute/ssh-keys").
+func (f *fakeAPI) CallCount(route string) int {
+	n := 0
+	for _, c := range f.Calls() {
+		if c == route {
+			n++
+		}
+	}
+	return n
+}
+
+// mutating filters calls down to those that can change something: anything
+// but a GET.
+func mutating(calls []string) []string {
+	var out []string
+	for _, c := range calls {
+		if !strings.HasPrefix(c, "GET ") {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // Protect switches deletion protection on or off for vm id (VmOut.protected).
@@ -401,6 +584,14 @@ func (f *fakeAPI) Vanish(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.vms, id)
+}
+
+// VanishPublicIP removes public ip id from the store, as a release out of band:
+// the list no longer shows it, so the client's GetPublicIp finds it absent.
+func (f *fakeAPI) VanishPublicIP(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.publicIPs, id)
 }
 
 // --- request plumbing ------------------------------------------------------
@@ -469,6 +660,24 @@ func (rc *reqCtx) problem(status int, code, title, detail string, errs ...wireFi
 	_ = json.NewEncoder(rc.w).Encode(body)
 }
 
+// inProgress is db/idempotency.py's 409 idempotency_in_progress. The real API
+// sends no Retry-After with it, so the client backs off with jitter (which has
+// its own client tests); the fake sends 0 so that the acceptance tests, which
+// cannot shorten that backoff, do not sleep.
+func (rc *reqCtx) inProgress() {
+	rc.w.Header().Set("Retry-After", "0")
+	rc.conflict("idempotency_in_progress", detailIdempotencyInProgress)
+}
+
+// noContent writes an empty 204, the success of a delete that has nothing to say.
+func (rc *reqCtx) noContent() {
+	rc.w.Header().Set("X-Request-ID", rc.rid)
+	rc.w.WriteHeader(http.StatusNoContent)
+}
+
+// notFound is errors.py not_found(resource): the one helper every resource 404
+// of the API comes from (vm, public_ip, ssh_key, and also organization,
+// "compute service" and region).
 func (rc *reqCtx) notFound(resource string) {
 	rc.problem(http.StatusNotFound, "not_found", "Resource not found",
 		"no "+resource+" matching that identifier is visible to this organization")
@@ -505,6 +714,10 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key, param, id = "compute/public-ips/{public_ip_id}", "public_ip_id", parts[2]
 	case len(parts) == 4 && parts[0] == "compute" && parts[1] == "public-ips" && (parts[3] == "associate" || parts[3] == "disassociate"):
 		key, param, id = "compute/public-ips/{public_ip_id}/"+parts[3], "public_ip_id", parts[2]
+	case rest == "compute/ssh-keys":
+		key = "compute/ssh-keys"
+	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "ssh-keys":
+		key, param, id = "compute/ssh-keys/{ssh_key_id}", "ssh_key_id", parts[2]
 	default:
 		return "", "", "", false
 	}
@@ -512,7 +725,9 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	case "POST compute/vms", "GET compute/vms/{vm_id}", "DELETE compute/vms/{vm_id}",
 		"GET compute/images",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
-		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate":
+		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
+		"POST compute/ssh-keys", "GET compute/ssh-keys",
+		"GET compute/ssh-keys/{ssh_key_id}", "DELETE compute/ssh-keys/{ssh_key_id}":
 		return method + " " + key, param, id, true
 	}
 	return "", "", "", false
@@ -542,6 +757,12 @@ var routePermissions = map[string]string{
 	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
 	"POST compute/public-ips/{public_ip_id}/associate":    "edge.public_ip.allocate",
 	"POST compute/public-ips/{public_ip_id}/disassociate": "edge.public_ip.release",
+	// The four compute.ssh_key.* permissions of the TF7 plan §3.3 point 3: the
+	// reads sit with compute:read, the mutations with compute:write.
+	"POST compute/ssh-keys":                "compute.ssh_key.create",
+	"GET compute/ssh-keys":                 "compute.ssh_key.list",
+	"GET compute/ssh-keys/{ssh_key_id}":    "compute.ssh_key.read",
+	"DELETE compute/ssh-keys/{ssh_key_id}": "compute.ssh_key.delete",
 }
 
 // scopeGrants is SCOPE_PERMISSIONS (permissions.py): the legacy read and write
@@ -593,6 +814,9 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
 		return
 	}
+	f.mu.Lock()
+	f.calls = append(f.calls, route)
+	f.mu.Unlock()
 
 	// A malformed organization is refused before the credential is looked at
 	// (deps.py current_principal), so it is a 400 whatever the key.
@@ -652,6 +876,14 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.releasePublicIp(rc, id)
 	case "GET compute/images":
 		f.listImages(rc)
+	case "POST compute/ssh-keys":
+		f.importSshKey(rc)
+	case "GET compute/ssh-keys":
+		f.listSshKeys(rc)
+	case "GET compute/ssh-keys/{ssh_key_id}":
+		f.getSshKey(rc, id)
+	case "DELETE compute/ssh-keys/{ssh_key_id}":
+		f.deleteSshKey(rc, id)
 	}
 }
 
@@ -874,8 +1106,10 @@ const (
 )
 
 // createVm follows compute.py create_vm's gate order: body validation, then
-// user_data (before the key is claimed), then the Idempotency-Key claim, then
-// create_vm_request's own checks.
+// user_data (before the key is claimed), then -- TF7 -- the SSH-key flag
+// (a non-empty ssh_keys while the keystore is off is 503 not_ready, also
+// before the key is claimed), then the Idempotency-Key claim, then
+// create_vm_request's own checks, which resolve ssh_keys against the keystore.
 func (f *fakeAPI) createVm(rc *reqCtx) {
 	req, errs := decodeVmCreate(rc.r.Body)
 	if len(errs) > 0 {
@@ -890,6 +1124,11 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if len(req.SSHKeys) > 0 && f.sshKeysOff {
+		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", detailSshKeysOff)
+		return
+	}
+
 	key := rc.r.Header.Get("Idempotency-Key")
 	var digest string
 	if key != "" {
@@ -897,6 +1136,11 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%+v", req)))
 		digest = hex.EncodeToString(sum[:])
 		if rec, ok := f.idem[key]; ok {
+			if f.inProgressLeft > 0 {
+				f.inProgressLeft--
+				rc.inProgress()
+				return
+			}
 			if rec.payloadHash != digest {
 				rc.conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
 				return
@@ -911,8 +1155,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		rc.unprocessable("invalid_name", "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'")
 		return
 	}
-	if len(req.SSHKeys) > 1 {
-		rc.unprocessable("too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use")
+	if !f.resolveSshKeys(rc, req.SSHKeys) {
 		return
 	}
 	if req.WorkloadType != "customer" {
@@ -1367,6 +1610,286 @@ func (f *fakeAPI) releasePublicIp(rc *reqCtx, id string) {
 	f.callSeq[id] = append(f.callSeq[id], "release")
 
 	f.publicIPAccepted(rc, ip, f.newPublicIPOperation("ip.release", id))
+}
+
+// --- SSH keys (docs/plans/terraform-tf7-ssh-keys.md §3.3 and §4) ------------
+
+const (
+	maxSshKeysPerVm = 10
+
+	detailSshKeysOff            = "SSH keys are not switched on yet"
+	detailSshKeyName            = "an SSH key name is 1 to 64 characters from letters, digits, '.', '_', '@' and '-', starting with a letter or digit"
+	detailIdempotencyInProgress = "a request with this Idempotency-Key is still being processed; wait for it to finish and retry"
+)
+
+// sshKeyNameRE is the §4 name rule, case-sensitive.
+var sshKeyNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._@-]{0,63}$`)
+
+// importSshKey is POST /compute/ssh-keys, in the order of §4: the body is
+// validated, then the flag (503 not_ready before the Idempotency-Key is
+// claimed), the claim, the name, the key, the quota, and last the insert, whose
+// unique (org, name) constraint is 409 name_taken. A new key answers 201 with
+// SshKeyOut and a Location header.
+func (f *fakeAPI) importSshKey(rc *reqCtx) {
+	b := newBodyCheck(rc.r.Body)
+	name := b.str("name", true, 1, 64)
+	publicKey := b.str("public_key", true, 1, 8192)
+	if errs := b.finish(); len(errs) > 0 {
+		rc.invalid(errs...)
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.sshKeysOff {
+		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", detailSshKeysOff)
+		return
+	}
+
+	idemKey := ""
+	var digest string
+	if key := rc.r.Header.Get("Idempotency-Key"); key != "" {
+		// The mechanism is the VM create's, one claim per (route, key).
+		idemKey = "ssh-keys|" + key
+		f.sshIdemKeysSeen = append(f.sshIdemKeysSeen, key)
+		sum := sha256.Sum256([]byte(name + "\x00" + publicKey))
+		digest = hex.EncodeToString(sum[:])
+		if rec, ok := f.idem[idemKey]; ok {
+			if f.inProgressLeft > 0 {
+				f.inProgressLeft--
+				rc.inProgress()
+				return
+			}
+			if rec.payloadHash != digest {
+				rc.conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+				return
+			}
+			rc.raw(rec.status, rec.body, "Location", rec.location)
+			return
+		}
+	}
+
+	if !sshKeyNameRE.MatchString(name) {
+		rc.unprocessable("invalid_name", detailSshKeyName)
+		return
+	}
+	keyType, canonical, fingerprint, refusal := fakeParsePublicKey(publicKey)
+	if refusal != "" {
+		rc.unprocessable("invalid_public_key", refusal)
+		return
+	}
+	if f.sshKeyQuota >= 0 && len(f.sshKeys) >= f.sshKeyQuota {
+		rc.unprocessable("quota_exceeded", fmt.Sprintf(
+			"ssh_keys: %d in use plus 1 requested exceeds the limit of %d for this account", len(f.sshKeys), f.sshKeyQuota))
+		return
+	}
+	for _, existing := range f.sshKeys {
+		if existing.Name == name {
+			rc.conflict("name_taken", fmt.Sprintf("an SSH key named '%s' already exists in this organization", name))
+			return
+		}
+	}
+
+	f.sshKeySeq++
+	id := fakeUUID(4, f.sshKeySeq)
+	key := &wireSshKeyOut{
+		ID: id, Name: name, KeyType: keyType, Fingerprint: fingerprint,
+		PublicKey: canonical, CreatedAt: time.Now().UTC(),
+	}
+	f.sshKeys[id] = key
+
+	location := "/v1/orgs/" + f.org + "/compute/ssh-keys/" + id
+	if idemKey != "" {
+		body, _ := json.Marshal(key)
+		f.idem[idemKey] = &idemRecord{
+			payloadHash: digest,
+			status:      http.StatusCreated,
+			body:        append(body, '\n'),
+			location:    location,
+		}
+	}
+	rc.json(http.StatusCreated, key, "Location", location)
+}
+
+// listSshKeys is GET /compute/ssh-keys: ListResponse[SshKeyOut], oldest first.
+func (f *fakeAPI) listSshKeys(rc *reqCtx) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	items := make([]wireSshKeyOut, 0, len(f.sshKeys))
+	for _, k := range f.sshKeys {
+		items = append(items, *k)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
+	rc.json(http.StatusOK, wireList[wireSshKeyOut]{Items: items})
+}
+
+// getSshKey is GET /compute/ssh-keys/{id}: another organization's key, and one
+// that does not exist, read the same, as the ssh_key 404 of the shared helper.
+func (f *fakeAPI) getSshKey(rc *reqCtx, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	key, ok := f.sshKeys[id]
+	if !ok {
+		rc.notFound("ssh_key")
+		return
+	}
+	rc.json(http.StatusOK, key)
+}
+
+// deleteSshKey is DELETE /compute/ssh-keys/{id}: 204, and VMs that were
+// created with the key keep their ssh_key_names (a launch-time snapshot).
+func (f *fakeAPI) deleteSshKey(rc *reqCtx, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.sshKeys[id]; !ok {
+		rc.notFound("ssh_key")
+		return
+	}
+	delete(f.sshKeys, id)
+	rc.noContent()
+}
+
+// resolveSshKeys is the VM create's resolution of ssh_keys against the
+// keystore (§3.3 point 4): at most 10 names, none twice, every one imported.
+// The caller holds f.mu. It answers the refusal itself and reports false.
+func (f *fakeAPI) resolveSshKeys(rc *reqCtx, names []string) bool {
+	if len(names) > maxSshKeysPerVm {
+		rc.unprocessable("too_many_ssh_keys", fmt.Sprintf("a VM can be given at most %d SSH keys", maxSshKeysPerVm))
+		return false
+	}
+	seen := map[string]bool{}
+	for _, n := range names {
+		if seen[n] {
+			rc.unprocessable("duplicate_ssh_key", fmt.Sprintf("SSH key '%s' is listed more than once", n))
+			return false
+		}
+		seen[n] = true
+	}
+	held := map[string]bool{}
+	for _, k := range f.sshKeys {
+		held[k.Name] = true
+	}
+	var missing []string
+	for _, n := range names {
+		if !held[n] {
+			missing = append(missing, "'"+n+"'")
+		}
+	}
+	if len(missing) > 0 {
+		rc.unprocessable("ssh_key_not_found", fmt.Sprintf(
+			"no SSH key named %s in this organization; import it with POST /v1/orgs/%s/compute/ssh-keys",
+			strings.Join(missing, ", "), f.org))
+		return false
+	}
+	return true
+}
+
+// fakeParsePublicKey is what the API does with an imported key: one OpenSSH
+// line "<type> <base64> [comment]", surrounding whitespace and CRLF tolerated.
+// The stored form is "<type> <base64>" with the blob re-encoded, so spare bits
+// in the last base64 character are normalised away, and the fingerprint is
+// "SHA256:" plus the unpadded base64 of the SHA-256 of the blob, as ssh-keygen
+// -lf prints it. refusal is one of the plan's S10 sentences, "" for a key the
+// API takes. It is written from the plan, not from the provider's own parser.
+func fakeParsePublicKey(text string) (keyType, canonical, fingerprint, refusal string) {
+	const (
+		refusePrivate = "this is a private key; upload the public key (the .pub file) instead. Nothing was stored."
+		refuseFormat  = "upload one public key in OpenSSH format: <type> <base64> [comment]"
+		refuseMany    = "upload one key at a time"
+		refuseOptions = "the key may not carry authorized_keys options such as command= or from="
+		refuseType    = "this key type is not supported; use ssh-ed25519, ecdsa-sha2-nistp256, -nistp384, -nistp521 or ssh-rsa of at least 2048 bits"
+		refuseData    = "the key data is not valid for its type"
+	)
+	supported := map[string]bool{
+		"ssh-ed25519": true, "ecdsa-sha2-nistp256": true, "ecdsa-sha2-nistp384": true,
+		"ecdsa-sha2-nistp521": true, "ssh-rsa": true,
+	}
+
+	s := strings.TrimSpace(text)
+	switch {
+	case strings.Contains(s, "PRIVATE KEY"):
+		return "", "", "", refusePrivate
+	case strings.ContainsAny(s, "\r\n"):
+		return "", "", "", refuseMany
+	}
+	fields := strings.Fields(s)
+	if len(fields) < 2 {
+		return "", "", "", refuseFormat
+	}
+	typ := fields[0]
+	if !supported[typ] {
+		for _, later := range fields[1:] {
+			if supported[later] {
+				return "", "", "", refuseOptions
+			}
+		}
+		return "", "", "", refuseType
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil {
+		return "", "", "", refuseData
+	}
+
+	// The blob is SSH wire format: a string naming the type, then what the type
+	// needs.
+	embedded, rest, ok := sshWireString(blob)
+	if !ok || string(embedded) != typ {
+		return "", "", "", refuseData
+	}
+	switch typ {
+	case "ssh-ed25519":
+		if key, rest, ok := sshWireString(rest); !ok || len(key) != 32 || len(rest) != 0 {
+			return "", "", "", refuseData
+		}
+	case "ssh-rsa":
+		e, rest, ok1 := sshWireString(rest)
+		n, rest, ok2 := sshWireString(rest)
+		if !ok1 || !ok2 || len(rest) != 0 || len(e) == 0 || len(n) == 0 {
+			return "", "", "", refuseData
+		}
+		if size := sshMpintBits(n); size < 2048 || size > 16384 {
+			return "", "", "", fmt.Sprintf("RSA keys must be 2048 to 16384 bits; this one has %d", size)
+		}
+	default: // ecdsa-sha2-nistpNNN: the curve name, then the public point
+		curve, rest, ok1 := sshWireString(rest)
+		point, rest, ok2 := sshWireString(rest)
+		if !ok1 || !ok2 || len(rest) != 0 || "ecdsa-sha2-"+string(curve) != typ || len(point) < 2 || point[0] != 4 {
+			return "", "", "", refuseData
+		}
+	}
+
+	sum := sha256.Sum256(blob)
+	return typ, typ + " " + base64.StdEncoding.EncodeToString(blob),
+		"SHA256:" + base64.RawStdEncoding.EncodeToString(sum[:]), ""
+}
+
+// sshWireString reads one SSH wire string (a uint32 length and that many
+// bytes) off the front of b.
+func sshWireString(b []byte) (s, rest []byte, ok bool) {
+	if len(b) < 4 {
+		return nil, nil, false
+	}
+	n := binary.BigEndian.Uint32(b)
+	if uint64(n) > uint64(len(b)-4) {
+		return nil, nil, false
+	}
+	return b[4 : 4+n], b[4+n:], true
+}
+
+// sshMpintBits is the bit length of an SSH mpint (a big-endian number, with a
+// leading zero byte when the top bit would otherwise read as a sign).
+func sshMpintBits(mpint []byte) int {
+	for len(mpint) > 0 && mpint[0] == 0 {
+		mpint = mpint[1:]
+	}
+	if len(mpint) == 0 {
+		return 0
+	}
+	return 8*(len(mpint)-1) + bits.Len8(mpint[0])
 }
 
 // --- Images handler ------------------------------------------------------
@@ -1910,7 +2433,7 @@ func TestFakeAPI_RefusesWhatTheAPIRefuses(t *testing.T) {
 	cases := []struct {
 		name, extra, code, detail string
 	}{
-		{"two ssh keys", `"ssh_keys":["a","b"]`, "too_many_ssh_keys", "an instance can be given one SSH keypair; name the single key to use"},
+		{"an ssh key that was never imported", `"ssh_keys":["a"]`, "ssh_key_not_found", "no SSH key named 'a' in this organization; import it with POST /v1/orgs/" + testOrgID + "/compute/ssh-keys"},
 		{"user_data", `"user_data":"#cloud-config"`, "user_data_unsupported", "user_data is not accepted: the instance is built asynchronously, so cloud-init would have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, so where such a payload may live is still an open design question"},
 		{"empty user_data", `"user_data":""`, "user_data_unsupported", ""},
 		{"infra workload", `"workload_type":"infra"`, "workload_not_allowed", "a customer account cannot request infra workloads"},
@@ -1931,7 +2454,8 @@ func TestFakeAPI_RefusesWhatTheAPIRefuses(t *testing.T) {
 		t.Errorf("refused requests created %d vms", f.CreateCount())
 	}
 
-	// The allowed shapes still work: one keypair name, null user_data, customer workload.
+	// The allowed shapes still work: an imported key's name, null user_data, customer workload.
+	importKeyVia(t, f, "k1", testKeyEd25519)
 	vm := createVmVia(t, f, "good-key", withExtra(`"ssh_keys":["k1"],"user_data":null,"workload_type":"customer"`)).get("vm")
 	if names, _ := vm["ssh_key_names"].([]any); len(names) != 1 || names[0] != "k1" {
 		t.Errorf("ssh_key_names = %v, want [k1]", vm["ssh_key_names"])
@@ -2171,19 +2695,26 @@ func TestFakeAPI_KeyScopesGatePermissions(t *testing.T) {
 	associate := call{http.MethodPost, ips + "/" + testSomeUUID + "/associate", `{"vm_id":"` + testSomeUUID + `"}`, "edge.public_ip.allocate"}
 	disassociate := call{http.MethodPost, ips + "/" + testSomeUUID + "/disassociate", "", "edge.public_ip.release"}
 	release := call{http.MethodDelete, ips + "/" + testSomeUUID, "", "edge.public_ip.release"}
+	keys := sshKeysPath(testOrgID)
+	importKey := call{http.MethodPost, keys, `{"name":"scoped","public_key":"` + testKeyEd25519 + `"}`, "compute.ssh_key.create"}
+	listKeys := call{http.MethodGet, keys, "", "compute.ssh_key.list"}
+	getKey := call{http.MethodGet, keys + "/" + testSomeUUID, "", "compute.ssh_key.read"}
+	delKey := call{http.MethodDelete, keys + "/" + testSomeUUID, "", "compute.ssh_key.delete"}
 
 	cases := []struct {
 		key     string
 		allowed []call
 		refused []call
 	}{
-		{"compute-read", []call{getVm, listImages}, []call{create, delVm, listIPs, allocate, associate, disassociate, release}},
-		{"compute-write", []call{create, getVm, delVm, listImages}, []call{listIPs, allocate, associate, disassociate, release}},
-		{"network-write", []call{listIPs, allocate, associate, disassociate, release}, []call{create, getVm, delVm, listImages}},
-		{"read-halves", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, associate, disassociate, release}},
-		{"legacy-read", []call{getVm, listImages, listIPs}, []call{create, delVm, allocate, release}},
-		{"legacy-write", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
-		{"full-key", []call{create, getVm, delVm, listImages, listIPs, allocate, release}, nil},
+		// The four compute.ssh_key.* permissions ride with the compute scopes: the
+		// reads with compute:read, all four with compute:write, none with network:*.
+		{"compute-read", []call{getVm, listImages, listKeys, getKey}, []call{create, delVm, listIPs, allocate, associate, disassociate, release, importKey, delKey}},
+		{"compute-write", []call{create, getVm, delVm, listImages, importKey, listKeys, getKey, delKey}, []call{listIPs, allocate, associate, disassociate, release}},
+		{"network-write", []call{listIPs, allocate, associate, disassociate, release}, []call{create, getVm, delVm, listImages, importKey, listKeys, getKey, delKey}},
+		{"read-halves", []call{getVm, listImages, listIPs, listKeys, getKey}, []call{create, delVm, allocate, associate, disassociate, release, importKey, delKey}},
+		{"legacy-read", []call{getVm, listImages, listIPs, listKeys, getKey}, []call{create, delVm, allocate, release, importKey, delKey}},
+		{"legacy-write", []call{create, getVm, delVm, listImages, listIPs, allocate, release, importKey, listKeys, getKey, delKey}, nil},
+		{"full-key", []call{create, getVm, delVm, listImages, listIPs, allocate, release, importKey, listKeys, getKey, delKey}, nil},
 	}
 	for _, tc := range cases {
 		for _, c := range tc.refused {
@@ -2280,6 +2811,49 @@ func respondDrop(rc *reqCtx) {
 		if conn, _, err := hj.Hijack(); err == nil {
 			_ = conn.Close()
 		}
+	}
+}
+
+// matchRoute matches a request by method and by a piece of its path.
+func matchRoute(method, pathPiece string) func(*http.Request) bool {
+	return func(r *http.Request) bool {
+		return r.Method == method && strings.Contains(r.URL.Path, pathPiece)
+	}
+}
+
+// respondNoSuchRoute is what an unknown route (a mistyped endpoint) answers:
+// code not_found and the detail "Not Found", with nothing about a resource.
+func respondNoSuchRoute(rc *reqCtx) {
+	rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
+}
+
+// respondNotFoundOf is the shared helper's 404 for a resource the request did
+// not ask about: organization, "compute service", region, or another kind.
+func respondNotFoundOf(resource string) func(*reqCtx) {
+	return func(rc *reqCtx) { rc.notFound(resource) }
+}
+
+// respondEchoingTheKey is an upstream that prints the request's Authorization
+// header into a plain-text error page, as a debug page of a proxy might.
+func respondEchoingTheKey(status int) func(*reqCtx) {
+	return func(rc *reqCtx) {
+		rc.w.Header().Set("Content-Type", "text/plain")
+		rc.w.WriteHeader(status)
+		_, _ = rc.w.Write([]byte("debug: Authorization: " + rc.r.Header.Get("Authorization")))
+	}
+}
+
+// notFoundVariants are the 404s that do not say "this resource is gone": a
+// mistyped endpoint, a proxy's page, and the shared helper's sentence for what
+// the request did not ask about (the compute service, another kind of
+// resource; the organization and a region have their own cases in the client's
+// tests). Reading them as "gone" would empty the state.
+func notFoundVariants() map[string]func(*reqCtx) {
+	return map[string]func(*reqCtx){
+		"an unknown route":         respondNoSuchRoute,
+		"a proxy's html page":      respondGateway(http.StatusNotFound),
+		"the compute service":      respondNotFoundOf("compute service"),
+		"another kind of resource": respondNotFoundOf("operation"),
 	}
 }
 
@@ -2451,5 +3025,353 @@ func TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys(t *testing.T) {
 	}
 	if e := entry("plain-vm"); e["OS-EXT-IPS:type"] != "fixed" || e["version"] != float64(4) {
 		t.Errorf("ordinary entry = %v, want the full Nova shape with type fixed", e)
+	}
+}
+
+// --- the keystore (TF7 plan §4) ----------------------------------------------
+
+// specSshKeyOutKeys is SshKeyOut, from the plan's §4: the contract the s3cp
+// branch tf7/ssh-keys implements.
+var specSshKeyOutKeys = []string{"id", "name", "key_type", "fingerprint", "public_key", "created_at"}
+
+func sshKeysPath(org string) string { return "/v1/orgs/" + org + "/compute/ssh-keys" }
+
+// importKeyVia imports a key as the fake's own key and returns the decoded
+// SshKeyOut, failing the test unless the answer is 201.
+func importKeyVia(t *testing.T, f *fakeAPI, name, publicKey string, extra ...string) map[string]any {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"name": name, "public_key": publicKey})
+	status, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodPost, sshKeysPath(f.org), string(body), extra...)
+	if status != http.StatusCreated {
+		t.Fatalf("import of %q: status = %d, want 201 (%s)", name, status, resp)
+	}
+	return decodeObject(t, resp)
+}
+
+// importKeyRaw imports a key and returns the status and decoded body, whatever
+// the answer.
+func importKeyRaw(t *testing.T, f *fakeAPI, name, publicKey string, extra ...string) (int, map[string]any) {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"name": name, "public_key": publicKey})
+	status, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodPost, sshKeysPath(f.org), string(body), extra...)
+	return status, decodeObject(t, resp)
+}
+
+// vmWithKeys is a valid create body that names the given SSH keys.
+func vmWithKeys(name string, keys ...string) string {
+	if keys == nil {
+		keys = []string{}
+	}
+	quoted, _ := json.Marshal(keys)
+	return `{"name":"` + name + `","image":"image-1","vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool":"pool-1","region":"gro","network_profile":"net-1","ssh_keys":` + string(quoted) + `}`
+}
+
+func TestFakeAPI_SshKeyRoutesMatchThePlan(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	// POST -> 201 SshKeyOut with a Location header; the key comes back canonical.
+	body, _ := json.Marshal(map[string]string{"name": "laptop", "public_key": testKeyEd25519 + " " + testKeyEd25519Comment + "\r\n"})
+	status, hdr, resp := fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(body))
+	if status != http.StatusCreated {
+		t.Fatalf("import: status = %d, want 201 (%s)", status, resp)
+	}
+	key := decodeObject(t, resp)
+	wantKeys(t, "SshKeyOut", key, specSshKeyOutKeys)
+	id, _ := key["id"].(string)
+	if !uuidRE.MatchString(id) {
+		t.Errorf("id %q is not a UUID", key["id"])
+	}
+	if want := sshKeysPath(testOrgID) + "/" + id; hdr.Get("Location") != want {
+		t.Errorf("Location = %q, want %q", hdr.Get("Location"), want)
+	}
+	if key["name"] != "laptop" || key["key_type"] != "ssh-ed25519" ||
+		key["public_key"] != testKeyEd25519 || key["fingerprint"] != testKeyEd25519Fingerprint {
+		t.Errorf("SshKeyOut = %v, want the canonical key (no comment) with its ssh-keygen fingerprint", key)
+	}
+
+	// GET one, GET the list.
+	status, _, resp = fakeHTTP(t, f, "good-key", http.MethodGet, sshKeysPath(testOrgID)+"/"+id, "")
+	if status != http.StatusOK {
+		t.Fatalf("get: status = %d (%s)", status, resp)
+	}
+	wantKeys(t, "SshKeyOut (GET)", decodeObject(t, resp), specSshKeyOutKeys)
+	status, _, resp = fakeHTTP(t, f, "good-key", http.MethodGet, sshKeysPath(testOrgID), "")
+	list := decodeObject(t, resp)
+	if status != http.StatusOK {
+		t.Fatalf("list: status = %d (%s)", status, resp)
+	}
+	wantKeys(t, "ListResponse[SshKeyOut]", list, specListKeys)
+	if items, _ := list["items"].([]any); len(items) != 1 {
+		t.Errorf("list items = %v, want the one key", list["items"])
+	}
+
+	// DELETE -> 204 with no body; afterwards the key is the ssh_key 404, for GET and DELETE.
+	status, hdr, resp = fakeHTTP(t, f, "good-key", http.MethodDelete, sshKeysPath(testOrgID)+"/"+id, "")
+	if status != http.StatusNoContent || len(resp) != 0 || hdr.Get("X-Request-ID") == "" {
+		t.Errorf("delete: status %d, body %q, request id %q, want an empty 204 with a request id", status, resp, hdr.Get("X-Request-ID"))
+	}
+	for _, method := range []string{http.MethodGet, http.MethodDelete} {
+		status, _, resp = fakeHTTP(t, f, "good-key", method, sshKeysPath(testOrgID)+"/"+id, "")
+		p := decodeObject(t, resp)
+		if status != http.StatusNotFound || p["code"] != "not_found" ||
+			p["detail"] != "no ssh_key matching that identifier is visible to this organization" {
+			t.Errorf("%s of a gone key: %d %v %v, want 404 not_found with the ssh_key sentence", method, status, p["code"], p["detail"])
+		}
+	}
+}
+
+// The fingerprints are the ones ssh-keygen -lf printed for keys it made, and
+// the stored form drops the comment.
+func TestFakeAPI_FingerprintsAreWhatSshKeygenPrints(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	for i, k := range []struct{ keyType, key, comment, fingerprint string }{
+		{"ssh-ed25519", testKeyEd25519, testKeyEd25519Comment, testKeyEd25519Fingerprint},
+		{"ssh-ed25519", testKeyOther, testKeyOtherComment, testKeyOtherFingerprint},
+		{"ecdsa-sha2-nistp256", testKeyECDSA256, "tf7-ecdsa@example.invalid", testKeyECDSA256Fingerprint},
+		{"ecdsa-sha2-nistp384", testKeyECDSA384, "tf7-ecdsa384@example.invalid", testKeyECDSA384Fingerprint},
+		{"ssh-rsa", testKeyRSA2048, "tf7-rsa@example.invalid", testKeyRSA2048Fingerprint},
+	} {
+		got := importKeyVia(t, f, fmt.Sprintf("key-%d", i), k.key+" "+k.comment)
+		if got["key_type"] != k.keyType || got["public_key"] != k.key || got["fingerprint"] != k.fingerprint {
+			t.Errorf("%s: key_type %v, public_key %v, fingerprint %v; want %s, the key without its comment, %s",
+				k.keyType, got["key_type"], got["public_key"], got["fingerprint"], k.keyType, k.fingerprint)
+		}
+	}
+}
+
+// Two base64 texts can decode to one key when the last character carries spare
+// bits; the API stores the blob re-encoded, so there is one text per key.
+func TestFakeAPI_SpareBitsAreNormalisedAway(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	variant := withSpareBitsFlipped(t, testKeyECDSA256)
+	if variant == testKeyECDSA256 {
+		t.Fatal("the variant must differ from the key in its text")
+	}
+	got := importKeyVia(t, f, "spare", variant)
+	if got["public_key"] != testKeyECDSA256 || got["fingerprint"] != testKeyECDSA256Fingerprint {
+		t.Errorf("public_key %v, fingerprint %v; want the canonical text and the key's own fingerprint", got["public_key"], got["fingerprint"])
+	}
+}
+
+func TestFakeAPI_SshKeyRefusals(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	t.Run("names", func(t *testing.T) {
+		for _, name := range []string{"-lead", ".dot", "has space", "semi;colon", "ünï"} {
+			status, p := importKeyRaw(t, f, name, testKeyEd25519)
+			wantProblem(t, fmt.Sprintf("name %q", name), status, p, 422, "invalid_name", detailSshKeyName)
+		}
+		for _, name := range []string{"a", "Laptop", "ci@build.01_x-y", strings.Repeat("a", 64)} {
+			if status, p := importKeyRaw(t, f, name, testKeyEd25519); status != http.StatusCreated {
+				t.Errorf("name %q: %d %v, want it accepted", name, status, p["code"])
+			}
+		}
+	})
+
+	t.Run("keys", func(t *testing.T) {
+		f := newFakeAPI(t, "good-key", testOrgID)
+		blob := strings.Fields(testKeyEd25519)[1]
+		cases := []struct{ what, key, detail string }{
+			{"a private key", "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n",
+				"this is a private key; upload the public key (the .pub file) instead. Nothing was stored."},
+			{"one word", "hello", "upload one public key in OpenSSH format: <type> <base64> [comment]"},
+			{"two keys", testKeyEd25519 + "\n" + testKeyOther, "upload one key at a time"},
+			{"an options prefix", `command="ls" ` + testKeyEd25519, "the key may not carry authorized_keys options such as command= or from="},
+			{"ssh-dss", "ssh-dss " + blob, "this key type is not supported; use ssh-ed25519, ecdsa-sha2-nistp256, -nistp384, -nistp521 or ssh-rsa of at least 2048 bits"},
+			{"a security key", "sk-ssh-ed25519@openssh.com " + blob, "this key type is not supported; use ssh-ed25519, ecdsa-sha2-nistp256, -nistp384, -nistp521 or ssh-rsa of at least 2048 bits"},
+			{"RSA below 2048 bits", testKeyRSA1024, "RSA keys must be 2048 to 16384 bits; this one has 1024"},
+			{"base64 that is not base64", "ssh-ed25519 !!!!", "the key data is not valid for its type"},
+			{"a truncated blob", "ssh-ed25519 " + blob[:30], "the key data is not valid for its type"},
+			{"a blob of another type", "ssh-rsa " + blob, "the key data is not valid for its type"},
+		}
+		for _, tc := range cases {
+			status, p := importKeyRaw(t, f, "bad", tc.key)
+			wantProblem(t, tc.what, status, p, 422, "invalid_public_key", tc.detail)
+			if strings.Contains(fmt.Sprint(p), "PRIVATE KEY") || strings.Contains(fmt.Sprint(p), "b3BlbnNz") {
+				t.Errorf("%s: the refusal echoes the submitted text: %v", tc.what, p)
+			}
+		}
+		if f.SSHKeyCount() != 0 {
+			t.Errorf("refused keys left %d key(s) in the keystore", f.SSHKeyCount())
+		}
+	})
+
+	t.Run("bodies", func(t *testing.T) {
+		f := newFakeAPI(t, "good-key", testOrgID)
+		for _, tc := range []struct{ what, body, field, message string }{
+			{"empty name", `{"name":"","public_key":"x"}`, "name", "String should have at least 1 character"},
+			{"a name above 64 characters", `{"name":"` + strings.Repeat("a", 65) + `","public_key":"x"}`, "name", "String should have at most 64 characters"},
+			{"missing key", `{"name":"a"}`, "public_key", "Field required"},
+			{"an unknown field", `{"name":"a","public_key":"x","comment":"c"}`, "comment", "Extra inputs are not permitted"},
+			{"a key above 8192 characters", `{"name":"a","public_key":"` + strings.Repeat("A", 8193) + `"}`, "public_key", "String should have at most 8192 characters"},
+		} {
+			status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), tc.body)
+			p := decodeObject(t, resp)
+			errs, _ := p["errors"].([]any)
+			if status != http.StatusBadRequest || p["code"] != "invalid_request" || len(errs) != 1 ||
+				errs[0].(map[string]any)["field"] != tc.field || errs[0].(map[string]any)["message"] != tc.message {
+				t.Errorf("%s: %d %v %v, want 400 invalid_request with {%s: %s}", tc.what, status, p["code"], p["errors"], tc.field, tc.message)
+			}
+		}
+	})
+
+	t.Run("a name that is taken", func(t *testing.T) {
+		f := newFakeAPI(t, "good-key", testOrgID)
+		importKeyVia(t, f, "taken", testKeyEd25519)
+		// The same key material under another name is allowed; the same name is not.
+		importKeyVia(t, f, "other-name", testKeyEd25519)
+		status, p := importKeyRaw(t, f, "taken", testKeyOther)
+		wantProblem(t, "the same name", status, p, 409, "name_taken", "an SSH key named 'taken' already exists in this organization")
+		if f.SSHKeyCount() != 2 {
+			t.Errorf("keys = %d, want 2", f.SSHKeyCount())
+		}
+	})
+
+	t.Run("the quota", func(t *testing.T) {
+		f := newFakeAPI(t, "good-key", testOrgID)
+		f.SetSSHKeyQuota(2)
+		importKeyVia(t, f, "one", testKeyEd25519)
+		importKeyVia(t, f, "two", testKeyOther)
+		status, p := importKeyRaw(t, f, "three", testKeyECDSA256)
+		wantProblem(t, "a third key", status, p, 422, "quota_exceeded", "ssh_keys: 2 in use plus 1 requested exceeds the limit of 2 for this account")
+		f.SetSSHKeyQuota(-1)
+		if status, _ := importKeyRaw(t, f, "three", testKeyECDSA256); status != http.StatusCreated {
+			t.Errorf("unlimited quota: status = %d, want 201", status)
+		}
+	})
+
+	t.Run("the switch is off", func(t *testing.T) {
+		f := newFakeAPI(t, "good-key", testOrgID)
+		id := importKeyVia(t, f, "before", testKeyEd25519)["id"].(string)
+		f.SetSSHKeysOn(false)
+
+		status, p := importKeyRaw(t, f, "after", testKeyOther)
+		wantProblem(t, "import while off", status, p, 503, "not_ready", "SSH keys are not switched on yet")
+		// Reading and deleting stay served, so switching the feature off does not strand what exists.
+		if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodGet, sshKeysPath(testOrgID)+"/"+id, ""); status != http.StatusOK {
+			t.Errorf("get while off: status = %d, want 200", status)
+		}
+		if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodGet, sshKeysPath(testOrgID), ""); status != http.StatusOK {
+			t.Errorf("list while off: status = %d, want 200", status)
+		}
+		if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodDelete, sshKeysPath(testOrgID)+"/"+id, ""); status != http.StatusNoContent {
+			t.Errorf("delete while off: status = %d, want 204", status)
+		}
+	})
+}
+
+// The key import takes the Idempotency-Key the VM create takes: the same key
+// and body replay the stored answer, another body is a client bug, and a repeat
+// that races the first request meets idempotency_in_progress first.
+func TestFakeAPI_SshKeyImportIsIdempotent(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	body, _ := json.Marshal(map[string]string{"name": "once", "public_key": testKeyEd25519})
+	status, hdr1, first := fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(body), "Idempotency-Key", "k1")
+	if status != http.StatusCreated {
+		t.Fatalf("first: status = %d (%s)", status, first)
+	}
+	status, hdr2, second := fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(body), "Idempotency-Key", "k1")
+	if status != http.StatusCreated || string(first) != string(second) || hdr1.Get("Location") != hdr2.Get("Location") {
+		t.Errorf("replay: status %d, body equal %v, Location %q vs %q; want the stored 201", status,
+			string(first) == string(second), hdr1.Get("Location"), hdr2.Get("Location"))
+	}
+	if f.SSHKeyCount() != 1 {
+		t.Errorf("keys = %d, want 1: a replay must not import twice", f.SSHKeyCount())
+	}
+
+	other, _ := json.Marshal(map[string]string{"name": "once", "public_key": testKeyOther})
+	status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(other), "Idempotency-Key", "k1")
+	wantProblem(t, "a reused key", status, decodeObject(t, resp), 409, "idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+
+	// In flight: the next two repeats lose the race, then the stored answer replays.
+	f.InProgressFor(2)
+	for i := 0; i < 2; i++ {
+		status, _, resp = fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(body), "Idempotency-Key", "k1")
+		wantProblem(t, "a repeat that races the first request", status, decodeObject(t, resp), 409, "idempotency_in_progress", detailIdempotencyInProgress)
+	}
+	if status, _, _ = fakeHTTP(t, f, "good-key", http.MethodPost, sshKeysPath(testOrgID), string(body), "Idempotency-Key", "k1"); status != http.StatusCreated {
+		t.Errorf("after the race: status = %d, want the stored 201", status)
+	}
+	if keys := f.SSHKeyIdempotencyKeys(); len(keys) != 6 {
+		t.Errorf("SSHKeyIdempotencyKeys = %v, want the 6 keyed requests that reached the API", keys)
+	}
+
+	// The same knob races a VM create.
+	if status, _, _ = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "v1"); status != http.StatusAccepted {
+		t.Fatalf("vm create: status = %d", status)
+	}
+	f.InProgressFor(1)
+	status, _, resp = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "v1")
+	wantProblem(t, "a vm create that races the first", status, decodeObject(t, resp), 409, "idempotency_in_progress", detailIdempotencyInProgress)
+	if status, _, _ = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS, "Idempotency-Key", "v1"); status != http.StatusAccepted || f.CreateCount() != 1 {
+		t.Errorf("after the race: status %d, creates %d, want the stored 202 and still 1 create", status, f.CreateCount())
+	}
+}
+
+// §3.3 point 4: the customer route resolves ssh_keys against the org's keystore
+// (never against Nova), keeps the names as a launch-time snapshot, and refuses
+// a non-empty list while the keystore is off before it claims the key.
+func TestFakeAPI_VmCreateResolvesSshKeysAgainstTheKeystore(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	create := func(body string, extra ...string) (int, map[string]any) {
+		status, _, resp := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), body, extra...)
+		return status, decodeObject(t, resp)
+	}
+
+	// An unknown name, more than ten, and a name twice.
+	status, p := create(vmWithKeys("vm-a", "nope"))
+	wantProblem(t, "an unknown key", status, p, 422, "ssh_key_not_found",
+		"no SSH key named 'nope' in this organization; import it with POST /v1/orgs/"+testOrgID+"/compute/ssh-keys")
+	importKeyVia(t, f, "alpha", testKeyEd25519)
+	importKeyVia(t, f, "beta", testKeyOther)
+	status, p = create(vmWithKeys("vm-a", "alpha", "nope", "beta", "gone"))
+	wantProblem(t, "two unknown keys", status, p, 422, "ssh_key_not_found", "")
+	if d, _ := p["detail"].(string); !strings.Contains(d, "'nope', 'gone'") {
+		t.Errorf("detail %q does not name both unknown keys", d)
+	}
+	eleven := make([]string, 11)
+	for i := range eleven {
+		eleven[i] = fmt.Sprintf("k%d", i)
+	}
+	status, p = create(vmWithKeys("vm-a", eleven...))
+	wantProblem(t, "eleven keys", status, p, 422, "too_many_ssh_keys", "a VM can be given at most 10 SSH keys")
+	status, p = create(vmWithKeys("vm-a", "alpha", "beta", "alpha"))
+	wantProblem(t, "a key twice", status, p, 422, "duplicate_ssh_key", "SSH key 'alpha' is listed more than once")
+	if f.CreateCount() != 0 {
+		t.Fatalf("refused creates built %d vm(s)", f.CreateCount())
+	}
+
+	// Two imported keys are fine, the names come back in the order given, and
+	// deleting a key afterwards changes nothing on the VM.
+	status, p = create(vmWithKeys("vm-a", "beta", "alpha"))
+	if status != http.StatusAccepted {
+		t.Fatalf("create with two keys: %d %v", status, p)
+	}
+	vm := p["vm"].(map[string]any)
+	if names, _ := vm["ssh_key_names"].([]any); len(names) != 2 || names[0] != "beta" || names[1] != "alpha" {
+		t.Errorf("ssh_key_names = %v, want [beta alpha]", vm["ssh_key_names"])
+	}
+	id := vm["id"].(string)
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodDelete, sshKeysPath(testOrgID)+"/"+f.SSHKeyID("alpha"), ""); status != http.StatusNoContent {
+		t.Fatalf("delete of the key: status = %d", status)
+	}
+	if got := f.SSHKeyNames(id); len(got) != 2 || got[0] != "beta" || got[1] != "alpha" {
+		t.Errorf("after the key was deleted the vm lists %v, want [beta alpha] still", got)
+	}
+
+	// Switched off: a non-empty list is 503 not_ready before the key is claimed
+	// (so the same Idempotency-Key works once it is on), an empty list is served.
+	f.SetSSHKeysOn(false)
+	status, p = create(vmWithKeys("vm-b", "beta"), "Idempotency-Key", "k-off")
+	wantProblem(t, "keys while off", status, p, 503, "not_ready", "SSH keys are not switched on yet")
+	if status, _ := create(vmWithKeys("vm-c"), "Idempotency-Key", "k-empty"); status != http.StatusAccepted {
+		t.Errorf("an empty list while off: status = %d, want 202", status)
+	}
+	f.SetSSHKeysOn(true)
+	if status, p := create(vmWithKeys("vm-b", "beta"), "Idempotency-Key", "k-off"); status != http.StatusAccepted {
+		t.Errorf("the same Idempotency-Key once on: %d %v, want 202: the refusal must not have claimed it", status, p["code"])
 	}
 }

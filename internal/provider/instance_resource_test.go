@@ -16,6 +16,7 @@ package provider
 // gracefully instead of failing on an exec error.
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -25,7 +26,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
@@ -56,6 +61,20 @@ func wrapSafe(phrase string) *regexp.Regexp {
 		words[i] = regexp.QuoteMeta(w)
 	}
 	return regexp.MustCompile(strings.Join(words, `\s+`))
+}
+
+// wrapSafeInOrder matches the phrases one after the other, with anything in
+// between, each as wrapSafe would match it.
+func wrapSafeInOrder(phrases ...string) *regexp.Regexp {
+	parts := make([]string, len(phrases))
+	for i, phrase := range phrases {
+		words := strings.Fields(phrase)
+		for j, w := range words {
+			words[j] = regexp.QuoteMeta(w)
+		}
+		parts[i] = strings.Join(words, `\s+`)
+	}
+	return regexp.MustCompile(`(?s)` + strings.Join(parts, `.*`))
 }
 
 func testAccPreCheck(t *testing.T) {
@@ -577,12 +596,36 @@ func TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises(t *testing.
 	}
 }
 
-func testAccInstanceConfigSSHKeys(fake *fakeAPI, name string, keys ...string) string {
-	quoted := make([]string, len(keys))
-	for i, k := range keys {
-		quoted[i] = fmt.Sprintf("%q", k)
+// testKeySpec is one virtscale_ssh_key of a test configuration.
+type testKeySpec struct{ label, name, publicKey string }
+
+var (
+	keyAlpha = testKeySpec{"a", "alpha", testKeyEd25519}
+	keyBeta  = testKeySpec{"b", "beta", testKeyOther}
+)
+
+// hclList renders names as an HCL list of strings.
+func hclList(names ...string) string {
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = fmt.Sprintf("%q", n)
 	}
-	return testAccProviderBlock(fake) + fmt.Sprintf(`
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+// testAccKeysAndInstance is the provider, the given keys and an instance whose
+// ssh_keys is the HCL expression sshKeysExpr (left out when it is empty).
+func testAccKeysAndInstance(fake *fakeAPI, vmName, sshKeysExpr string, keys ...testKeySpec) string {
+	var b strings.Builder
+	b.WriteString(testAccProviderBlock(fake))
+	for _, k := range keys {
+		b.WriteString(testAccSshKeyBlock(k.label, k.name, fmt.Sprintf("%q", k.publicKey)))
+	}
+	sshKeysLine := ""
+	if sshKeysExpr != "" {
+		sshKeysLine = "ssh_keys        = " + sshKeysExpr
+	}
+	fmt.Fprintf(&b, `
 resource "virtscale_instance" "test" {
   name            = %q
   region          = "gro"
@@ -592,17 +635,19 @@ resource "virtscale_instance" "test" {
   disk_gb         = 10
   storage_pool    = "pool-1"
   network_profile = "net-1"
-  ssh_keys        = [%s]
+  %s
 }
-`, name, strings.Join(quoted, ", "))
+`, vmName, sshKeysLine)
+	return b.String()
 }
 
-// TestAccInstanceResource_SSHKeyNameReachesTheAPI: ssh_keys carries Nova
-// keypair NAMES (VmCreateRequest.ssh_keys); the API records them as
-// ssh_key_names. (No customer project has a keypair yet, so against the real
-// API a build with a name fails; see README. This pins the request shape.)
-func TestAccInstanceResource_SSHKeyNameReachesTheAPI(t *testing.T) {
+// TestAccInstanceResource_SSHKeysComeFromTheKeystore: ssh_keys names keys that
+// were imported into the organization (virtscale_ssh_key), in the order given;
+// the API records the names it resolved. Importing the instance reads them back,
+// so the imported state equals the applied one.
+func TestAccInstanceResource_SSHKeysComeFromTheKeystore(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "with-keys", "[virtscale_ssh_key.b.name, virtscale_ssh_key.a.name]", keyAlpha, keyBeta)
 	var id string
 
 	resource.Test(t, resource.TestCase{
@@ -611,28 +656,39 @@ func TestAccInstanceResource_SSHKeyNameReachesTheAPI(t *testing.T) {
 		CheckDestroy:             testAccCheckInstanceDestroy(fake),
 		Steps: []resource.TestStep{
 			{
-				Config: testAccInstanceConfigSSHKeys(fake, "with-key", "deploy"),
+				Config: config,
 				Check: resource.ComposeAggregateTestCheckFunc(
 					vmIDFromState(&id),
-					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "1"),
-					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.0", "deploy"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "2"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.0", "beta"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.1", "alpha"),
 					func(*terraform.State) error {
-						if got := fake.SSHKeyNames(id); len(got) != 1 || got[0] != "deploy" {
-							return fmt.Errorf("the API recorded ssh_key_names %v, want [deploy]", got)
+						if got := fake.SSHKeyNames(id); len(got) != 2 || got[0] != "beta" || got[1] != "alpha" {
+							return fmt.Errorf("the API recorded ssh_key_names %v, want [beta alpha]", got)
 						}
 						return nil
 					},
 				),
 			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				ResourceName:      "virtscale_instance.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
 		},
 	})
 }
 
-// TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI: an instance is
-// given exactly one keypair, so the API refuses more with 422
-// too_many_ssh_keys before it builds anything. The refusal and its reason
-// reach the user, and nothing is created.
-func TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI(t *testing.T) {
+// TestAccInstanceResource_AnUnknownSSHKeyIsRefusedByTheAPI: the API resolves the
+// names against the organization's keystore and refuses one that was never
+// imported; its words reach the user and no instance is built.
+func TestAccInstanceResource_AnUnknownSSHKeyIsRefusedByTheAPI(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 	resource.Test(t, resource.TestCase{
@@ -640,13 +696,309 @@ func TestAccInstanceResource_MoreThanOneSSHKeyIsRefusedByTheAPI(t *testing.T) {
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 		Steps: []resource.TestStep{
 			{
-				Config:      testAccInstanceConfigSSHKeys(fake, "two-keys", "a", "b"),
-				ExpectError: regexp.MustCompile(`too_many_ssh_keys`),
+				Config:      testAccKeysAndInstance(fake, "unknown-key", hclList("nope")),
+				ExpectError: wrapSafe("ssh_key_not_found: no SSH key named 'nope' in this organization"),
 			},
 		},
 	})
 	if fake.CreateCount() != 0 {
 		t.Errorf("the API refused the request, yet %d vm(s) were created", fake.CreateCount())
+	}
+}
+
+// TestAccInstanceResource_MoreThanTenSSHKeysAreRefusedBeforeAnythingIsBuilt: at
+// most 10 keys, checked at plan time with the API's own words (S7). Nothing is
+// sent to the API.
+func TestAccInstanceResource_MoreThanTenSSHKeysAreRefusedBeforeAnythingIsBuilt(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	names := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("key-%02d", i)
+		}
+		return out
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				// Ten is allowed: the plan wants to create the instance.
+				Config:             testAccKeysAndInstance(fake, "ten-keys", hclList(names(10)...)),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config:      testAccKeysAndInstance(fake, "eleven-keys", hclList(names(11)...)),
+				ExpectError: wrapSafe("a VM can be given at most 10 SSH keys"),
+			},
+		},
+	})
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the plan-time checks must not need the API, yet it was called: %v", calls)
+	}
+}
+
+// TestAccInstanceResource_ASSHKeyListedTwiceIsRefusedBeforeAnythingIsBuilt: no
+// name twice, at plan time, with the API's own words (S8).
+func TestAccInstanceResource_ASSHKeyListedTwiceIsRefusedBeforeAnythingIsBuilt(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config:      testAccKeysAndInstance(fake, "twice", hclList("alpha", "beta", "alpha")),
+				ExpectError: wrapSafe("SSH key 'alpha' is listed more than once"),
+			},
+		},
+	})
+	if calls := fake.Calls(); len(calls) != 0 {
+		t.Errorf("the plan-time checks must not need the API, yet it was called: %v", calls)
+	}
+}
+
+// TestAccInstanceResource_ImportSeedsSSHKeysAndPlansNoReplacement covers M14.
+// An instance made with keys, imported, reads its ssh_key_names back into
+// ssh_keys, so the next plan has nothing to change. Before, the imported state
+// had no ssh_keys, and the plan replaced the instance.
+func TestAccInstanceResource_ImportSeedsSSHKeysAndPlansNoReplacement(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "imported", hclList("alpha", "beta"))
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				// An instance that already exists, made out of band with two keys; the
+				// state does not know it. This step also fixes the configuration the
+				// import below runs against.
+				PreConfig: func() {
+					importKeyVia(t, fake, "alpha", testKeyEd25519)
+					importKeyVia(t, fake, "beta", testKeyOther)
+					id = createVmVia(t, fake, fake.apiKey, vmWithKeys("imported", "alpha", "beta")).get("vm")["id"].(string)
+					runVm(t, fake, fake.apiKey, id)
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				ResourceName:       "virtscale_instance.test",
+				ImportState:        true,
+				ImportStatePersist: true,
+				ImportStateIdFunc:  func(*terraform.State) (string, error) { return id, nil },
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("imported %d resources, want 1", len(states))
+					}
+					a := states[0].Attributes
+					if a["ssh_keys.#"] != "2" || a["ssh_keys.0"] != "alpha" || a["ssh_keys.1"] != "beta" {
+						return fmt.Errorf("imported ssh_keys = %v, want [alpha beta] read back from ssh_key_names", a)
+					}
+					return nil
+				},
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_NoSSHKeysStayNull: an instance made without keys has
+// no ssh_keys: the API returns an empty list, and Read keeps null, so a
+// configuration that says nothing about keys has nothing to change.
+func TestAccInstanceResource_NoSSHKeysStayNull(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "no-keys", 1),
+				Check:  resource.TestCheckNoResourceAttr("virtscale_instance.test", "ssh_keys.#"),
+			},
+			{
+				Config: testAccInstanceConfig(fake, "no-keys", 1),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				ResourceName:      "virtscale_instance.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_AnEmptySSHKeysListStaysEmpty: a configuration that
+// says ssh_keys = [] and an API that returns no names agree: the state keeps the
+// empty list, and the next plan has nothing to change.
+func TestAccInstanceResource_AnEmptySSHKeysListStaysEmpty(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "empty-list", "[]")
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "0"),
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_SSHKeysStayInTheOrderTheyAreConfiguredIn: a
+// deployment that reports ssh_key_names in another order, the same names, is no
+// change. A reordered list read back must not plan the instance's replacement.
+func TestAccInstanceResource_SSHKeysStayInTheOrderTheyAreConfiguredIn(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "ordered", "[virtscale_ssh_key.b.name, virtscale_ssh_key.a.name]", keyAlpha, keyBeta)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{Config: config, Check: vmIDFromState(&id)},
+			{
+				PreConfig: func() { fake.SetSSHKeyNames(id, "alpha", "beta") },
+				Config:    config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.0", "beta"),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ChangingSSHKeysReplacesTheInstance: the keys are
+// installed at first boot, so a different list is a different instance.
+func TestAccInstanceResource_ChangingSSHKeysReplacesTheInstance(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccKeysAndInstance(fake, "changing-keys", "[virtscale_ssh_key.a.name]", keyAlpha, keyBeta),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "1"),
+			},
+			{
+				Config: testAccKeysAndInstance(fake, "changing-keys", "[virtscale_ssh_key.a.name, virtscale_ssh_key.b.name]", keyAlpha, keyBeta),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionDestroyBeforeCreate)},
+				},
+				Check: resource.TestCheckResourceAttr("virtscale_instance.test", "ssh_keys.#", "2"),
+			},
+		},
+	})
+	if fake.CreateCount() != 2 {
+		t.Errorf("creates = %d, want 2 (the original and its replacement)", fake.CreateCount())
+	}
+}
+
+// TestAccInstanceResource_DeletingAKeyLaterDoesNotChangeTheInstance: keys are a
+// launch-time snapshot. A key deleted afterwards is recreated by the next apply
+// (it is gone from the keystore), and the instance that used it is untouched.
+func TestAccInstanceResource_DeletingAKeyLaterDoesNotChangeTheInstance(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccKeysAndInstance(fake, "keeps-keys", "[virtscale_ssh_key.a.name]", keyAlpha)
+	var vmID, keyID string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vmIDFromState(&vmID),
+					func(s *terraform.State) error {
+						keyID = s.RootModule().Resources["virtscale_ssh_key.a"].Primary.ID
+						return nil
+					},
+				),
+			},
+			{
+				PreConfig: func() {
+					if status, _, body := fakeHTTP(t, fake, fake.apiKey, http.MethodDelete, sshKeysPath(fake.org)+"/"+keyID, ""); status != http.StatusNoContent {
+						t.Errorf("out-of-band delete of the key: %d %s", status, body)
+					}
+				},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("virtscale_ssh_key.a", plancheck.ResourceActionCreate),
+						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionNoop),
+					},
+				},
+				Check: func(*terraform.State) error {
+					if got := fake.SSHKeyNames(vmID); len(got) != 1 || got[0] != "alpha" {
+						return fmt.Errorf("the instance lists %v after its key was deleted, want [alpha] still", got)
+					}
+					return nil
+				},
+			},
+		},
+	})
+	if fake.CreateCount() != 1 {
+		t.Errorf("creates = %d, want 1: the instance must not be replaced", fake.CreateCount())
+	}
+}
+
+// TestAccInstanceResource_SSHKeysNotSwitchedOnIsShownAndNotRetried: while the
+// keystore is off, a non-empty ssh_keys is 503 not_ready, which says SSH keys
+// are not switched on for this API yet. The request is sent once; nothing is built.
+func TestAccInstanceResource_SSHKeysNotSwitchedOnIsShownAndNotRetried(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					importKeyVia(t, fake, "alpha", testKeyEd25519)
+					fake.SetSSHKeysOn(false)
+				},
+				Config:      testAccKeysAndInstance(fake, "keys-off", hclList("alpha")),
+				ExpectError: wrapSafe("not_ready: SSH keys are not switched on yet"),
+			},
+		},
+	})
+	if n := fake.CallCount("POST compute/vms"); n != 1 {
+		t.Errorf("the create was sent %d times, want exactly once: not_ready is never retried", n)
+	}
+	if fake.CreateCount() != 0 {
+		t.Errorf("%d vm(s) were created", fake.CreateCount())
 	}
 }
 
@@ -702,13 +1054,18 @@ func TestAccInstanceResource_SurvivesThrottlingAndLostResponses(t *testing.T) {
 
 // --- diagnostics as the user sees them -------------------------------------
 
-// testAccStackConfig is an instance, a public IP associated to it and the
-// images catalogue, configured with the given API key: everything the provider
-// can read or write.
+// testAccStackConfig is an SSH key, an instance that uses it, a public IP
+// associated to the instance and the images catalogue, configured with the
+// given API key: everything the provider can read or write.
 func testAccStackConfig(fake *fakeAPI, key string) string {
 	return testAccProviderBlockWith(fake, key, fake.org) + `
 data "virtscale_images" "gro" {
   region = "gro"
+}
+
+resource "virtscale_ssh_key" "test" {
+  name       = "scoped"
+  public_key = "` + testKeyEd25519 + `"
 }
 
 resource "virtscale_instance" "test" {
@@ -720,6 +1077,7 @@ resource "virtscale_instance" "test" {
   disk_gb         = 10
   storage_pool    = "pool-1"
   network_profile = "net-1"
+  ssh_keys        = [virtscale_ssh_key.test.name]
 }
 
 resource "virtscale_public_ip" "test" {
@@ -731,10 +1089,11 @@ resource "virtscale_public_ip" "test" {
 
 // TestAccStack_KeyScopesMatchWhatTheREADMESays pins the README's "API key
 // scopes" section against the deployed permission table (permissions.py,
-// transcribed into the fake). The default test key holds exactly compute:write
-// and network:write, and applies the whole stack. Plan-only use, which only
-// reads, works with the two read halves. Without network:read the refresh of a
-// public IP fails, and the message says which scope to add.
+// transcribed into the fake, plus the four compute.ssh_key.* permissions of the
+// TF7 plan). The default test key holds exactly compute:write and
+// network:write, and applies the whole stack. Plan-only use, which only reads,
+// works with the two read halves. Without network:read the refresh of a public
+// IP fails, and the message says which scope to add.
 func TestAccStack_KeyScopesMatchWhatTheREADMESays(t *testing.T) {
 	fake := newFakeAPI(t, "write-key", testOrgID)
 	fake.AddKey("read-halves", "compute:read", "network:read")
@@ -809,4 +1168,323 @@ func TestAccInstanceResource_SourceAddressNotAllowedSaysTheKeyIsRestricted(t *te
 			},
 		},
 	})
+}
+
+// --- 404s: only "this resource is gone" is gone -----------------------------
+
+// TestAccInstanceResource_ReadErrorsThatAreNotTheVmBeingGoneKeepTheResource: a
+// 404 means "this vm is gone" only when it carries the vm sentence of the API's
+// not_found helper. A mistyped endpoint, a proxy's page, and the sentence for
+// the compute service, a region or another kind of resource are errors, and the
+// instance stays in the state (V4 L4).
+func TestAccInstanceResource_ReadErrorsThatAreNotTheVmBeingGoneKeepTheResource(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfig(fake, "keep-me", 1)
+	variants := notFoundVariants()
+
+	steps := []resource.TestStep{{Config: config}}
+	for _, name := range sortedVariantNames(variants) {
+		respond := variants[name]
+		steps = append(steps, resource.TestStep{
+			PreConfig: func() {
+				fake.ClearFaults()
+				fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/vms/"), respond)
+			},
+			Config:      config,
+			PlanOnly:    true,
+			ExpectError: wrapSafe("Unable to Read Instance"),
+		})
+	}
+	steps = append(steps, resource.TestStep{
+		PreConfig: fake.ClearFaults,
+		Config:    config,
+		PlanOnly:  true,
+	})
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps:                    steps,
+	})
+}
+
+// TestAccInstanceResource_DestroyDoesNotTakeAMistypedEndpointForADeletedVm: the
+// wait after a DELETE ends when the vm reads as gone, which is the vm sentence
+// and nothing else. If every read answers with an unknown route's 404, destroy
+// fails and the instance stays tracked, instead of reporting a deletion nobody
+// confirmed.
+func TestAccInstanceResource_DestroyDoesNotTakeAMistypedEndpointForADeletedVm(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+	deleteSeen := false
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "wait-404", 1),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				// The DELETE goes through; every read after it is the wrong 404.
+				PreConfig: func() {
+					fake.FailNext(1000, func(r *http.Request) bool {
+						if r.Method == http.MethodDelete {
+							deleteSeen = true
+						}
+						return deleteSeen && matchRoute(http.MethodGet, "/compute/vms/")(r)
+					}, respondNoSuchRoute)
+				},
+				Config:      testAccProviderBlock(fake),
+				ExpectError: wrapSafe("Unable to Wait for Instance Deletion"),
+			},
+			{
+				PreConfig: fake.ClearFaults,
+				Config:    testAccProviderBlock(fake),
+			},
+		},
+	})
+	if state, ok := fake.VmState(id); !ok || state != "deleted" {
+		t.Errorf("the vm is %q (present %v), want deleted once destroy was allowed to finish", state, ok)
+	}
+}
+
+// TestAccInstanceResource_ADeleteThatMeetsAConflictAndThenAnAbsentVmIsDone: the
+// DELETE is answered 409 operation_in_flight and, by the time the vm is read
+// back, it is gone (the vm sentence): the removal was already underway, so
+// destroy is done.
+func TestAccInstanceResource_ADeleteThatMeetsAConflictAndThenAnAbsentVmIsDone(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "gone-by-then", 1),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				PreConfig: func() {
+					fake.FailNext(1, matchRoute(http.MethodDelete, "/compute/vms/"), func(rc *reqCtx) {
+						fake.Vanish(id)
+						rc.conflict("operation_in_flight", detailOperationInFlightVm)
+					})
+				},
+				Config: testAccProviderBlock(fake),
+			},
+		},
+	})
+}
+
+// --- an upstream that echoes the key, and a create that gives up -------------
+
+// TestAccInstanceResource_AnUpstreamEchoingTheKeyDoesNotLeakItIntoTheError: a
+// proxy's error page that prints the request's Authorization header reaches the
+// user with the API key replaced (V4 I1).
+func TestAccInstanceResource_AnUpstreamEchoingTheKeyDoesNotLeakItIntoTheError(t *testing.T) {
+	fake := newFakeAPI(t, "sk-echoed-4f9a7c1e2b", testOrgID)
+	config := testAccInstanceConfig(fake, "echo", 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig: func() {
+					fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/vms/"), respondEchoingTheKey(500))
+				},
+				Config:      config,
+				PlanOnly:    true,
+				ExpectError: wrapSafe("debug: Authorization: Bearer [redacted]"),
+			},
+			{
+				PreConfig: fake.ClearFaults,
+				Config:    config,
+				PlanOnly:  true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_TheInFlightDuplicateIsWaitedFor: the retry of a lost
+// create answer can meet 409 idempotency_in_progress while the first request is
+// still inside its transaction (V4 L3, V5 I4). It waits and gets the stored
+// answer: one instance, one Idempotency-Key, the apply succeeds.
+func TestAccInstanceResource_TheInFlightDuplicateIsWaitedFor(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(1, matchMethod(http.MethodPost), respondGatewayRetryAfter(502, "0"))
+					fake.InProgressFor(2)
+				},
+				Config: testAccInstanceConfig(fake, "in-flight", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+					func(*terraform.State) error {
+						if n := fake.CreateCount(); n != 1 {
+							return fmt.Errorf("the create built %d vms, want exactly 1", n)
+						}
+						keys := fake.IdempotencyKeys()
+						if len(keys) != 4 || keys[0] == "" || keys[0] != keys[1] || keys[1] != keys[2] || keys[2] != keys[3] {
+							return fmt.Errorf("Idempotency-Keys of the attempts = %v, want one key four times (lost answer, two races, replay)", keys)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_GivingUpSaysHowToRecover: when every attempt of the
+// create is lost, the instance may exist anyway. The error keeps the API's own
+// words and says what to do (name_taken on the next apply, then tofu import),
+// and that recovery works: the next apply is name_taken, and importing the
+// instance leaves nothing to change.
+func TestAccInstanceResource_GivingUpSaysHowToRecover(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfig(fake, "lost-create", 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(5, matchMethod(http.MethodPost), respondGatewayRetryAfter(502, "0"))
+				},
+				Config: config,
+				ExpectError: wrapSafeInOrder("virtscale API 502", "gave up after 5 attempts",
+					"the first request may still have created the resource: "+
+						"if the next apply reports name_taken, find it in the panel or with the API "+
+						"and bring it under management with tofu import"),
+			},
+			{
+				Config:      config,
+				ExpectError: wrapSafe("name_taken"),
+			},
+			{
+				ResourceName:       "virtscale_instance.test",
+				ImportState:        true,
+				ImportStatePersist: true,
+				ImportStateIdFunc:  func(*terraform.State) (string, error) { return fake.VmIDByName("lost-create"), nil },
+			},
+			{
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// --- the plan-time checks on ssh_keys (S7, S8) -------------------------------------
+
+func sshKeysListRequest(elements ...types.String) validator.ListRequest {
+	values := make([]attr.Value, len(elements))
+	for i, e := range elements {
+		values[i] = e
+	}
+	return validator.ListRequest{
+		Path:        path.Root("ssh_keys"),
+		ConfigValue: types.ListValueMust(types.StringType, values),
+	}
+}
+
+func keyNames(n ...string) []types.String {
+	out := make([]types.String, len(n))
+	for i, name := range n {
+		out[i] = types.StringValue(name)
+	}
+	return out
+}
+
+func TestSSHKeyCountValidator(t *testing.T) {
+	ctx := context.Background()
+	many := func(n int) []types.String {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("k%d", i)
+		}
+		return keyNames(out...)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		req     validator.ListRequest
+		wantErr bool
+	}{
+		{"none", sshKeysListRequest(), false},
+		{"one", sshKeysListRequest(many(1)...), false},
+		{"ten", sshKeysListRequest(many(10)...), false},
+		{"eleven", sshKeysListRequest(many(11)...), true},
+		{"unknown elements still count", sshKeysListRequest(append(many(10), types.StringUnknown())...), true},
+		{"a null list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListNull(types.StringType)}, false},
+		{"an unknown list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListUnknown(types.StringType)}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp validator.ListResponse
+			sshKeyCountValidator{}.ValidateList(ctx, tc.req, &resp)
+			if resp.Diagnostics.HasError() != tc.wantErr {
+				t.Fatalf("diagnostics = %v, want an error: %v", resp.Diagnostics, tc.wantErr)
+			}
+			if tc.wantErr {
+				d := resp.Diagnostics.Errors()[0]
+				if d.Detail() != "a VM can be given at most 10 SSH keys" {
+					t.Errorf("detail = %q, want the API's own sentence", d.Detail())
+				}
+			}
+		})
+	}
+}
+
+func TestSSHKeyUniqueValidator(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		req  validator.ListRequest
+		want []string // the names reported, each once
+	}{
+		{"none", sshKeysListRequest(), nil},
+		{"all different", sshKeysListRequest(keyNames("a", "b", "c")...), nil},
+		{"one twice", sshKeysListRequest(keyNames("a", "b", "a")...), []string{"a"}},
+		{"one three times is reported once", sshKeysListRequest(keyNames("a", "a", "a")...), []string{"a"}},
+		{"two names twice, reported where the repeat is", sshKeysListRequest(keyNames("a", "b", "b", "a")...), []string{"b", "a"}},
+		{"case differs", sshKeysListRequest(keyNames("a", "A")...), nil},
+		{"unknown elements are not the same name", sshKeysListRequest(types.StringUnknown(), types.StringUnknown()), nil},
+		{"null elements are not the same name", sshKeysListRequest(types.StringNull(), types.StringNull()), nil},
+		{"a null list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListNull(types.StringType)}, nil},
+		{"an unknown list", validator.ListRequest{Path: path.Root("ssh_keys"), ConfigValue: types.ListUnknown(types.StringType)}, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var resp validator.ListResponse
+			sshKeyUniqueValidator{}.ValidateList(ctx, tc.req, &resp)
+			var got []string
+			for _, d := range resp.Diagnostics.Errors() {
+				got = append(got, d.Detail())
+			}
+			var want []string
+			for _, name := range tc.want {
+				want = append(want, fmt.Sprintf("SSH key '%s' is listed more than once", name))
+			}
+			if strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Errorf("errors = %q, want %q", got, want)
+			}
+		})
+	}
 }
