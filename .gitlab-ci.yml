@@ -15,7 +15,7 @@ test:
   # An API pipeline started with PROVIDER_STAGING_LIVE=1 runs only provider-staging-live (below); every other
   # pipeline runs this job as before.
   rules:
-    - if: $PROVIDER_STAGING_LIVE != "1"
+    - if: $CI_PIPELINE_SOURCE != "api" || $PROVIDER_STAGING_LIVE != "1"
   cache:
     key:
       files:
@@ -36,6 +36,7 @@ test:
     - unzip -o "tofu_${TOFU_VERSION}_linux_amd64.zip" tofu -d "$(go env GOPATH)/bin"
     - chmod +x "$(go env GOPATH)/bin/tofu"
   script:
+    - sh ci/check-provider-staging-live.sh   # the live job's hardening lines must stay (it carries the staging API key)
     - test -z "$(gofmt -l $(git ls-files '*.go'))"   # tracked files only: the restored GOMODCACHE lives under .cache/
     - go vet ./...
     - go build ./...
@@ -53,6 +54,11 @@ test:
 # has the steps; the key is never exported, written to disk or printed, and the log is withheld if it contains it.
 # The staging API is reached on its in-cluster name, which the s3-staging NetworkPolicy admits from CI job pods only
 # (the gitlab-runner namespace). BAO_CA_PEM is the cluster CA, a public certificate, as a protected CI variable.
+#
+# Hardening (a pipeline variable can reach the job's environment): no cache (the Go module cache is built fresh and
+# verified, never shared with unprivileged branch jobs), no global variables inherited, the script refuses to run
+# when the pipeline carries proxy, Go, curl, loader or Terraform variables, and project setting "minimum role to use
+# pipeline variables" is Maintainer. ci/check-provider-staging-live.sh (run by `test`) keeps these lines in place.
 provider-staging-live:
   stage: test
   image: golang:1.25-bookworm
@@ -60,18 +66,13 @@ provider-staging-live:
   interruptible: false
   timeout: 30m
   resource_group: provider-staging-live
+  inherit:
+    variables: false
   id_tokens:
     BAO_ID_TOKEN:
       aud: openbao.virtscale.nl
-  cache:
-    key:
-      files:
-        - go.sum
-    paths:
-      - .cache/go-mod
   before_script:
-    - !reference [test, before_script]
-    - apt-get install -y --no-install-recommends jq
+    - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates jq
   script:
     - sh ci/provider-staging-live.sh
   artifacts:

@@ -311,10 +311,13 @@ started through the GitLab API on `main` with the variable `PROVIDER_STAGING_LIV
 click never runs it. The job logs in to OpenBao with the JWT role `provider-staging-live` (this project, protected
 `main`, API pipelines), reads the staging test org's key, runs the test above against
 `http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the token. It fails unless the log shows
-`--- PASS` for the test, withholds the log if it contains the key, and checks that no `tf-live-*` key is left in the org.
+`--- PASS` for the test, withholds the log if it contains the key, and checks that the org's key list holds no more
+`tf-live-*` keys after the run than before. It refuses to run when the pipeline carries proxy, Go, curl, loader or
+Terraform variables, uses its own pinned and checksum-verified `tofu`, and runs without a cache. Only users with the
+Maintainer role can start a pipeline with variables in this project.
 
 ```bash
-curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" \
+printf 'header = "PRIVATE-TOKEN: %s"\n' "$GITLAB_TOKEN" | curl -sS -K - -X POST -H "Content-Type: application/json" \
   -d '{"ref":"main","variables":[{"key":"PROVIDER_STAGING_LIVE","value":"1"}]}' \
   "$GITLAB_URL/api/v4/projects/225/pipeline"
 ```
