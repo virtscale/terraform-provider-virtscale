@@ -25,7 +25,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"net/url"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +137,17 @@ func runSshKeyLifecycleProof(t *testing.T, providerBlock string, destroyCheck re
 					if a["id"] == "" {
 						return fmt.Errorf("the imported state has no id")
 					}
+					// Read's own mapping, against what the test generated (ImportStateVerify only compares two states
+					// that both came from Read).
+					if a["name"] != key.name {
+						return fmt.Errorf("the imported state holds name %q, want %q", a["name"], key.name)
+					}
+					if a["key_type"] != "ssh-ed25519" {
+						return fmt.Errorf("the imported state holds key_type %q, want ssh-ed25519", a["key_type"])
+					}
+					if a["fingerprint"] != key.fingerprint {
+						return fmt.Errorf("the imported state holds fingerprint %q, want %q", a["fingerprint"], key.fingerprint)
+					}
 					return nil
 				},
 			},
@@ -165,7 +178,31 @@ func liveSshKeyEnv(t *testing.T) (endpoint, apiKey, org string) {
 	if len(missing) > 0 {
 		t.Skipf("this live acceptance test talks to a real VirtScale API and is skipped: set %s", strings.Join(missing, ", "))
 	}
+	// A requested live run must not turn into a silent "ok": testAccPreCheck skips when tofu is absent.
+	if _, err := exec.LookPath("tofu"); err != nil && os.Getenv("TF_ACC_TERRAFORM_PATH") == "" {
+		t.Fatal("a live run was requested (VIRTSCALE_LIVE=1) but tofu is not on PATH and TF_ACC_TERRAFORM_PATH is not set")
+	}
+	if err := refuseProductionEndpoint(endpoint, os.Getenv("VIRTSCALE_LIVE_ALLOW_PRODUCTION") == "1"); err != nil {
+		t.Fatal(err)
+	}
 	return endpoint, apiKey, org
+}
+
+// productionHost is the provider's default endpoint host: a live run against it is refused unless
+// the caller says so, because the test creates (and deletes) a real key there.
+const productionHost = "api.virtscale.nl"
+
+// refuseProductionEndpoint returns an error when endpoint names the production API and the caller
+// has not set VIRTSCALE_LIVE_ALLOW_PRODUCTION=1.
+func refuseProductionEndpoint(endpoint string, allow bool) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("VIRTSCALE_ENDPOINT is not a URL: %v", err)
+	}
+	if strings.EqualFold(u.Hostname(), productionHost) && !allow {
+		return fmt.Errorf("VIRTSCALE_ENDPOINT is the production API; the live test creates a key there: set VIRTSCALE_LIVE_ALLOW_PRODUCTION=1 to run it anyway")
+	}
+	return nil
 }
 
 // runLiveSshKeyProof runs the lifecycle proof with an empty provider block, so
@@ -245,4 +282,26 @@ func TestAccSshKeyResource_LiveProofBodyAgainstTheFake(t *testing.T) {
 	t.Setenv("VIRTSCALE_ORGANIZATION", fake.org)
 	t.Setenv("VIRTSCALE_ENDPOINT", fake.URL())
 	runLiveSshKeyProof(t, fake.URL(), fake.apiKey, fake.org)
+}
+
+// TestRefuseProductionEndpoint: the live test refuses the production API unless told otherwise, and
+// accepts any other host (the staging API is cluster-internal).
+func TestRefuseProductionEndpoint(t *testing.T) {
+	cases := []struct {
+		endpoint string
+		allow    bool
+		wantErr  bool
+	}{
+		{"https://api.virtscale.nl", false, true},
+		{"https://API.virtscale.nl:443/", false, true},
+		{"https://api.virtscale.nl", true, false},
+		{"http://s3-staging-customer-api.s3-staging.svc.cluster.local", false, false},
+		{"http://127.0.0.1:8080", false, false},
+	}
+	for _, c := range cases {
+		err := refuseProductionEndpoint(c.endpoint, c.allow)
+		if (err != nil) != c.wantErr {
+			t.Errorf("refuseProductionEndpoint(%q, allow=%v) = %v, want error: %v", c.endpoint, c.allow, err, c.wantErr)
+		}
+	}
 }

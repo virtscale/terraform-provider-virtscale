@@ -289,9 +289,17 @@ on for that API, and the test creates one key named `tf-live-<random>` and delet
 is cluster-internal, so run it from somewhere that reaches the endpoint.
 
 ```bash
-TF_ACC=1 VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDPOINT=... \
+TF_ACC=1 \
+TF_ACC_TERRAFORM_PATH=$(command -v tofu) \
+TF_ACC_PROVIDER_NAMESPACE=virtscale \
+TF_ACC_PROVIDER_HOST=registry.terraform.io \
+VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDPOINT=... \
 go test ./internal/provider -run TestLiveSshKeyResource -count=1 -v
 ```
+
+The run counts only when `-v` shows `--- PASS: TestLiveSshKeyResource_LifecycleProof` (a skip prints `ok` too). The test
+refuses the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fails at once, instead of skipping,
+when a live run is requested and `tofu` cannot be found.
 
 ## Links
 
