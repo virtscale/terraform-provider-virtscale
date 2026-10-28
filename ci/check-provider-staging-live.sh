@@ -69,8 +69,13 @@ fi
 if grep -vE '^[[:space:]]*#' "$script" | grep -qE '(^|[[:space:]])(set -x|set -o xtrace|env|printenv|declare -p)([[:space:]]|$)'; then
   bad "a command that can print the environment"
 fi
-# The job: no cache, no before_script, no inherited global variables, started as /bin/sh ci/provider-staging-live.sh.
+# The job: defined once (a duplicate key silently wins in YAML), no cache, no before_script/after_script, no job-level
+# variables, no inherited global variables, one artifact path, started as /bin/sh ci/provider-staging-live.sh.
+[ "$(grep -c '^provider-staging-live:' .gitlab-ci.yml)" -eq 1 ] || bad "provider-staging-live must be defined exactly once in .gitlab-ci.yml"
 job=$(awk '/^provider-staging-live:/ { f = 1; next } /^[A-Za-z.]/ { f = 0 } f' .gitlab-ci.yml)
+printf '%s\n' "$job" | grep -qE '^  after_script:' && bad "provider-staging-live must not have an after_script"
+printf '%s\n' "$job" | grep -qE '^  variables:' && bad "provider-staging-live must not set job-level variables"
+[ "$(printf '%s\n' "$job" | awk '/^  artifacts:$/ { f = 1; next } /^  [a-z_]+:/ { f = 0 } f && /^      - /' | tr -d ' ')" = "-provider-staging-live.log" ] || bad "provider-staging-live may publish only provider-staging-live.log"
 printf '%s\n' "$job" | grep -qE '^  cache:' && bad "provider-staging-live must not use a cache"
 printf '%s\n' "$job" | grep -qE '^  before_script:' && bad "provider-staging-live must not have a before_script (it runs before the allowlist)"
 printf '%s\n' "$job" | grep -qE '^  (default|extends|trigger):' && bad "provider-staging-live must not extend or default another job"

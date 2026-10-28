@@ -11,7 +11,8 @@
 # and its SHA-256.
 #
 # Stage B, in the clean environment:
-#   1. check the pipeline is the one this job is for, write the id_token to a 0600 file and unset it,
+#   1. check the pipeline is the one this job is for, write the id_token to a 0600 file and unset it (the file is
+#      deleted right after the login),
 #   2. install jq/unzip, the pinned tofu (checksum verified), fetch and verify the Go modules: no secret exists yet,
 #   3. log in to OpenBao with the id_token (JWT role provider-staging-live, terraform-openbao: this project,
 #      protected main, API pipelines only, token 300 s / 4 uses),
@@ -19,7 +20,7 @@
 #      shell variables, and revoke the OpenBao token,
 #   5. run TestLiveSshKeyResource_LifecycleProof with the key in that one process's environment and the Go module
 #      proxy switched off: apply, an empty second plan, import by id, destroy,
-#   6. withhold the test log if it contains the key or the id_token, require `--- PASS` for the test, and count the
+#   6. withhold the test log if it contains the key, require `--- PASS` for the test, and count the
 #      tf-live-* keys the org holds before and after (the run must leave none behind).
 #
 # Not coverable here: the id_token is also in the environment of the runner's own shell, which any process of the
@@ -111,10 +112,12 @@ chmod +x "$work/bin/tofu"
 go mod download || fail "go mod download failed"
 go mod verify >/dev/null || fail "go mod verify failed"
 
-# 3. Login. The id_token goes to jq from its file and to curl on stdin, never through argv or the environment.
+# 3. Login. The id_token goes to jq from its file and to curl on stdin, never through argv or the environment; the
+# file is deleted as soon as the login has been sent, before any code from the module cache runs.
 code=$(jq -n --arg role "$BAO_ROLE" --rawfile jwt "$work/idtoken" '{role: $role, jwt: $jwt}' |
   curl_safe -sS --max-time 30 --cacert "$BAO_CA_FILE" -X POST -H 'Content-Type: application/json' --data @- \
     -o "$work/login.json" -w '%{http_code}' "$BAO_ADDR/v1/auth/jwt/login") || code=000
+rm -f "$work/idtoken"
 [ "$code" = 200 ] || fail "OpenBao login answered HTTP $code (the status only: the body can echo the claims)"
 token=$(jq -r '.auth.client_token // empty' "$work/login.json")
 rm -f "$work/login.json"
@@ -164,9 +167,10 @@ TF_ACC=1 \
   GOPROXY=off \
   go test ./internal/provider -run "^${TEST_NAME}\$" -count=1 -v >"$work/go-test.log" 2>&1 || rc=$?
 
-# 6. Withhold the log if it holds the key or the id_token (grep reads the key on stdin, the id_token from its 0600 file).
-if printf '%s' "$api_key" | grep -qF -f - "$work/go-test.log" || grep -qF -f "$work/idtoken" "$work/go-test.log"; then
-  fail "a secret appears in the test output: the log is withheld"
+# 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
+# it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
+if printf '%s' "$api_key" | grep -qF -f - "$work/go-test.log"; then
+  fail "the API key appears in the test output: the log is withheld"
 fi
 cat "$work/go-test.log"
 cp "$work/go-test.log" provider-staging-live.log
