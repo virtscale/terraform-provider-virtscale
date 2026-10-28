@@ -26,6 +26,7 @@ need "the fixed PATH literal" "PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/b
 need "the marker argument" '/bin/sh "$0" --clean-env'
 need "the marker test" '[ "${1:-}" != "--clean-env" ]'
 # Stage B: the toolchain from literals, the id_token out of the environment before any toolchain command.
+need "the pinned tofu on PATH (the test's pre-check skips without it)" 'PATH="$work/bin:$PATH"'
 need "CGO off" "CGO_ENABLED=0"
 need "local toolchain" "GOTOOLCHAIN=local"
 need "no go env file" "GOENV=off"

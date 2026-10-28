@@ -87,6 +87,9 @@ unset BAO_ID_TOKEN
 
 # The toolchain environment is set here, from literals.
 mkdir -p "$work/home" "$work/bin"
+# The acceptance tests' pre-check skips when `tofu` is not on PATH (TF_ACC_TERRAFORM_PATH alone is not enough), so the
+# pinned tofu goes in front of the fixed PATH.
+PATH="$work/bin:$PATH"
 HOME="$work/home"
 GOPATH="$work/gopath"
 GOMODCACHE="$work/gomod"
@@ -98,7 +101,7 @@ GOFLAGS=-mod=readonly
 GOPROXY=https://proxy.golang.org
 GOSUMDB=sum.golang.org
 NO_PROXY='*'
-export HOME GOPATH GOMODCACHE GOCACHE CGO_ENABLED GOTOOLCHAIN GOENV GOFLAGS GOPROXY GOSUMDB NO_PROXY
+export PATH HOME GOPATH GOMODCACHE GOCACHE CGO_ENABLED GOTOOLCHAIN GOENV GOFLAGS GOPROXY GOSUMDB NO_PROXY
 
 # 2. Tools and modules, before any secret exists.
 if ! { apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates jq; } >"$work/apt.log" 2>&1; then
