@@ -298,7 +298,7 @@ resource "virtscale_instance" "test" {
 // D4). The old TestAccInstanceResource_ImageDrift asserted the opposite of
 // what this test asserts: it required ExpectNonEmptyPlan immediately after
 // apply, treating the fake's "alias-" image affordance (whose echoed
-// glance_id diverges from the submitted image id) as drift that forces a
+// image_id diverges from the submitted image id) as drift that forces a
 // replace. That fix traded Finding 1's apply-time crash for a perpetual
 // replace loop -- accepting the replace never converged, because the new
 // create hit the same systematic divergence every time. Per D4, image is a
@@ -311,7 +311,7 @@ resource "virtscale_instance" "test" {
 // loop cannot recur. image_name -- new in this fix -- carries what the API
 // actually reports running, unaffected by any of this. Step 3 confirms
 // import still works for this same divergent image: per D4, import is the
-// one case where Read does seed image, from vm.Image.GlanceID rather than
+// one case where Read does seed image, from vm.Image.ImageID rather than
 // the originally configured value, since there is no prior state to
 // preserve -- so image is expected to differ after import for this
 // specific, aliased resource and is ignored here (only here;
