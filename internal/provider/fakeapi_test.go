@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -97,7 +98,17 @@ type fakeAPI struct {
 
 	// calls records "METHOD route" for every request that reached a route.
 	calls []string
+	// requestedPaths records the URL path of every request that arrived at
+	// handle(), unknown routes and requests an injected fault answered included.
+	requestedPaths []string
+	// patchCalls records every PATCH that reached the instance route, as it
+	// arrived and before any gate.
+	patchCalls []patchCall
 }
+
+// patchCall is one PATCH that reached compute/instances/{vm_id}: the headers it
+// carried and the body it sent, recorded before any gate runs.
+type patchCall struct{ ID, IfMatch, IdempotencyKey, Body string }
 
 // --- wire types (customer-v1.json) ---------------------------------------
 
@@ -112,6 +123,8 @@ type wireVmOut struct {
 	RegionID          string         `json:"region_id"`
 	Name              string         `json:"name"`
 	FQDN              *string        `json:"fqdn"`
+	Hostname          *string        `json:"hostname"`
+	InstanceType      *string        `json:"instance_type"`
 	Image             wireImageRef   `json:"image"`
 	VCPUs             int            `json:"vcpus"`
 	MemoryMB          int            `json:"memory_mb"`
@@ -120,7 +133,11 @@ type wireVmOut struct {
 	WorkloadType      string         `json:"workload_type"`
 	NetworkProfileID  string         `json:"network_profile_id"`
 	State             string         `json:"state"`
+	Status            string         `json:"status"`
 	DesiredState      string         `json:"desired_state"`
+	PrivateIP         *string        `json:"private_ip"`
+	Addresses         []string       `json:"addresses"`
+	Generation        int64          `json:"generation"`
 	ErrorClass        *string        `json:"error_class"`
 	ErrorDetail       *string        `json:"error_detail"`
 	ObservedStatus    *string        `json:"observed_status"`
@@ -211,12 +228,14 @@ type fakeFault struct {
 	remaining int
 }
 
-// idemRecord is one stored Idempotency-Key answer.
+// idemRecord is one stored Idempotency-Key answer. location is the create's
+// Location header; etag is the PATCH answer's ETag (the create leaves it empty).
 type idemRecord struct {
 	payloadHash string
 	status      int
 	body        []byte
 	location    string
+	etag        string
 }
 
 // fakePublicIP is one public IP row.
@@ -531,6 +550,78 @@ func (f *fakeAPI) CallCount(route string) int {
 	return n
 }
 
+// PatchCalls lists every PATCH that reached the instance route, in arrival
+// order, copied: it is recorded before any gate, so refused attempts are there
+// too.
+func (f *fakeAPI) PatchCalls() []patchCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]patchCall(nil), f.patchCalls...)
+}
+
+// Generation reports the generation of vm id, or 0 when there is none.
+func (f *fakeAPI) Generation(id string) int64 {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vm, ok := f.vms[id]; ok {
+		return vm.Generation
+	}
+	return 0
+}
+
+// Hostname reports the hostname of vm id, or "" when it is null or unknown.
+func (f *fakeAPI) Hostname(id string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vm, ok := f.vms[id]; ok && vm.Hostname != nil {
+		return *vm.Hostname
+	}
+	return ""
+}
+
+// RequestedPaths lists the URL path of every request that arrived at handle(),
+// in order, unknown routes and requests answered by an injected fault included.
+func (f *fakeAPI) RequestedPaths() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.requestedPaths...)
+}
+
+// SeedForeignInstance inserts a live vm owned by ANOTHER organization
+// (testOtherOrg) that holds hostname. It is not visible to f.org's routes and
+// never counts as a holder of hostname in f.org, so a create or patch in f.org
+// may still take it.
+func (f *fakeAPI) SeedForeignInstance(hostname string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vmSeq++
+	id := fakeUUID(1, f.vmSeq)
+	h := hostname
+	now := time.Now().UTC()
+	f.vms[id] = &fakeVm{wireVmOut: wireVmOut{
+		ID:               id,
+		OrgID:            testOtherOrg,
+		RegionID:         "gro",
+		Name:             "foreign-instance",
+		Hostname:         &h,
+		Image:            wireImageRef{ImageID: "image-1", Name: "image-1"},
+		VCPUs:            1,
+		MemoryMB:         1024,
+		DiskGB:           10,
+		StoragePoolID:    "pool-1",
+		WorkloadType:     "customer",
+		NetworkProfileID: "net-1",
+		State:            "running",
+		Status:           "running",
+		DesiredState:     "running",
+		Addresses:        []string{},
+		Generation:       1,
+		AllowedActions:   allVmActions,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}}
+}
+
 // mutating filters calls down to those that can change something: anything
 // but a GET.
 func mutating(calls []string) []string {
@@ -702,10 +793,10 @@ func (rc *reqCtx) invalid(errs ...wireFieldError) {
 func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	parts := strings.Split(rest, "/")
 	switch {
-	case rest == "compute/vms":
-		key = "compute/vms"
-	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "vms":
-		key, param, id = "compute/vms/{vm_id}", "vm_id", parts[2]
+	case rest == "compute/instances":
+		key = "compute/instances"
+	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "instances":
+		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
 	case rest == "compute/public-ips":
@@ -722,7 +813,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		return "", "", "", false
 	}
 	switch method + " " + key {
-	case "POST compute/vms", "GET compute/vms/{vm_id}", "DELETE compute/vms/{vm_id}",
+	case "POST compute/instances", "GET compute/instances/{vm_id}",
+		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
 		"GET compute/images",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
@@ -735,6 +827,9 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 
 func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 	rc := f.newReqCtx(w, r)
+	f.mu.Lock()
+	f.requestedPaths = append(f.requestedPaths, r.URL.Path)
+	f.mu.Unlock()
 	if fault := f.takeFault(r); fault != nil {
 		if fault.after {
 			f.serve(&reqCtx{f: f, w: httptest.NewRecorder(), r: r, rid: rc.rid})
@@ -748,9 +843,10 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 // routePermissions is ROUTE_PERMISSIONS (permissions.py) restricted to the
 // routes this fake serves.
 var routePermissions = map[string]string{
-	"POST compute/vms":                                    "compute.instance.create",
-	"GET compute/vms/{vm_id}":                             "compute.instance.read",
-	"DELETE compute/vms/{vm_id}":                          "compute.instance.delete",
+	"POST compute/instances":                              "compute.instance.create",
+	"GET compute/instances/{vm_id}":                       "compute.instance.read",
+	"DELETE compute/instances/{vm_id}":                    "compute.instance.delete",
+	"PATCH compute/instances/{vm_id}":                     "compute.instance.update",
 	"GET compute/images":                                  "compute.instance.list",
 	"GET compute/public-ips":                              "edge.public_ip.read",
 	"POST compute/public-ips":                             "edge.public_ip.allocate",
@@ -858,12 +954,14 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 	}
 
 	switch route {
-	case "POST compute/vms":
+	case "POST compute/instances":
 		f.createVm(rc)
-	case "GET compute/vms/{vm_id}":
+	case "GET compute/instances/{vm_id}":
 		f.getVm(rc, id)
-	case "DELETE compute/vms/{vm_id}":
+	case "DELETE compute/instances/{vm_id}":
 		f.deleteVm(rc, id)
+	case "PATCH compute/instances/{vm_id}":
+		f.patchVm(rc, id)
 	case "POST compute/public-ips":
 		f.createPublicIp(rc)
 	case "GET compute/public-ips":
@@ -1013,6 +1111,25 @@ func (b *bodyCheck) integer(name string, required bool, ge int64) int {
 	return int(n)
 }
 
+// vmHostnamePattern is the customer API's hostname rule: a dotted sequence of
+// DNS labels. The create and patch bodies are checked against it after the 253
+// character ceiling.
+const vmHostnamePattern = `^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`
+
+var vmHostnameRE = regexp.MustCompile(vmHostnamePattern)
+
+// checkHostname records the length, then the pattern, error for a hostname,
+// with the wording the API's validator uses.
+func (b *bodyCheck) checkHostname(field, value string) {
+	if len([]rune(value)) > 253 {
+		b.fail(field, "String should have at most 253 characters")
+		return
+	}
+	if !vmHostnameRE.MatchString(value) {
+		b.fail(field, fmt.Sprintf("String should match pattern '%s'", vmHostnamePattern))
+	}
+}
+
 func (b *bodyCheck) strList(name string) []string {
 	raw, ok := b.present(name, false)
 	if !ok {
@@ -1042,8 +1159,12 @@ func (b *bodyCheck) finish() []wireFieldError {
 
 // --- VM handlers -----------------------------------------------------------
 
+// vmCreateIn holds the create body. Hostname and InstanceType are plain
+// strings -- empty meaning not given -- on purpose: the idempotency digest is
+// fmt.Sprintf("%+v", req), which would print a pointer as an address.
 type vmCreateIn struct {
 	Name, Image, StoragePool, Region, NetworkProfile, WorkloadType string
+	Hostname, InstanceType                                         string
 	VCPUs, MemoryMB, DiskGB                                        int
 	SSHKeys                                                        []string
 	UserData                                                       *string
@@ -1061,13 +1182,26 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 		Region:         b.str("region", true, 0, 0),
 		NetworkProfile: b.str("network_profile", true, 0, 0),
 		WorkloadType:   b.str("workload_type", false, 0, 0),
+		Hostname:       strOrEmpty(b.nullableStr("hostname")),
+		InstanceType:   strOrEmpty(b.nullableStr("instance_type")),
 		SSHKeys:        b.strList("ssh_keys"),
 		UserData:       b.nullableStr("user_data"),
 	}
 	if in.WorkloadType == "" {
 		in.WorkloadType = "customer"
 	}
+	if in.Hostname != "" {
+		b.checkHostname("hostname", in.Hostname)
+	}
 	return in, b.finish()
+}
+
+// strOrEmpty reads an optional string: absent and null both mean "".
+func strOrEmpty(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (f *fakeAPI) newOperation(typ, resourceType, resourceID string, now time.Time) wireOperationRef {
@@ -1172,6 +1306,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			return
 		}
 	}
+	if req.Hostname != "" && f.hostnameTaken(req.Hostname, "") {
+		rc.conflict("hostname_taken", hostnameTakenDetail(req.Hostname))
+		return
+	}
 
 	f.createCount++
 	f.vmSeq++
@@ -1189,12 +1327,29 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		imageID = req.Image + "-image-uuid"
 	}
 
+	var hostname *string
+	if req.Hostname != "" {
+		h := req.Hostname
+		hostname = &h
+	}
+	var instanceType *string
+	switch {
+	case req.InstanceType != "":
+		it := req.InstanceType
+		instanceType = &it
+	case strings.HasPrefix(name, "typed-"):
+		it := "general.small"
+		instanceType = &it
+	}
+
 	vm := &fakeVm{
 		wireVmOut: wireVmOut{
 			ID:               id,
 			OrgID:            f.org,
 			RegionID:         req.Region,
 			Name:             name,
+			Hostname:         hostname,
+			InstanceType:     instanceType,
 			Image:            wireImageRef{ImageID: imageID, Name: req.Image},
 			VCPUs:            req.VCPUs,
 			MemoryMB:         req.MemoryMB,
@@ -1203,7 +1358,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			WorkloadType:     "customer",
 			NetworkProfileID: req.NetworkProfile,
 			State:            "pending",
+			Status:           "pending",
 			DesiredState:     "running",
+			Addresses:        []string{},
+			Generation:       1,
 			SSHKeyNames:      req.SSHKeys,
 			AllowedActions:   allVmActions,
 			CreatedAt:        now,
@@ -1225,7 +1383,26 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			location:    location,
 		}
 	}
-	rc.json(http.StatusAccepted, payload, "Location", location)
+	rc.json(http.StatusAccepted, payload, "Location", location, "ETag", generationETag(vm.Generation))
+}
+
+// hostnameTaken reports whether a live instance of f.org other than exceptID
+// holds hostname. A row of another organization never counts as a holder.
+// f.mu must be held.
+func (f *fakeAPI) hostnameTaken(hostname, exceptID string) bool {
+	for id, vm := range f.vms {
+		if id == exceptID || vm.OrgID != f.org || vm.deletedAt != nil || vm.Hostname == nil {
+			continue
+		}
+		if *vm.Hostname == hostname {
+			return true
+		}
+	}
+	return false
+}
+
+func hostnameTakenDetail(hostname string) string {
+	return fmt.Sprintf("the hostname '%s' is already in use by another instance of this organization", hostname)
 }
 
 // getVm: "a foreign row and a soft-deleted row both read as absent"
@@ -1246,8 +1423,12 @@ func (f *fakeAPI) getVm(rc *reqCtx, id string) {
 		rc.notFound("vm")
 		return
 	}
-	rc.json(http.StatusOK, vm.wireVmOut)
+	rc.json(http.StatusOK, vm.wireVmOut, "ETag", generationETag(vm.Generation))
 }
+
+// generationETag is the ETag every GET, the create answer and the patch answer
+// carry: the generation, in double quotes.
+func generationETag(n int64) string { return fmt.Sprintf("\"%d\"", n) }
 
 // advance moves vm one step the way the executor does: pending ->
 // provisioning -> running (or -> error, for a name starting with "fail-");
@@ -1281,61 +1462,51 @@ func (f *fakeAPI) advance(vm *fakeVm) {
 			vm.State = "running"
 			f.nextOctet++
 			addr := fmt.Sprintf("10.128.3.%d", f.nextOctet)
-			entry := map[string]any{
-				"addr":                    addr,
+			// observed_status and observed_addresses are still published, as
+			// the real API still publishes them, but they are decoys now: a
+			// client that keeps reading them reports the wrong values.
+			active := "ACTIVE"
+			vm.ObservedStatus = &active
+			vm.ObservedAddresses = map[string]any{fakeNetwork: []any{map[string]any{
+				"addr":                    fmt.Sprintf("198.51.100.%d", f.nextOctet),
 				"version":                 4,
 				"OS-EXT-IPS:type":         "fixed",
 				"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
-			}
-			switch {
-			case strings.HasPrefix(vm.Name, "notype-"):
-				// The contract only promises addr; OS-EXT-IPS is a Nova extension.
-				entry = map[string]any{"addr": addr, "version": 4}
-			case strings.HasPrefix(vm.Name, "bare-"):
-				entry = map[string]any{"addr": addr}
-			}
-			vm.ObservedAddresses = map[string]any{fakeNetwork: []any{entry}}
+			}}}
 			observed := time.Now().UTC()
 			vm.ObservedAt = &observed
+			if strings.HasPrefix(vm.Name, "noip-") {
+				vm.PrivateIP = nil
+				vm.Addresses = []string{}
+			} else {
+				vm.PrivateIP = &addr
+				vm.Addresses = []string{addr}
+			}
 		}
 	}
+	vm.Status = vm.State
 	vm.UpdatedAt = time.Now().UTC()
 }
 
 // fakeNetwork is the one network the fake's vms sit on.
 const fakeNetwork = "gro-tenant-default"
 
-// attachFloating lists an associated public IP in the vm's addresses, FIRST,
-// as a floating entry: Nova reports it there next to the fixed address, and a
-// reader that takes the first IPv4 would mistake it for the private one.
+// attachFloating PREPENDS an associated public IP to the vm's addresses, so
+// addresses[0] is the public one while private_ip keeps the private one. It no
+// longer touches observed_addresses: those are decoys now.
 func attachFloating(vm *fakeVm, addr string) {
-	if vm.ObservedAddresses == nil {
-		return
-	}
-	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
-	floating := map[string]any{
-		"addr":                    addr,
-		"version":                 4,
-		"OS-EXT-IPS:type":         "floating",
-		"OS-EXT-IPS-MAC:mac_addr": "fa:16:3e:00:00:00",
-	}
-	vm.ObservedAddresses[fakeNetwork] = append([]any{floating}, list...)
+	vm.Addresses = append([]string{addr}, vm.Addresses...)
 }
 
-// detachFloating removes the floating entry for addr again.
+// detachFloating removes addr from the vm's addresses again.
 func detachFloating(vm *fakeVm, addr string) {
-	if vm.ObservedAddresses == nil {
-		return
-	}
-	list, _ := vm.ObservedAddresses[fakeNetwork].([]any)
-	kept := make([]any, 0, len(list))
-	for _, e := range list {
-		if m, ok := e.(map[string]any); ok && m["addr"] == addr && m["OS-EXT-IPS:type"] == "floating" {
-			continue
+	kept := make([]string, 0, len(vm.Addresses))
+	for _, a := range vm.Addresses {
+		if a != addr {
+			kept = append(kept, a)
 		}
-		kept = append(kept, e)
 	}
-	vm.ObservedAddresses[fakeNetwork] = kept
+	vm.Addresses = kept
 }
 
 // deleteVm declares desired_state=deleted and queues the teardown; state is
@@ -1352,7 +1523,7 @@ func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	// unknown or gone one falls through to the 404 below.
 	if ok && vm.deletedAt == nil && vm.Protected {
 		rc.conflict("vm_protected", fmt.Sprintf("this VM is protected against deletion; an owner of this "+
-			"organization has to switch that off first, with PUT /v1/orgs/%s/compute/vms/%s/protection", f.org, id))
+			"organization has to switch that off first, with PUT /v1/orgs/%s/compute/instances/%s/protection", f.org, id))
 		return
 	}
 	if !ok || vm.deletedAt != nil {
@@ -1367,11 +1538,160 @@ func (f *fakeAPI) deleteVm(rc *reqCtx, id string) {
 	vm.DesiredState = "deleted"
 	vm.deletingLeft = f.deleteSteps
 	vm.inFlight = true
+	vm.Generation++
 	vm.UpdatedAt = time.Now().UTC()
 
 	op := f.newOperation("vm.delete", "vm", id, time.Now().UTC())
 	rc.json(http.StatusAccepted, map[string]any{"vm": vm.wireVmOut, "operation": op},
 		"Location", f.operationLocation(op))
+}
+
+// vmPatchIn is the PATCH body: hostname is required and may be null (which
+// clears it).
+type vmPatchIn struct {
+	Hostname *string
+}
+
+// decodeVmPatch reads {"hostname": "<fqdn>"} or {"hostname": null}; hostname is
+// required and nothing else is accepted (the body decoder is strict).
+func decodeVmPatch(r io.Reader) (vmPatchIn, []wireFieldError) {
+	b := newBodyCheck(r)
+	in := vmPatchIn{}
+	if raw, ok := b.present("hostname", true); ok {
+		if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+			in.Hostname = nil
+		} else {
+			var s string
+			if err := json.Unmarshal(raw, &s); err != nil {
+				b.fail("hostname", "Input should be a valid string")
+			} else {
+				in.Hostname = &s
+				b.checkHostname("hostname", s)
+			}
+		}
+	}
+	return in, b.finish()
+}
+
+// ifMatchRE is a well-formed If-Match: a double-quoted integer.
+var ifMatchRE = regexp.MustCompile(`^"(\d+)"$`)
+
+// patchDigest is the PATCH Idempotency-Key digest: the instance id and the
+// hostname value, null differing from any string.
+func patchDigest(id string, hostname *string) string {
+	h, has := "", false
+	if hostname != nil {
+		h, has = *hostname, true
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%+v", struct {
+		InstanceID  string
+		Hostname    string
+		HasHostname bool
+	}{id, h, has})))
+	return hex.EncodeToString(sum[:])
+}
+
+// patchVm is PATCH /compute/instances/{id}: it sets or clears the hostname,
+// gated in the API's order -- body, liveness, Idempotency-Key replay, If-Match,
+// the hostname's uniqueness -- and answers the bare VmOut at its new
+// generation, with the ETag header.
+func (f *fakeAPI) patchVm(rc *reqCtx, id string) {
+	raw, _ := io.ReadAll(rc.r.Body)
+
+	f.mu.Lock()
+	f.patchCalls = append(f.patchCalls, patchCall{
+		ID:             id,
+		IfMatch:        rc.r.Header.Get("If-Match"),
+		IdempotencyKey: rc.r.Header.Get("Idempotency-Key"),
+		Body:           string(raw),
+	})
+	f.mu.Unlock()
+
+	in, errs := decodeVmPatch(bytes.NewReader(raw))
+	if len(errs) > 0 {
+		rc.invalid(errs...)
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	vm, ok := f.vms[id]
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+
+	key := rc.r.Header.Get("Idempotency-Key")
+	var digest string
+	if key != "" {
+		f.idemKeysSeen = append(f.idemKeysSeen, key)
+		digest = patchDigest(id, in.Hostname)
+		if rec, ok := f.idem[key]; ok {
+			if f.inProgressLeft > 0 {
+				f.inProgressLeft--
+				rc.inProgress()
+				return
+			}
+			if rec.payloadHash != digest {
+				rc.conflict("idempotency_key_reused", "this Idempotency-Key was already used with a different request body")
+				return
+			}
+			// The replay comes before If-Match: the retry of a request that
+			// already succeeded gets its first answer back, stale condition or
+			// not.
+			rc.raw(rec.status, rec.body, "ETag", rec.etag)
+			return
+		}
+	}
+
+	ifMatch := rc.r.Header.Get("If-Match")
+	if ifMatch == "" {
+		rc.problem(http.StatusPreconditionRequired, "precondition_required", "Precondition required",
+			"this request needs an If-Match header carrying the instance's generation")
+		return
+	}
+	m := ifMatchRE.FindStringSubmatch(ifMatch)
+	if m == nil {
+		rc.invalid(wireFieldError{Field: "If-Match", Message: `must be a quoted generation, for example "3"`})
+		return
+	}
+	sent, _ := strconv.ParseInt(m[1], 10, 64)
+	if sent != vm.Generation {
+		rc.w.Header().Set("ETag", generationETag(vm.Generation))
+		rc.problem(http.StatusPreconditionFailed, "generation_mismatch", "Precondition failed",
+			fmt.Sprintf("the instance is at generation %d, not %d; read it again and retry", vm.Generation, sent))
+		return
+	}
+
+	if in.Hostname != nil && f.hostnameTaken(*in.Hostname, id) {
+		rc.conflict("hostname_taken", hostnameTakenDetail(*in.Hostname))
+		return
+	}
+
+	current := strOrEmpty(vm.Hostname)
+	next := strOrEmpty(in.Hostname)
+	if next != current {
+		vm.Generation++
+		if in.Hostname == nil {
+			vm.Hostname = nil
+		} else {
+			h := next
+			vm.Hostname = &h
+		}
+	}
+	vm.UpdatedAt = time.Now().UTC()
+
+	if key != "" {
+		body, _ := json.Marshal(vm.wireVmOut)
+		f.idem[key] = &idemRecord{
+			payloadHash: digest,
+			status:      http.StatusOK,
+			body:        append(body, '\n'),
+			etag:        generationETag(vm.Generation),
+		}
+	}
+	rc.json(http.StatusOK, vm.wireVmOut, "ETag", generationETag(vm.Generation))
 }
 
 // --- Public IP handlers ------------------------------------------------
@@ -1922,7 +2242,7 @@ func (f *fakeAPI) listImages(rc *reqCtx) {
 func TestFakeAPI_AuthRejectsWrongBearer(t *testing.T) {
 	f := newFakeAPI(t, "good-key", testOrgID)
 
-	req, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/"+testOrgID+"/compute/vms/"+testSomeUUID, nil)
+	req, err := http.NewRequest(http.MethodGet, f.URL()+"/v1/orgs/"+testOrgID+"/compute/instances/"+testSomeUUID, nil)
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -1960,7 +2280,7 @@ func TestFakeAPI_DuplicateLiveNameConflicts(t *testing.T) {
 
 func doCreate(t *testing.T, f *fakeAPI, body string) int {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, f.URL()+"/v1/orgs/"+f.org+"/compute/vms", strings.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, f.URL()+"/v1/orgs/"+f.org+"/compute/instances", strings.NewReader(body))
 	if err != nil {
 		t.Fatalf("build request: %v", err)
 	}
@@ -1996,10 +2316,11 @@ const (
 // sees is exactly this.
 var (
 	specVmOutKeys = []string{
-		"id", "org_id", "region_id", "name", "fqdn", "image", "vcpus", "memory_mb", "disk_gb",
-		"storage_pool_id", "workload_type", "network_profile_id", "state", "desired_state",
-		"error_class", "error_detail", "observed_status", "observed_addresses", "observed_at",
-		"ssh_key_names", "user_data_present", "protected", "allowed_actions", "created_at", "updated_at",
+		"id", "org_id", "region_id", "name", "fqdn", "hostname", "instance_type", "image", "vcpus",
+		"memory_mb", "disk_gb", "storage_pool_id", "workload_type", "network_profile_id", "state",
+		"status", "desired_state", "private_ip", "addresses", "generation", "error_class",
+		"error_detail", "observed_status", "observed_addresses", "observed_at", "ssh_key_names",
+		"user_data_present", "protected", "allowed_actions", "created_at", "updated_at",
 	}
 	specOperationRefKeys = []string{
 		"id", "type", "state", "resource_type", "resource_id", "attempt", "max_attempts",
@@ -2075,7 +2396,7 @@ func wantKeys(t *testing.T, what string, got map[string]any, want []string) {
 	}
 }
 
-func vmsPath(org string) string { return "/v1/orgs/" + org + "/compute/vms" }
+func vmsPath(org string) string { return "/v1/orgs/" + org + "/compute/instances" }
 
 func TestFakeAPI_ProblemEnvelopeMatchesSpec(t *testing.T) {
 	f := newFakeAPI(t, "good-key", testOrgID)
@@ -2207,7 +2528,7 @@ func TestFakeAPI_RequestBodiesAreStrict(t *testing.T) {
 func TestFakeAPI_ResponseShapesMatchSpec(t *testing.T) {
 	f := newFakeAPI(t, "good-key", testOrgID)
 
-	// POST /compute/vms -> 202 {vm, operation} with a Location header.
+	// POST /compute/instances -> 202 {vm, operation} with a Location header.
 	status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS)
 	if status != http.StatusAccepted {
 		t.Fatalf("create: status = %d, want 202 (%s)", status, body)
@@ -2235,7 +2556,7 @@ func TestFakeAPI_ResponseShapesMatchSpec(t *testing.T) {
 		t.Errorf("vm state/desired/workload = %v/%v/%v", vm["state"], vm["desired_state"], vm["workload_type"])
 	}
 
-	// GET /compute/vms/{id} -> VmOut.
+	// GET /compute/instances/{id} -> VmOut.
 	status, _, body = fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOrgID)+"/"+vm["id"].(string), "")
 	if status != http.StatusOK {
 		t.Fatalf("get: status = %d (%s)", status, body)
@@ -2924,7 +3245,7 @@ func TestFakeAPI_ProtectedVmRefusesDelete(t *testing.T) {
 	}
 	status, p := deleteVmVia(t, f, "good-key", id)
 	wantProblem(t, "delete of a protected vm", status, p, 409, "vm_protected",
-		"this VM is protected against deletion; an owner of this organization has to switch that off first, with PUT /v1/orgs/"+testOrgID+"/compute/vms/"+id+"/protection")
+		"this VM is protected against deletion; an owner of this organization has to switch that off first, with PUT /v1/orgs/"+testOrgID+"/compute/instances/"+id+"/protection")
 
 	f.Protect(id, false)
 	if status, _ := deleteVmVia(t, f, "good-key", id); status != http.StatusAccepted {
@@ -2969,14 +3290,28 @@ func TestFakeAPI_PacingKnobsKeepDeletesVisible(t *testing.T) {
 	}
 }
 
-// TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry: Nova lists a floating
-// IP in the server's addresses with OS-EXT-IPS:type floating, next to the
-// fixed one, and removes it again on disassociation. The fake puts it FIRST so
-// a reader that takes the first IPv4 reports the public address as private.
-func TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry(t *testing.T) {
+// TestFakeAPI_AssociatedAddressShowsUpInAddresses: associating a public IP
+// PREPENDS it to VmOut.addresses, so addresses[0] is the public one while
+// private_ip keeps the private one; disassociating removes it again. The
+// Nova-shaped observed_addresses decoy is left alone.
+func TestFakeAPI_AssociatedAddressShowsUpInAddresses(t *testing.T) {
 	f := newFakeAPI(t, "good-key", testOrgID)
 	vmID := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
 	runVm(t, f, "good-key", vmID)
+
+	addresses := func() []any {
+		_, vm := getVmVia(t, f, "good-key", vmID)
+		return vm["addresses"].([]any)
+	}
+	before := addresses()
+	if len(before) != 1 {
+		t.Fatalf("addresses before association = %v, want just the private one", before)
+	}
+	private := before[0].(string)
+	if !strings.HasPrefix(private, "10.128.3.") {
+		t.Fatalf("private address = %q, want a 10.128.3.x address", private)
+	}
+
 	ipID := allocateIPVia(t, f, "gro")
 	settleIP(t, f, ipID, "allocated")
 	if st, _ := ipAction(t, f, ipID, "associate", `{"vm_id":"`+vmID+`"}`); st != http.StatusAccepted {
@@ -2984,47 +3319,517 @@ func TestFakeAPI_AssociatedAddressShowsUpAsAFloatingEntry(t *testing.T) {
 	}
 	settleIP(t, f, ipID, "associated")
 
-	entries := func() []any {
-		_, vm := getVmVia(t, f, "good-key", vmID)
-		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)
+	public := publicAddressOf(t, f, ipID)
+	got := addresses()
+	if len(got) != 2 || got[0] != public || got[1] != private {
+		t.Fatalf("addresses after association = %v, want [%s %s]", got, public, private)
 	}
-	got := entries()
-	if len(got) != 2 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "floating" || got[1].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
-		t.Fatalf("addresses after association = %v, want [floating, fixed]", got)
+	_, vm := getVmVia(t, f, "good-key", vmID)
+	if vm["private_ip"] != private {
+		t.Errorf("private_ip = %v, want %s unchanged by the association", vm["private_ip"], private)
+	}
+	if decoy := vm["observed_addresses"].(map[string]any)[fakeNetwork].([]any)[0].(map[string]any)["addr"]; decoy == public {
+		t.Errorf("observed_addresses decoy = %v: the association must not touch it", decoy)
 	}
 
 	if st, _ := ipAction(t, f, ipID, "disassociate", ""); st != http.StatusAccepted {
 		t.Fatalf("disassociate: status = %d", st)
 	}
 	settleIP(t, f, ipID, "allocated")
-	if got := entries(); len(got) != 1 || got[0].(map[string]any)["OS-EXT-IPS:type"] != "fixed" {
-		t.Errorf("addresses after disassociation = %v, want only the fixed one", got)
+	if got := addresses(); len(got) != 1 || got[0] != private {
+		t.Errorf("addresses after disassociation = %v, want only the private one", got)
 	}
 }
 
-// TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys: the contract promises
-// "addr" and little more, so a vm named notype-* reports entries without the
-// OS-EXT-IPS keys and one named bare-* reports entries with nothing but addr.
-func TestFakeAPI_AddressEntriesCanLackTheOptionalNovaKeys(t *testing.T) {
-	f := newFakeAPI(t, "good-key", testOrgID)
-	named := func(name string) string {
-		return strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"`+name+`"`, 1)
+// publicAddressOf reads a public IP's address from the list, which also
+// advances it.
+func publicAddressOf(t *testing.T, f *fakeAPI, id string) string {
+	t.Helper()
+	_, _, resp := fakeHTTP(t, f, f.apiKey, http.MethodGet, ipsPath(f.org), "")
+	for _, it := range decodeObject(t, resp)["items"].([]any) {
+		if m := it.(map[string]any); m["id"] == id {
+			addr, _ := m["address"].(string)
+			return addr
+		}
 	}
-	entry := func(name string) map[string]any {
-		id := createVmVia(t, f, "good-key", named(name)).get("vm")["id"].(string)
-		runVm(t, f, "good-key", id)
-		_, vm := getVmVia(t, f, "good-key", id)
-		return vm["observed_addresses"].(map[string]any)["gro-tenant-default"].([]any)[0].(map[string]any)
+	t.Fatalf("public ip %s is not in the list", id)
+	return ""
+}
+
+// namedVmBody is the valid create body with its name replaced.
+func namedVmBody(name string) string {
+	return strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"`+name+`"`, 1)
+}
+
+// --- the renamed instance routes and the new VmOut fields -------------------
+
+// TestFakeAPI_OldComputeVmsRoutesAreGone: the routes were renamed to
+// /compute/instances, so the old /compute/vms paths are unknown routes now --
+// the generic "Not Found" problem for every verb -- and every arrival shows up
+// in RequestedPaths, unknown routes and fault-answered requests included.
+func TestFakeAPI_OldComputeVmsRoutesAreGone(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	oldBase := "/v1/orgs/" + testOrgID + "/compute/vms"
+
+	old := []struct {
+		method, path, body string
+	}{
+		{http.MethodPost, oldBase, testValidVmJS},
+		{http.MethodGet, oldBase + "/" + testSomeUUID, ""},
+		{http.MethodDelete, oldBase + "/" + testSomeUUID, ""},
+		{http.MethodPatch, oldBase + "/" + testSomeUUID, `{"hostname":null}`},
+	}
+	var want []string
+	for _, c := range old {
+		status, _, body := fakeHTTP(t, f, "good-key", c.method, c.path, c.body)
+		p := decodeObject(t, body)
+		if status != http.StatusNotFound || p["code"] != "not_found" || p["title"] != "Not Found" || p["detail"] != "Not Found" {
+			t.Errorf("%s %s: %d %v %v %v, want 404 not_found Not Found", c.method, c.path, status, p["code"], p["title"], p["detail"])
+		}
+		want = append(want, c.path)
+	}
+	if f.CreateCount() != 0 {
+		t.Errorf("a request on the old route created %d vm(s)", f.CreateCount())
 	}
 
-	if e := entry("notype-vm"); e["OS-EXT-IPS:type"] != nil || e["version"] != float64(4) || e["addr"] == nil {
-		t.Errorf("notype-* entry = %v, want addr and version only", e)
+	// A mistyped path and a request an injected fault swallowed before it
+	// reached a route are arrivals too.
+	unknown := "/v1/orgs/" + testOrgID + "/compute/nope"
+	f.FailNext(1, matchAny, respondNoSuchRoute)
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodGet, unknown, ""); status != http.StatusNotFound {
+		t.Errorf("fault-answered request: status = %d, want the injected 404", status)
 	}
-	if e := entry("bare-vm"); len(e) != 1 || e["addr"] == nil {
-		t.Errorf("bare-* entry = %v, want addr only", e)
+	want = append(want, unknown)
+
+	got := f.RequestedPaths()
+	if len(got) != len(want) {
+		t.Fatalf("RequestedPaths = %v, want %v", got, want)
 	}
-	if e := entry("plain-vm"); e["OS-EXT-IPS:type"] != "fixed" || e["version"] != float64(4) {
-		t.Errorf("ordinary entry = %v, want the full Nova shape with type fixed", e)
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("RequestedPaths[%d] = %q, want %q (all: %v)", i, got[i], want[i], got)
+		}
+	}
+}
+
+// TestFakeAPI_NewVmFieldsMatchTheContract pins the fields the new contract
+// gained: status (always the state), private_ip and addresses, generation,
+// instance_type, hostname, and the Nova-shaped observed_* decoys.
+func TestFakeAPI_NewVmFieldsMatchTheContract(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), testValidVmJS)
+	if status != http.StatusAccepted {
+		t.Fatalf("create: status = %d, want 202 (%s)", status, body)
+	}
+	if got := hdr.Get("ETag"); got != `"1"` {
+		t.Errorf("create ETag = %q, want \"1\"", got)
+	}
+	vm := decodeObject(t, body)["vm"].(map[string]any)
+	id := vm["id"].(string)
+
+	addresses := func(m map[string]any) []any {
+		a, ok := m["addresses"].([]any)
+		if !ok || a == nil {
+			t.Fatalf("addresses = %v, want a list, never null", m["addresses"])
+		}
+		return a
+	}
+
+	if vm["status"] != "pending" || vm["status"] != vm["state"] {
+		t.Errorf("created status/state = %v/%v, want pending for both", vm["status"], vm["state"])
+	}
+	if vm["hostname"] != nil || vm["instance_type"] != nil || vm["private_ip"] != nil {
+		t.Errorf("created hostname/instance_type/private_ip = %v/%v/%v, want null",
+			vm["hostname"], vm["instance_type"], vm["private_ip"])
+	}
+	if got := addresses(vm); len(got) != 0 {
+		t.Errorf("created addresses = %v, want []", got)
+	}
+	if vm["generation"] != float64(1) {
+		t.Errorf("created generation = %v, want 1", vm["generation"])
+	}
+
+	// A GET carries the generation in its ETag too.
+	status, hdr, body = fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOrgID)+"/"+id, "")
+	if status != http.StatusOK {
+		t.Fatalf("get: status = %d (%s)", status, body)
+	}
+	if got := hdr.Get("ETag"); got != `"1"` {
+		t.Errorf("GET ETag = %q, want \"1\"", got)
+	}
+
+	runVm(t, f, "good-key", id)
+	_, _, body = fakeHTTP(t, f, "good-key", http.MethodGet, vmsPath(testOrgID)+"/"+id, "")
+	vm = decodeObject(t, body)
+	private, _ := vm["private_ip"].(string)
+	if !strings.HasPrefix(private, "10.128.3.") {
+		t.Errorf("running private_ip = %v, want a 10.128.3.x address", vm["private_ip"])
+	}
+	if got := addresses(vm); len(got) != 1 || got[0] != private {
+		t.Errorf("running addresses = %v, want [%s]", got, private)
+	}
+	if vm["status"] != "running" || vm["status"] != vm["state"] {
+		t.Errorf("running status/state = %v/%v, want running for both", vm["status"], vm["state"])
+	}
+	if vm["generation"] != float64(1) {
+		t.Errorf("running generation = %v, want 1: a GET never bumps it", vm["generation"])
+	}
+
+	// The Nova-shaped fields are still published, but as decoys.
+	if vm["observed_status"] != "ACTIVE" {
+		t.Errorf("observed_status = %v, want the decoy ACTIVE", vm["observed_status"])
+	}
+	decoy, _ := vm["observed_addresses"].(map[string]any)[fakeNetwork].([]any)[0].(map[string]any)["addr"].(string)
+	if !strings.HasPrefix(decoy, "198.51.100.") || decoy == private {
+		t.Errorf("observed_addresses decoy = %q, want a 198.51.100.x address different from private_ip %q", decoy, private)
+	}
+
+	// A "noip-" name reaches running without an address at all.
+	noip := createVmVia(t, f, "good-key", namedVmBody("noip-web")).get("vm")["id"].(string)
+	runVm(t, f, "good-key", noip)
+	_, got := getVmVia(t, f, "good-key", noip)
+	if got["private_ip"] != nil {
+		t.Errorf("noip- private_ip = %v, want null", got["private_ip"])
+	}
+	if a := addresses(got); len(a) != 0 {
+		t.Errorf("noip- addresses = %v, want []", a)
+	}
+
+	// instance_type: "general.small" for a typed- name, else the body's value
+	// or null.
+	typed := createVmVia(t, f, "good-key", namedVmBody("typed-web")).get("vm")
+	if typed["instance_type"] != "general.small" {
+		t.Errorf("typed- instance_type = %v, want general.small", typed["instance_type"])
+	}
+	given := strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"sized-web","instance_type":"general.large"`, 1)
+	if got := createVmVia(t, f, "good-key", given).get("vm")["instance_type"]; got != "general.large" {
+		t.Errorf("instance_type from the body = %v, want general.large", got)
+	}
+}
+
+// vmWithHostname is a valid create body (like vmWithKeys) that also carries a
+// hostname.
+func vmWithHostname(name, hostname string) string {
+	quoted, _ := json.Marshal(hostname)
+	return `{"name":"` + name + `","image":"image-1","vcpus":1,"memory_mb":1024,"disk_gb":10,` +
+		`"storage_pool":"pool-1","region":"gro","network_profile":"net-1","hostname":` + string(quoted) + `}`
+}
+
+// TestFakeAPI_HostnameOnCreate pins the hostname rules of the create body: the
+// pattern and the 253 character ceiling, uniqueness among the live instances of
+// the one organization (soft-deleted and foreign rows do not hold it), and that
+// a hostname still takes part in the Idempotency-Key digest.
+func TestFakeAPI_HostnameOnCreate(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+
+	const host = "web-01.example.com"
+	vm := createVmVia(t, f, "good-key", vmWithHostname("web-01", host)).get("vm")
+	id := vm["id"].(string)
+	if vm["hostname"] != host {
+		t.Errorf("hostname = %v, want %q", vm["hostname"], host)
+	}
+	if got := f.Hostname(id); got != host {
+		t.Errorf("Hostname(%s) = %q, want %q", id, got, host)
+	}
+
+	// A bad hostname is a 400 invalid_request naming the field.
+	bad := []struct{ what, hostname, message string }{
+		{"upper case", "Web-01.example.com", ""},
+		{"no dot", "web01", ""},
+		{"a leading hyphen label", "-bad.example.com", ""},
+		{"254 characters", strings.Repeat("a", 254), "String should have at most 253 characters"},
+	}
+	for _, tc := range bad {
+		status, _, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), vmWithHostname("badhost", tc.hostname))
+		p := decodeObject(t, body)
+		errs, _ := p["errors"].([]any)
+		want := tc.message
+		if want == "" {
+			want = "String should match pattern '" + vmHostnamePattern + "'"
+		}
+		if status != http.StatusBadRequest || p["code"] != "invalid_request" || len(errs) != 1 {
+			t.Fatalf("%s: %d %v %v, want 400 invalid_request with one error", tc.what, status, p["code"], p["errors"])
+		}
+		if e := errs[0].(map[string]any); e["field"] != "hostname" || e["message"] != want {
+			t.Errorf("%s: error = %v, want {hostname: %s}", tc.what, e, want)
+		}
+	}
+	if f.CreateCount() != 1 {
+		t.Errorf("CreateCount = %d, want 1: a refused hostname must not build a vm", f.CreateCount())
+	}
+
+	// A second live instance of the organization may not take the hostname.
+	first := createVmVia(t, f, "good-key", vmWithHostname("host-a", "a.example.com")).get("vm")
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), vmWithHostname("host-b", "a.example.com"))
+	p := decodeObject(t, body)
+	if status != http.StatusConflict || p["code"] != "hostname_taken" ||
+		p["detail"] != "the hostname 'a.example.com' is already in use by another instance of this organization" {
+		t.Errorf("second holder: %d %v %v, want 409 hostname_taken", status, p["code"], p["detail"])
+	}
+
+	// A row of another organization is no holder at all.
+	f.SeedForeignInstance("foreign.example.com")
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), vmWithHostname("host-c", "foreign.example.com")); status != http.StatusAccepted {
+		t.Errorf("a foreign holder: status = %d, want 202", status)
+	}
+
+	// Once the holder is soft-deleted and gone, the hostname is free again.
+	firstID := first["id"].(string)
+	runVm(t, f, "good-key", firstID)
+	if status, _ := deleteVmVia(t, f, "good-key", firstID); status != http.StatusAccepted {
+		t.Fatalf("delete of the holder: status = %d, want 202", status)
+	}
+	for i := 0; ; i++ {
+		status, _ := getVmVia(t, f, "good-key", firstID)
+		if status == http.StatusNotFound {
+			break
+		}
+		if i == 4 {
+			t.Fatalf("the deleted holder never went away (status %d)", status)
+		}
+	}
+	if status, _, _ := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), vmWithHostname("host-d", "a.example.com")); status != http.StatusAccepted {
+		t.Errorf("after the holder is gone: status = %d, want 202: a soft-deleted instance must not hold its hostname", status)
+	}
+
+	// The Idempotency-Key digest covers the hostname: the same key and body
+	// replay, another hostname under that key does not.
+	keyed := vmWithHostname("host-e", "e.example.com")
+	status1, _, firstAnswer := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), keyed, "Idempotency-Key", "hk-1")
+	status2, _, secondAnswer := fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), keyed, "Idempotency-Key", "hk-1")
+	if status1 != http.StatusAccepted || status2 != http.StatusAccepted || string(firstAnswer) != string(secondAnswer) {
+		t.Errorf("keyed replay: %d/%d, bodies equal %v; want the stored 202", status1, status2, string(firstAnswer) == string(secondAnswer))
+	}
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodPost, vmsPath(testOrgID), vmWithHostname("host-e", "e2.example.com"), "Idempotency-Key", "hk-1")
+	if p := decodeObject(t, body); status != http.StatusConflict || p["code"] != "idempotency_key_reused" {
+		t.Errorf("another hostname under the key: %d %v, want 409 idempotency_key_reused", status, p["code"])
+	}
+}
+
+// patchHostnameVia reads the current generation with a GET, then PATCHes
+// {"hostname": ...} with If-Match "<generation>". A nil hostname sends null.
+func patchHostnameVia(t *testing.T, f *fakeAPI, key, id string, hostname *string) (int, map[string]any) {
+	t.Helper()
+	status, _, body := fakeHTTP(t, f, key, http.MethodGet, vmsPath(f.org)+"/"+id, "")
+	if status != http.StatusOK {
+		t.Fatalf("read before patch: status = %d (%s)", status, body)
+	}
+	generation, _ := decodeObject(t, body)["generation"].(float64)
+	payload, _ := json.Marshal(map[string]any{"hostname": hostname})
+	status, _, body = fakeHTTP(t, f, key, http.MethodPatch, vmsPath(f.org)+"/"+id, string(payload),
+		"If-Match", fmt.Sprintf("\"%d\"", int64(generation)))
+	return status, decodeObject(t, body)
+}
+
+// TestFakeAPI_PatchHostnameGates pins PATCH /compute/instances/{id}: the body,
+// the liveness of the instance, the Idempotency-Key replay (before If-Match),
+// then If-Match and the hostname's uniqueness.
+func TestFakeAPI_PatchHostnameGates(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+	path := vmsPath(testOrgID) + "/" + id
+
+	// 428 without If-Match.
+	status, _, body := fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"x.example.com"}`)
+	p := decodeObject(t, body)
+	if status != http.StatusPreconditionRequired || p["code"] != "precondition_required" ||
+		p["title"] != "Precondition required" ||
+		p["detail"] != "this request needs an If-Match header carrying the instance's generation" {
+		t.Errorf("no If-Match: %d %v %v %v", status, p["code"], p["title"], p["detail"])
+	}
+
+	// Anything but a double-quoted integer is a 400 naming the header.
+	for _, bad := range []string{"1", `"x"`, `"1`, `1"`, `"1 "`} {
+		status, _, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"x.example.com"}`, "If-Match", bad)
+		p = decodeObject(t, body)
+		errs, _ := p["errors"].([]any)
+		if status != http.StatusBadRequest || p["code"] != "invalid_request" || len(errs) != 1 ||
+			errs[0].(map[string]any)["field"] != "If-Match" ||
+			errs[0].(map[string]any)["message"] != `must be a quoted generation, for example "3"` {
+			t.Errorf("If-Match %q: %d %v %v, want 400 invalid_request naming If-Match", bad, status, p["code"], p["errors"])
+		}
+	}
+
+	// A stale generation is a 412 carrying the current ETag.
+	status, hdr, body := fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"x.example.com"}`, "If-Match", `"0"`)
+	p = decodeObject(t, body)
+	if status != http.StatusPreconditionFailed || p["code"] != "generation_mismatch" || p["title"] != "Precondition failed" ||
+		p["detail"] != "the instance is at generation 1, not 0; read it again and retry" {
+		t.Errorf("stale If-Match: %d %v %v %v", status, p["code"], p["title"], p["detail"])
+	}
+	if got := hdr.Get("ETag"); got != `"1"` {
+		t.Errorf("412 ETag = %q, want \"1\"", got)
+	}
+
+	// A real change: 200, the bare VmOut, generation 2 and its ETag.
+	status, hdr, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"x.example.com"}`, "If-Match", `"1"`)
+	if status != http.StatusOK {
+		t.Fatalf("patch: status = %d (%s)", status, body)
+	}
+	got := decodeObject(t, body)
+	if _, wrapped := got["vm"]; wrapped {
+		t.Errorf("the PATCH answer is wrapped: %s", body)
+	}
+	wantKeys(t, "VmOut (PATCH)", got, specVmOutKeys)
+	if got["hostname"] != "x.example.com" || got["generation"] != float64(2) {
+		t.Errorf("hostname/generation = %v/%v, want x.example.com/2", got["hostname"], got["generation"])
+	}
+	if hdr.Get("ETag") != `"2"` {
+		t.Errorf("patch ETag = %q, want \"2\"", hdr.Get("ETag"))
+	}
+	if f.Generation(id) != 2 || f.Hostname(id) != "x.example.com" {
+		t.Errorf("stored generation/hostname = %d/%q, want 2/x.example.com", f.Generation(id), f.Hostname(id))
+	}
+
+	// The same hostname is a no-op: 200, generation unchanged.
+	status, hdr, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"x.example.com"}`, "If-Match", `"2"`)
+	if status != http.StatusOK || decodeObject(t, body)["generation"] != float64(2) ||
+		f.Generation(id) != 2 || hdr.Get("ETag") != `"2"` {
+		t.Errorf("no-op patch: %d generation %v stored %d ETag %q, want 200/2/2/\"2\"",
+			status, decodeObject(t, body)["generation"], f.Generation(id), hdr.Get("ETag"))
+	}
+
+	// null clears the hostname, which does bump the generation.
+	status, hdr, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":null}`, "If-Match", `"2"`)
+	got = decodeObject(t, body)
+	if status != http.StatusOK || got["hostname"] != nil || got["generation"] != float64(3) ||
+		hdr.Get("ETag") != `"3"` || f.Hostname(id) != "" {
+		t.Errorf("clearing: %d %v %v %q %q, want 200/null/3/\"3\"/\"\"",
+			status, got["hostname"], got["generation"], hdr.Get("ETag"), f.Hostname(id))
+	}
+
+	// Another live instance of the organization holds it: 409, nothing changes.
+	createVmVia(t, f, "good-key", vmWithHostname("holder-vm", "h.example.com"))
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"h.example.com"}`, "If-Match", `"3"`)
+	p = decodeObject(t, body)
+	if status != http.StatusConflict || p["code"] != "hostname_taken" ||
+		p["detail"] != "the hostname 'h.example.com' is already in use by another instance of this organization" {
+		t.Errorf("taken: %d %v %v, want 409 hostname_taken", status, p["code"], p["detail"])
+	}
+	if f.Generation(id) != 3 {
+		t.Errorf("a refused patch bumped the generation to %d, want 3", f.Generation(id))
+	}
+
+	// Unknown and soft-deleted ids are the plain vm 404.
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodPatch, vmsPath(testOrgID)+"/"+testSomeUUID, `{"hostname":"y.example.com"}`, "If-Match", `"1"`)
+	p = decodeObject(t, body)
+	if status != http.StatusNotFound || p["code"] != "not_found" ||
+		p["detail"] != "no vm matching that identifier is visible to this organization" {
+		t.Errorf("unknown id: %d %v %v, want 404 not_found", status, p["code"], p["detail"])
+	}
+
+	// The body is strict: no extra fields, hostname required, same pattern.
+	for _, tc := range []struct{ what, body, field, message string }{
+		{"an extra field", `{"hostname":"a.example.com","extra":1}`, "extra", "Extra inputs are not permitted"},
+		{"a missing hostname", `{}`, "hostname", "Field required"},
+		{"a bad hostname", `{"hostname":"NoDot"}`, "hostname", "String should match pattern '" + vmHostnamePattern + "'"},
+	} {
+		status, _, body := fakeHTTP(t, f, "good-key", http.MethodPatch, path, tc.body, "If-Match", `"3"`)
+		p := decodeObject(t, body)
+		errs, _ := p["errors"].([]any)
+		found := false
+		for _, e := range errs {
+			m := e.(map[string]any)
+			if m["field"] == tc.field && m["message"] == tc.message {
+				found = true
+			}
+		}
+		if status != http.StatusBadRequest || p["code"] != "invalid_request" || !found {
+			t.Errorf("%s: %d %v %v, want 400 with {%s: %s}", tc.what, status, p["code"], p["errors"], tc.field, tc.message)
+		}
+	}
+
+	// Idempotency: the first answer replays even though If-Match is stale now.
+	status, hdr, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"i.example.com"}`,
+		"If-Match", `"3"`, "Idempotency-Key", "pk-1")
+	if status != http.StatusOK {
+		t.Fatalf("keyed patch: status = %d (%s)", status, body)
+	}
+	if gen := decodeObject(t, body)["generation"]; gen != float64(4) {
+		t.Fatalf("keyed patch generation = %v, want 4", gen)
+	}
+	firstETag := hdr.Get("ETag")
+	status, hdr, body2 := fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"i.example.com"}`,
+		"If-Match", `"3"`, "Idempotency-Key", "pk-1")
+	if status != http.StatusOK || hdr.Get("ETag") != firstETag || string(body) != string(body2) {
+		t.Errorf("replay: %d ETag %q vs %q, bodies equal %v; want the stored answer",
+			status, hdr.Get("ETag"), firstETag, string(body) == string(body2))
+	}
+	if f.Generation(id) != 4 {
+		t.Errorf("a replay bumped the generation to %d, want 4", f.Generation(id))
+	}
+
+	// Same key, another hostname: the digest differs, so 409.
+	status, _, body = fakeHTTP(t, f, "good-key", http.MethodPatch, path, `{"hostname":"other.example.com"}`,
+		"If-Match", `"4"`, "Idempotency-Key", "pk-1")
+	if p := decodeObject(t, body); status != http.StatusConflict || p["code"] != "idempotency_key_reused" {
+		t.Errorf("reused key: %d %v, want 409 idempotency_key_reused", status, p["code"])
+	}
+
+	// Every PATCH that reached the route is recorded, headers and body.
+	calls := f.PatchCalls()
+	if len(calls) == 0 {
+		t.Fatal("PatchCalls is empty")
+	}
+	if first := calls[0]; first != (patchCall{ID: id, Body: `{"hostname":"x.example.com"}`}) {
+		t.Errorf("first PatchCall = %+v, want the condition-less, keyless first attempt", first)
+	}
+	if want := (patchCall{ID: id, IfMatch: `"3"`, IdempotencyKey: "pk-1", Body: `{"hostname":"i.example.com"}`}); !containsPatchCall(calls, want) {
+		t.Errorf("PatchCalls %v does not contain %+v", calls, want)
+	}
+	if want := (patchCall{ID: testSomeUUID, IfMatch: `"1"`, Body: `{"hostname":"y.example.com"}`}); !containsPatchCall(calls, want) {
+		t.Errorf("PatchCalls %v does not record the unknown-id call %+v", calls, want)
+	}
+}
+
+func containsPatchCall(calls []patchCall, want patchCall) bool {
+	for _, c := range calls {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFakeAPI_PatchHostnameViaReadsThenPatches exercises the helper the
+// acceptance tests drive: it reads the generation with a GET, then PATCHes with
+// If-Match, and a nil hostname clears the field.
+func TestFakeAPI_PatchHostnameViaReadsThenPatches(t *testing.T) {
+	f := newFakeAPI(t, "good-key", testOrgID)
+	id := createVmVia(t, f, "good-key", testValidVmJS).get("vm")["id"].(string)
+	runVm(t, f, "good-key", id)
+
+	h := "via.example.com"
+	status, vm := patchHostnameVia(t, f, "good-key", id, &h)
+	if status != http.StatusOK || vm["hostname"] != h || vm["generation"] != float64(2) {
+		t.Errorf("set: %d %v %v, want 200/%s/2", status, vm["hostname"], vm["generation"], h)
+	}
+	status, vm = patchHostnameVia(t, f, "good-key", id, nil)
+	if status != http.StatusOK || vm["hostname"] != nil || vm["generation"] != float64(3) {
+		t.Errorf("clear: %d %v %v, want 200/null/3", status, vm["hostname"], vm["generation"])
+	}
+	if got := f.Hostname(id); got != "" {
+		t.Errorf("Hostname after clearing = %q, want \"\"", got)
+	}
+
+	// A soft-deleted instance answers the plain vm 404, like a GET does.
+	gone := createVmVia(t, f, "good-key", namedVmBody("gone-vm")).get("vm")["id"].(string)
+	runVm(t, f, "good-key", gone)
+	if st, _ := deleteVmVia(t, f, "good-key", gone); st != http.StatusAccepted {
+		t.Fatalf("delete of the second vm: status = %d, want 202", st)
+	}
+	for i := 0; ; i++ {
+		if st, _ := getVmVia(t, f, "good-key", gone); st == http.StatusNotFound {
+			break
+		} else if i == 4 {
+			t.Fatalf("the deleted vm never went away (status %d)", st)
+		}
+	}
+	if st, _, body := fakeHTTP(t, f, "good-key", http.MethodPatch, vmsPath(testOrgID)+"/"+gone,
+		`{"hostname":"z.example.com"}`, "If-Match", `"1"`); st != http.StatusNotFound || decodeObject(t, body)["code"] != "not_found" {
+		t.Errorf("patch of a soft-deleted vm: %d, want 404 not_found", st)
 	}
 }
 

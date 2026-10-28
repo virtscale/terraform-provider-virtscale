@@ -139,6 +139,25 @@ resource "virtscale_instance" "test" {
 `, name, image, vcpus)
 }
 
+// testAccInstanceConfigExtra is testAccInstanceConfig with extra attribute
+// lines appended to the instance resource, for the attributes the other
+// helpers do not set (hostname, for instance). extra may be "" for none.
+func testAccInstanceConfigExtra(fake *fakeAPI, name string, vcpus int, extra string) string {
+	return testAccProviderBlock(fake) + fmt.Sprintf(`
+resource "virtscale_instance" "test" {
+  name            = %q
+  region          = "gro"
+  image           = "image-1"
+  vcpus           = %d
+  memory_mb       = 1024
+  disk_gb         = 10
+  storage_pool    = "pool-1"
+  network_profile = "net-1"
+  %s
+}
+`, name, vcpus, extra)
+}
+
 func testAccCheckInstanceDestroy(fake *fakeAPI) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		rs, ok := s.RootModule().Resources["virtscale_instance.test"]
@@ -172,11 +191,16 @@ func TestAccInstanceResource_Lifecycle(t *testing.T) {
 				Config: testAccInstanceConfig(fake, "lifecycle-1", 1),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "status", "running"),
 					resource.TestCheckResourceAttr("virtscale_instance.test", "name", "lifecycle-1"),
 					resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "1"),
 					resource.TestCheckResourceAttrSet("virtscale_instance.test", "id"),
 					resource.TestCheckResourceAttrSet("virtscale_instance.test", "created_at"),
 					resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
+					// A configuration that never mentions a hostname leaves it null, and
+					// an ordinary instance has no instance_type.
+					resource.TestCheckNoResourceAttr("virtscale_instance.test", "hostname"),
+					resource.TestCheckNoResourceAttr("virtscale_instance.test", "instance_type"),
 				),
 			},
 			{
@@ -569,31 +593,606 @@ func TestAccInstanceResource_ReplacingAProtectedVmKeepsTheRefusal(t *testing.T) 
 	})
 }
 
-// TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises covers M5.
-// observed_addresses is Nova's address map, stored verbatim; the contract
-// promises "addr" and little else (OS-EXT-IPS:type is an extension, and the
-// platform's own readers and fixtures accept entries with nothing but addr).
-// private_ipv4 must come out for entries without the type key, and without
-// the version key, and must not take an explicitly floating entry for the
-// private address.
-func TestAccInstanceResource_PrivateIPv4ReadsWhatTheContractPromises(t *testing.T) {
-	for _, name := range []string{"notype-vm", "bare-vm"} {
-		t.Run(name, func(t *testing.T) {
+// TestAccInstanceResource_HostnameIsSentOnCreateAndStable: a configured
+// hostname is sent on create and stored by the API, comes back on every read,
+// and is no drift: the same configuration plans empty, and an import reads the
+// hostname and the status back.
+func TestAccInstanceResource_HostnameIsSentOnCreateAndStable(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfigExtra(fake, "hostname-vm", 1, `hostname = "web.example.com"`)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vmIDFromState(&id),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "web.example.com"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "status", "running"),
+					func(*terraform.State) error {
+						if got := fake.Hostname(id); got != "web.example.com" {
+							return fmt.Errorf("the API stored hostname %q, want web.example.com", got)
+						}
+						if n := fake.CallCount("PATCH compute/instances/{vm_id}"); n != 0 {
+							return fmt.Errorf("a create sent %d PATCH(es), want 0", n)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+			{
+				ResourceName:      "virtscale_instance.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("imported %d resources, want 1", len(states))
+					}
+					a := states[0].Attributes
+					if a["hostname"] != "web.example.com" {
+						return fmt.Errorf("imported hostname = %q, want web.example.com", a["hostname"])
+					}
+					if a["status"] != "running" {
+						return fmt.Errorf("imported status = %q, want running", a["status"])
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// decoyObservedAddress reads vm id from the API and returns the address in its
+// Nova-shaped observed_addresses map: the decoy the provider must no longer
+// read from.
+func decoyObservedAddress(t *testing.T, fake *fakeAPI, id string) string {
+	t.Helper()
+	_, vm := getVmVia(t, fake, fake.apiKey, id)
+	byNet, _ := vm["observed_addresses"].(map[string]any)
+	entries, _ := byNet[fakeNetwork].([]any)
+	for _, e := range entries {
+		if m, ok := e.(map[string]any); ok {
+			if addr, ok := m["addr"].(string); ok {
+				return addr
+			}
+		}
+	}
+	return ""
+}
+
+// TestAccInstanceResource_PrivateIPv4IsThePrivateIP: private_ipv4 is the API's
+// private_ip. The Nova-shaped observed_addresses decoy holds a different
+// address, so a provider that still reads it reports the wrong value.
+func TestAccInstanceResource_PrivateIPv4IsThePrivateIP(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "private-ip-vm", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					vmIDFromState(&id),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
+					func(*terraform.State) error {
+						if decoy := decoyObservedAddress(t, fake, id); !strings.HasPrefix(decoy, "198.51.100.") {
+							return fmt.Errorf("observed_addresses decoy = %q, want a 198.51.100.x address private_ipv4 must not be taken from", decoy)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_PrivateIPv4IsEmptyWhenTheAPISaysNull: a vm with no
+// private address reports private_ipv4 as the empty string, and that empty
+// value is not drift.
+func TestAccInstanceResource_PrivateIPv4IsEmptyWhenTheAPISaysNull(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfig(fake, "noip-vm", 1),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", ""),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_NoHostnameStaysNull: a configuration that never
+// mentions a hostname leaves it null, and keeps planning nothing afterwards.
+func TestAccInstanceResource_NoHostnameStaysNull(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfig(fake, "no-hostname", 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  resource.TestCheckNoResourceAttr("virtscale_instance.test", "hostname"),
+			},
+			{
+				Config:   config,
+				PlanOnly: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_InstanceTypeAndStatusAreReadFromTheAPI: status is the
+// API's status word; instance_type is what the API reports when it reports one.
+func TestAccInstanceResource_InstanceTypeAndStatusAreReadFromTheAPI(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfig(fake, "typed-vm", 1)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "instance_type", "general.small"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "status", "running"),
+				),
+			},
+			{
+				ResourceName:      "virtscale_instance.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ChangingTheHostnameIsAnInPlaceUpdate: a hostname
+// change is one PATCH carrying the generation read from a fresh GET and an
+// Idempotency-Key -- never a replacement -- and the next plan has nothing left.
+func TestAccInstanceResource_ChangingTheHostnameIsAnInPlaceUpdate(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExtra(fake, "hostname-move", 1, `hostname = "a.example.com"`),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				Config: testAccInstanceConfigExtra(fake, "hostname-move", 1, `hostname = "b.example.com"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "b.example.com"),
+					func(s *terraform.State) error {
+						rs := s.RootModule().Resources["virtscale_instance.test"]
+						if rs == nil {
+							return fmt.Errorf("virtscale_instance.test not found in state")
+						}
+						if rs.Primary.ID != id {
+							return fmt.Errorf("the instance was replaced: id = %s, want %s unchanged", rs.Primary.ID, id)
+						}
+						if n := fake.CallCount("POST compute/instances"); n != 1 {
+							return fmt.Errorf("POSTs = %d, want 1: a hostname change must not replace the instance", n)
+						}
+						calls := fake.PatchCalls()
+						if len(calls) != 1 {
+							return fmt.Errorf("PATCHes = %d (%+v), want exactly 1", len(calls), calls)
+						}
+						got := calls[0]
+						if got.IfMatch != `"1"` {
+							return fmt.Errorf("If-Match = %q, want the generation read before the patch, \"1\"", got.IfMatch)
+						}
+						if got.Body != `{"hostname":"b.example.com"}` {
+							return fmt.Errorf("PATCH body = %q, want {\"hostname\":\"b.example.com\"}", got.Body)
+						}
+						if got.IdempotencyKey == "" {
+							return fmt.Errorf("the PATCH carried no Idempotency-Key")
+						}
+						if g := fake.Generation(id); g != 2 {
+							return fmt.Errorf("generation = %d, want 2 after one hostname change", g)
+						}
+						if h := fake.Hostname(id); h != "b.example.com" {
+							return fmt.Errorf("stored hostname = %q, want b.example.com", h)
+						}
+						return nil
+					},
+				),
+			},
+			{
+				Config: testAccInstanceConfigExtra(fake, "hostname-move", 1, `hostname = "b.example.com"`),
+				Check: func(*terraform.State) error {
+					if n := len(fake.PatchCalls()); n != 1 {
+						return fmt.Errorf("the plan sent a PATCH (%d total), want only the one change", n)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_TheGenerationComesFromAFreshRead: after an
+// out-of-band hostname change, Update's If-Match carries the generation of a
+// fresh read, not the one the state remembers (which would be 412).
+func TestAccInstanceResource_TheGenerationComesFromAFreshRead(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := testAccInstanceConfigExtra(fake, "drift-back", 1, `hostname = "a.example.com"`)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: config,
+				Check:  vmIDFromState(&id),
+			},
+			{
+				PreConfig: func() {
+					drift := "drift.example.com"
+					if status, _ := patchHostnameVia(t, fake, fake.apiKey, id, &drift); status != http.StatusOK {
+						t.Errorf("out-of-band hostname patch: status = %d, want 200", status)
+					}
+				},
+				Config: config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionUpdate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+					func(*terraform.State) error {
+						calls := fake.PatchCalls()
+						if len(calls) == 0 {
+							return fmt.Errorf("no PATCH reached the API")
+						}
+						if last := calls[len(calls)-1]; last.IfMatch != `"2"` {
+							return fmt.Errorf("the last PATCH used If-Match %q, want the freshly read generation \"2\"", last.IfMatch)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ATakenHostnameIsRefusedWithTheAPIsSentence: a
+// hostname another instance of the organization holds is refused by the API,
+// on create and on update, with its own sentence.
+func TestAccInstanceResource_ATakenHostnameIsRefusedWithTheAPIsSentence(t *testing.T) {
+	const sentence = "the hostname 'taken.example.com' is already in use by another instance of this organization"
+
+	t.Run("on create", func(t *testing.T) {
+		fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+			Steps: []resource.TestStep{
+				{
+					PreConfig: func() {
+						createVmVia(t, fake, fake.apiKey, vmWithHostname("holder", "taken.example.com"))
+					},
+					Config:      testAccInstanceConfigExtra(fake, "wants-taken", 1, `hostname = "taken.example.com"`),
+					ExpectError: wrapSafe(sentence),
+				},
+			},
+		})
+		if fake.CreateCount() != 1 {
+			t.Errorf("creates = %d, want 1 (only the holder)", fake.CreateCount())
+		}
+	})
+
+	t.Run("on update", func(t *testing.T) {
+		fake := newFakeAPI(t, "test-api-key", testOrgID)
+		var id string
+
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+			Steps: []resource.TestStep{
+				{
+					Config: testAccInstanceConfigExtra(fake, "moves-to-taken", 1, `hostname = "a.example.com"`),
+					Check:  vmIDFromState(&id),
+				},
+				{
+					PreConfig: func() {
+						createVmVia(t, fake, fake.apiKey, vmWithHostname("holder", "taken.example.com"))
+					},
+					Config:      testAccInstanceConfigExtra(fake, "moves-to-taken", 1, `hostname = "taken.example.com"`),
+					ExpectError: wrapSafe(sentence),
+				},
+			},
+		})
+		if fake.CreateCount() != 2 {
+			t.Errorf("creates = %d, want 2 (the instance and the holder): no replacement must happen", fake.CreateCount())
+		}
+	})
+}
+
+// TestAccInstanceResource_ReplacingKeepsTheHostname: hostname survives a
+// replacement (vcpus changed): the destroyed instance releases the name, so the
+// replacement may take it again.
+func TestAccInstanceResource_ReplacingKeepsTheHostname(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExtra(fake, "keep-hostname", 1, `hostname = "a.example.com"`),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+			},
+			{
+				Config: testAccInstanceConfigExtra(fake, "keep-hostname", 2, `hostname = "a.example.com"`),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{
+						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionDestroyBeforeCreate),
+					},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "2"),
+					func(*terraform.State) error {
+						if n := fake.CallCount("PATCH compute/instances/{vm_id}"); n != 0 {
+							return fmt.Errorf("a replacement sent %d PATCH(es), want 0", n)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_AnInvalidHostnameIsRefusedAtPlanTime: a hostname that
+// does not match the API's rule, or is too long, is refused before anything is
+// sent.
+func TestAccInstanceResource_AnInvalidHostnameIsRefusedAtPlanTime(t *testing.T) {
+	for _, hostname := range []string{"Web.Example.com", "nodots", "-bad.example.com", strings.Repeat("a", 254), "a..example.com"} {
+		t.Run(hostname, func(t *testing.T) {
 			fake := newFakeAPI(t, "test-api-key", testOrgID)
 
 			resource.Test(t, resource.TestCase{
 				PreCheck:                 func() { testAccPreCheck(t) },
 				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
-				CheckDestroy:             testAccCheckInstanceDestroy(fake),
 				Steps: []resource.TestStep{
 					{
-						Config: testAccInstanceConfig(fake, name, 1),
-						Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "private_ipv4", "10.128.3.11"),
+						Config:      testAccInstanceConfigExtra(fake, "bad-hostname", 1, fmt.Sprintf("hostname = %q", hostname)),
+						ExpectError: wrapSafe("Invalid hostname"),
 					},
 				},
 			})
+			if fake.CreateCount() != 0 {
+				t.Errorf("an invalid hostname created %d vm(s)", fake.CreateCount())
+			}
+			if n := fake.CallCount("POST compute/instances"); n != 0 {
+				t.Errorf("an invalid hostname sent %d create request(s), want 0", n)
+			}
 		})
 	}
+}
+
+// TestAccInstanceResource_RemovingTheHostnameFromTheConfigurationKeepsIt: the
+// attribute is Computed, so dropping the line keeps whatever the API holds and
+// plans nothing.
+func TestAccInstanceResource_RemovingTheHostnameFromTheConfigurationKeepsIt(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExtra(fake, "drop-hostname", 1, `hostname = "a.example.com"`),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+			},
+			{
+				Config: testAccInstanceConfig(fake, "drop-hostname", 1),
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+					func(*terraform.State) error {
+						if n := fake.CallCount("PATCH compute/instances/{vm_id}"); n != 0 {
+							return fmt.Errorf("dropping the hostname from the configuration sent %d PATCH(es), want 0", n)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_ImportOfAnInstanceWithAHostname: an instance made out
+// of band with a hostname imports it (and its status), and both a configuration
+// without the hostname and one with the same hostname plan nothing.
+func TestAccInstanceResource_ImportOfAnInstanceWithAHostname(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	without := testAccInstanceConfig(fake, "imported-h", 1)
+	with := testAccInstanceConfigExtra(fake, "imported-h", 1, `hostname = "imp.example.com"`)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				PreConfig: func() {
+					id = createVmVia(t, fake, fake.apiKey, vmWithHostname("imported-h", "imp.example.com")).get("vm")["id"].(string)
+					runVm(t, fake, fake.apiKey, id)
+				},
+				Config:             without,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				ResourceName:       "virtscale_instance.test",
+				ImportState:        true,
+				ImportStatePersist: true,
+				ImportStateIdFunc:  func(*terraform.State) (string, error) { return id, nil },
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("imported %d resources, want 1", len(states))
+					}
+					a := states[0].Attributes
+					if a["hostname"] != "imp.example.com" {
+						return fmt.Errorf("imported hostname = %q, want imp.example.com", a["hostname"])
+					}
+					if a["status"] != "running" {
+						return fmt.Errorf("imported status = %q, want running", a["status"])
+					}
+					return nil
+				},
+			},
+			{
+				Config: without,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+			{
+				Config: with,
+				ConfigPlanChecks: resource.ConfigPlanChecks{
+					PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()},
+				},
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_SurvivesALostPatchAnswer: the PATCH is applied, its
+// answer is lost, and the client repeats the keyed request; the API replays the
+// stored answer, so the hostname is applied once and the apply succeeds.
+func TestAccInstanceResource_SurvivesALostPatchAnswer(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var id string
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExtra(fake, "lost-patch", 1, `hostname = "a.example.com"`),
+				Check:  vmIDFromState(&id),
+			},
+			{
+				PreConfig: func() {
+					fake.FailNextAfterHandling(1, matchRoute(http.MethodPatch, "/compute/instances/"), respondDrop)
+				},
+				Config: testAccInstanceConfigExtra(fake, "lost-patch", 1, `hostname = "b.example.com"`),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "b.example.com"),
+					func(*terraform.State) error {
+						if g := fake.Generation(id); g != 2 {
+							return fmt.Errorf("generation = %d, want 2: the keyed retry must not apply twice", g)
+						}
+						calls := fake.PatchCalls()
+						if len(calls) != 2 {
+							return fmt.Errorf("PATCHes = %d (%+v), want 2 (the lost one and its retry)", len(calls), calls)
+						}
+						if calls[0].IdempotencyKey == "" || calls[0].IdempotencyKey != calls[1].IdempotencyKey {
+							return fmt.Errorf("Idempotency-Keys = %q and %q, want the same non-empty key repeated", calls[0].IdempotencyKey, calls[1].IdempotencyKey)
+						}
+						if calls[0].IfMatch != calls[1].IfMatch {
+							return fmt.Errorf("If-Match = %q and %q, want the same condition repeated", calls[0].IfMatch, calls[1].IfMatch)
+						}
+						return nil
+					},
+				),
+			},
+		},
+	})
+}
+
+// TestAccInstanceResource_NeverCallsTheDeprecatedRoutes: a whole life -- create,
+// import, hostname change, destroy -- reaches the renamed routes only, never
+// /compute/vms.
+func TestAccInstanceResource_NeverCallsTheDeprecatedRoutes(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy: func(s *terraform.State) error {
+			if err := testAccCheckInstanceDestroy(fake)(s); err != nil {
+				return err
+			}
+			paths := fake.RequestedPaths()
+			if len(paths) == 0 {
+				return fmt.Errorf("the fake saw no request at all")
+			}
+			for _, p := range paths {
+				if strings.Contains(p, "/compute/vms") {
+					return fmt.Errorf("the provider called the deprecated route %q", p)
+				}
+				if strings.Contains(p, "/compute/") &&
+					!strings.Contains(p, "/compute/images") &&
+					!strings.Contains(p, "/compute/public-ips") &&
+					!strings.Contains(p, "/compute/ssh-keys") &&
+					!strings.Contains(p, "/compute/instances") {
+					return fmt.Errorf("the provider called an unexpected compute route %q", p)
+				}
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				Config: testAccInstanceConfigExtra(fake, "no-legacy", 1, `hostname = "a.example.com"`),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
+			},
+			{
+				ResourceName:      "virtscale_instance.test",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			{
+				Config: testAccInstanceConfigExtra(fake, "no-legacy", 1, `hostname = "b.example.com"`),
+				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "b.example.com"),
+			},
+		},
+	})
 }
 
 // testKeySpec is one virtscale_ssh_key of a test configuration.
@@ -994,7 +1593,7 @@ func TestAccInstanceResource_SSHKeysNotSwitchedOnIsShownAndNotRetried(t *testing
 			},
 		},
 	})
-	if n := fake.CallCount("POST compute/vms"); n != 1 {
+	if n := fake.CallCount("POST compute/instances"); n != 1 {
 		t.Errorf("the create was sent %d times, want exactly once: not_ready is never retried", n)
 	}
 	if fake.CreateCount() != 0 {
@@ -1188,7 +1787,7 @@ func TestAccInstanceResource_ReadErrorsThatAreNotTheVmBeingGoneKeepTheResource(t
 		steps = append(steps, resource.TestStep{
 			PreConfig: func() {
 				fake.ClearFaults()
-				fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/vms/"), respond)
+				fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/instances/"), respond)
 			},
 			Config:      config,
 			PlanOnly:    true,
@@ -1234,7 +1833,7 @@ func TestAccInstanceResource_DestroyDoesNotTakeAMistypedEndpointForADeletedVm(t 
 						if r.Method == http.MethodDelete {
 							deleteSeen = true
 						}
-						return deleteSeen && matchRoute(http.MethodGet, "/compute/vms/")(r)
+						return deleteSeen && matchRoute(http.MethodGet, "/compute/instances/")(r)
 					}, respondNoSuchRoute)
 				},
 				Config:      testAccProviderBlock(fake),
@@ -1269,7 +1868,7 @@ func TestAccInstanceResource_ADeleteThatMeetsAConflictAndThenAnAbsentVmIsDone(t 
 			},
 			{
 				PreConfig: func() {
-					fake.FailNext(1, matchRoute(http.MethodDelete, "/compute/vms/"), func(rc *reqCtx) {
+					fake.FailNext(1, matchRoute(http.MethodDelete, "/compute/instances/"), func(rc *reqCtx) {
 						fake.Vanish(id)
 						rc.conflict("operation_in_flight", detailOperationInFlightVm)
 					})
@@ -1297,7 +1896,7 @@ func TestAccInstanceResource_AnUpstreamEchoingTheKeyDoesNotLeakItIntoTheError(t 
 			{Config: config},
 			{
 				PreConfig: func() {
-					fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/vms/"), respondEchoingTheKey(500))
+					fake.FailNext(1000, matchRoute(http.MethodGet, "/compute/instances/"), respondEchoingTheKey(500))
 				},
 				Config:      config,
 				PlanOnly:    true,

@@ -180,17 +180,22 @@ the API prints the request.
 | `storage_pool`    | string | Required, forces replacement | |
 | `network_profile` | string | Required, forces replacement | |
 | `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. The API refuses `user_data`, so the provider has no such attribute. |
+| `hostname`        | string | Optional, Computed | The lower-case fully qualified name the instance is known by in your organization (for example `web.example.com`); checked at plan time (labels of lowercase letters, digits and hyphens, at least two labels, at most 253 characters). Unique among the organization's live instances: a duplicate is `409 hostname_taken`; another organization may use the same name. It is a handle only: the platform creates no DNS record for it. Changing it is an in-place update, not a replacement. It is read back on every refresh, so a change made elsewhere shows as a difference, and `tofu import` fills it. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). |
 | `id`              | string | Computed | |
 | `state`           | string | Computed | |
+| `status`          | string | Computed | The instance's status as the API reports it, for example `running` or `stopped`. |
 | `fqdn`            | string | Computed | Null for a customer account. |
-| `private_ipv4`    | string | Computed | The first fixed IPv4 address the API has observed for the instance; empty until one is. An associated public IP is not the private address. |
+| `private_ipv4`    | string | Computed | The instance's private IPv4 address as the platform reports it; empty until it is known. An associated public IP is not the private address. |
 | `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. |
+| `instance_type`   | string | Computed | The catalogue instance type the instance was created from; null when the API does not report one. |
 | `created_at`      | string | Computed | RFC 3339. |
 
 The API checks `vcpus`, `memory_mb` and `disk_gb` against the platform's size limits and the image's
 minimums (`min_disk_gb` and `min_ram_mb` in `virtscale_images`); a refusal lists every violation
-(`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute forces replacement: there
-are no in-place changes yet.
+(`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute except `hostname` forces
+replacement; changing `hostname` is an in-place update (one PATCH, guarded by the instance's current generation
+read just before it, so a change made at the same moment by someone else is refused with `412
+generation_mismatch` and the next run picks it up).
 
 ### `virtscale_ssh_key`
 
