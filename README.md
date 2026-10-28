@@ -279,6 +279,20 @@ TF_ACC_PROVIDER_HOST=registry.terraform.io \
 go test ./... -count=1 -v
 ```
 
+### Live acceptance (staging)
+
+`TestLiveSshKeyResource_LifecycleProof` is skipped unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`,
+`VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all set. It runs the same
+lifecycle proof as the fake-backed tests against a real API: apply creates the key, a second plan is empty,
+import by id works, and destroy removes it. The API key needs compute write scope, SSH keys must be switched
+on for that API, and the test creates one key named `tf-live-<random>` and deletes it again. The staging API
+is cluster-internal, so run it from somewhere that reaches the endpoint.
+
+```bash
+TF_ACC=1 VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDPOINT=... \
+go test ./internal/provider -run TestLiveSshKeyResource -count=1 -v
+```
+
 ## Links
 
 - API reference: <https://learn.virtscale.nl>
