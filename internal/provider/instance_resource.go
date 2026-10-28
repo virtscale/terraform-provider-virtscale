@@ -412,7 +412,7 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 	}
 
 	// hostname is sent only when the configuration gave one: an omitted
-	// hostname is left out of the body entirely, so the API picks its own.
+	// hostname is left out of the body entirely, so the instance has no hostname.
 	var hostname *string
 	if !plan.Hostname.IsNull() && !plan.Hostname.IsUnknown() {
 		h := plan.Hostname.ValueString()

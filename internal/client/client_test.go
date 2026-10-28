@@ -1172,6 +1172,18 @@ func TestAPIError_UnauthorizedAsksYouToCheckTheKey(t *testing.T) {
 	}
 }
 
+// A stale generation on a hostname change is a race with another change of the instance: the
+// API tells the caller to retry with the new ETag, which a Terraform user cannot do, so the error
+// says what they can: run apply again.
+func TestAPIError_GenerationMismatchSaysToApplyAgain(t *testing.T) {
+	c := failWith(t, 412, "generation_mismatch", "the instance changed since it was read; retry with If-Match")
+
+	_, err := c.GetVm(context.Background(), "vm-1")
+	if err == nil || !strings.Contains(err.Error(), "run apply again") {
+		t.Errorf("Error() = %v, want it to say to run apply again", err)
+	}
+}
+
 func TestAPIError_SourceAddressNotAllowedSaysTheKeyIsRestricted(t *testing.T) {
 	c := failWith(t, 403, "source_address_not_allowed", "this API token cannot be used from this network address")
 

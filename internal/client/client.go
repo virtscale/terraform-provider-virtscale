@@ -249,6 +249,10 @@ func (e *APIError) hint() string {
 	case e.Status == http.StatusForbidden && e.Code == "source_address_not_allowed":
 		return "the key's network limits do not include this address; " +
 			"run Terraform from an allowed address or widen the key's network limits"
+	case e.Status == http.StatusPreconditionFailed && e.Code == "generation_mismatch":
+		// The API says to retry with the new ETag; the provider read the instance just before, so
+		// this is a race with another change of the same instance, and what the user can do is plan again.
+		return "the instance was changed by something else while this change was being made; run apply again"
 	case isOrganizationNotVisible(e):
 		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
 			"or VIRTSCALE_API_KEY belongs to another organization"
@@ -702,7 +706,7 @@ func (c *Client) orgPath(p string) string {
 // VmCreateRequest is the body of POST /v1/orgs/{org}/compute/instances.
 //
 // Hostname, when set, is the lower-case FQDN the instance should carry; a nil
-// Hostname is left out of the body entirely, so the API picks its own.
+// Hostname is left out of the body entirely, so the instance has no hostname.
 //
 // user_data and workload_type are intentionally not represented: the API
 // refuses any non-null user_data and any workload_type other than the
