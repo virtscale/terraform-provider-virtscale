@@ -552,7 +552,13 @@ func TestGetPublicIp_AbsentUsesTheAPIsNotFoundCode(t *testing.T) {
 // --- retries (the AWS SDK's standard mode, adapted to this API) ------------
 
 const (
-	testVmJSON        = `{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":null,"observed_addresses":null,"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`
+	// The instance the compute/instances endpoints return: the provider-neutral
+	// fields (hostname, instance_type, status, private_ip, addresses,
+	// generation) are the ones the client reads. observed_status and
+	// observed_addresses are still sent by the API but deprecated: they are
+	// DECOYS here (a value no test expects to see) so that a field of Vm which
+	// still decodes them shows up in a test instead of passing.
+	testVmJSON        = `{"id":"vm-1","org_id":"o","region_id":"gro","name":"web-01","fqdn":null,"hostname":"web-01.example.com","instance_type":"general.small","status":"running","private_ip":"10.128.3.11","addresses":["10.128.3.11"],"generation":3,"image":{"image_id":"g1","name":"debian-12"},"vcpus":1,"memory_mb":1024,"disk_gb":10,"storage_pool_id":"pool1","network_profile_id":"np1","state":"running","desired_state":"running","error_class":null,"error_detail":null,"observed_status":"ACTIVE","observed_addresses":{"net":[{"addr":"198.51.100.9","version":4}]},"ssh_key_names":[],"protected":false,"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}`
 	testOperationJSON = `{"id":"op-1","type":"vm.create","state":"pending","resource_type":"vm","resource_id":"vm-1","attempt":0,"max_attempts":3,"error_class":null,"error_detail":null,"created_at":"2026-01-01T00:00:00Z","finished_at":null}`
 	testIPJSON        = `{"id":"ip-1","region_id":"gro","address":null,"vm_id":null,"state":"pending","error":null,"created_at":"2026-01-01T00:00:00Z"}`
 )
@@ -684,6 +690,7 @@ type op struct {
 }
 
 func testOps() []op {
+	hostname := "web.example.com"
 	return []op{
 		{"GetVm", http.MethodGet, false, jsonStep(200, testVmJSON), func(c *Client) error { _, err := c.GetVm(context.Background(), "vm-1"); return err }},
 		{"ListImages", http.MethodGet, false, jsonStep(200, `{"items":[],"next_cursor":null}`), func(c *Client) error { _, err := c.ListImages(context.Background(), "gro"); return err }},
@@ -709,11 +716,21 @@ func testOps() []op {
 			_, err := c.CreateSshKey(context.Background(), SshKeyCreateRequest{Name: "laptop", PublicKey: "ssh-ed25519 AAAA"}, "key-1")
 			return err
 		}},
+		// The hostname PATCH follows the keyed create: with a key it is safe to
+		// send twice, without one it is not.
+		{"UpdateVmHostname (keyed)", http.MethodPatch, true, jsonStep(200, testVmJSON), func(c *Client) error {
+			_, err := c.UpdateVmHostname(context.Background(), "vm-1", 3, &hostname, "key-1")
+			return err
+		}},
+		{"UpdateVmHostname (no key)", http.MethodPatch, false, jsonStep(200, testVmJSON), func(c *Client) error {
+			_, err := c.UpdateVmHostname(context.Background(), "vm-1", 3, &hostname, "")
+			return err
+		}},
 	}
 }
 
 // repeatable is the rule for 502/503/504 and transport errors: only a request
-// that is safe to send twice (a GET, a DELETE, or a POST carrying an
+// that is safe to send twice (a GET, a DELETE, or a POST or PATCH carrying an
 // Idempotency-Key).
 func (o op) repeatable() bool {
 	return o.method == http.MethodGet || o.method == http.MethodDelete || o.keyed

@@ -37,6 +37,7 @@ resource "virtscale_ssh_key" "example" {
 
 resource "virtscale_instance" "example" {
   name            = "example"
+  hostname        = "example.example.com"
   region          = "gro"
   image           = local.debian_12_image_id
   vcpus           = 1
@@ -57,6 +58,10 @@ output "id" {
 
 output "state" {
   value = virtscale_instance.example.state
+}
+
+output "hostname" {
+  value = virtscale_instance.example.hostname
 }
 
 output "private_ipv4" {

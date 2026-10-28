@@ -168,6 +168,12 @@ type APIError struct {
 	// processed, a lost connection. Error() then says how to find what it may
 	// have made.
 	MayHaveBeenApplied bool
+
+	// recovery is the sentence Error() appends for MayHaveBeenApplied, set by
+	// giveUp from the request method (lostCreateHint for a create, otherwise the
+	// change's own hint). Empty on a hand-built APIError, which keeps the create
+	// hint.
+	recovery string
 }
 
 // lostCreateHint is what the error of a keyed create that gave up adds: the
@@ -177,6 +183,13 @@ type APIError struct {
 const lostCreateHint = "the first request may still have created the resource: " +
 	"if the next apply reports name_taken, find it in the panel or with the API " +
 	"and bring it under management with tofu import"
+
+// lostHostnameHint is what the error of a keyed PATCH that gave up adds
+// instead: nothing was created, so the create hint would send the user looking
+// for a resource that does not exist. Another plan reads the instance's
+// current hostname, which is what the change may have set.
+const lostHostnameHint = "the first request may still have been applied: " +
+	"run another plan to see the instance's current hostname"
 
 // FieldError is one entry of a problem body's errors[]: which request field
 // the API refused and why.
@@ -208,7 +221,11 @@ func (e *APIError) Error() string {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
 	if e.MayHaveBeenApplied {
-		msg += "; " + lostCreateHint
+		hint := e.recovery
+		if hint == "" {
+			hint = lostCreateHint
+		}
+		msg += "; " + hint
 	}
 	if hint := e.hint(); hint != "" {
 		msg += "; " + hint
@@ -380,8 +397,9 @@ func (c *Client) newAPIError(status int, body []byte) *APIError {
 // (nil for none) and is wrapped in a fresh reader every time, so a retry never
 // sends a drained one. It sets auth, Accept, User-Agent and, when there is a
 // body, Content-Type; idempotencyKey, when non-empty, goes out as the
-// Idempotency-Key header.
-func (c *Client) newRequest(ctx context.Context, method, fullURL string, payload []byte, idempotencyKey string) (*http.Request, error) {
+// Idempotency-Key header. headers, when non-nil, are added to every attempt
+// (used for preconditions such as If-Match).
+func (c *Client) newRequest(ctx context.Context, method, fullURL string, payload []byte, idempotencyKey string, headers http.Header) (*http.Request, error) {
 	var reader io.Reader
 	if payload != nil {
 		reader = bytes.NewReader(payload)
@@ -400,6 +418,11 @@ func (c *Client) newRequest(ctx context.Context, method, fullURL string, payload
 	}
 	if idempotencyKey != "" {
 		req.Header.Set("Idempotency-Key", idempotencyKey)
+	}
+	for name, values := range headers {
+		for _, v := range values {
+			req.Header.Add(name, v)
+		}
 	}
 	return req, nil
 }
@@ -428,16 +451,23 @@ func (c *Client) roundTrip(req *http.Request) (*exchange, error) {
 }
 
 // doJSON issues a request and, on a 2xx response, decodes the JSON body into
-// out (when out is non-nil). Any non-2xx response yields an *APIError.
+// out (when out is non-nil). Any non-2xx response yields an *APIError. It is
+// doJSONWithHeaders without extra headers.
+func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
+	return c.doJSONWithHeaders(ctx, method, fullURL, body, idempotencyKey, nil, out)
+}
+
+// doJSONWithHeaders is doJSON with headers added to every attempt (for
+// preconditions such as If-Match).
 //
 // Throttling and transient failures are retried, like the AWS SDK's standard
 // mode, within what the API makes safe (see retryable): at most
 // retryConfig.maxAttempts sends in all, waiting what Retry-After says or an
 // exponential backoff with full jitter, and never sleeping past ctx's
 // deadline -- when the next wait would end after it, the last error is
-// returned instead. The body is rebuilt, and the Idempotency-Key reused, for
-// every attempt.
-func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, idempotencyKey string, out any) error {
+// returned instead. The body is rebuilt, and the Idempotency-Key and headers
+// reused, for every attempt.
+func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, body any, idempotencyKey string, headers http.Header, out any) error {
 	var payload []byte
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -449,7 +479,7 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 
 	var lastErr error
 	for attempt := 1; ; attempt++ {
-		req, err := c.newRequest(ctx, method, fullURL, payload, idempotencyKey)
+		req, err := c.newRequest(ctx, method, fullURL, payload, idempotencyKey, headers)
 		if err != nil {
 			return err
 		}
@@ -464,9 +494,9 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 				// theirs. An earlier attempt's API error says more than the
 				// cancellation does.
 				if lastErr != nil {
-					return giveUp(lastErr, 0, idempotencyKey)
+					return giveUp(lastErr, 0, idempotencyKey, method)
 				}
-				return giveUp(transportErr, 0, idempotencyKey)
+				return giveUp(transportErr, 0, idempotencyKey, method)
 			}
 			lastErr = transportErr
 		case ex.status >= 200 && ex.status < 300:
@@ -484,7 +514,7 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 		}
 
 		if attempt >= c.retry.maxAttempts || !retryable(method, idempotencyKey, ex, apiErr, transportErr) {
-			return giveUp(lastErr, attempt, idempotencyKey)
+			return giveUp(lastErr, attempt, idempotencyKey, method)
 		}
 		var header http.Header
 		if ex != nil {
@@ -492,13 +522,13 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 		}
 		wait, ok := c.retryDelay(attempt, header)
 		if !ok {
-			return giveUp(lastErr, attempt, idempotencyKey)
+			return giveUp(lastErr, attempt, idempotencyKey, method)
 		}
 		if deadline, has := ctx.Deadline(); has && c.retry.now().Add(wait).After(deadline) {
-			return giveUp(lastErr, attempt, idempotencyKey)
+			return giveUp(lastErr, attempt, idempotencyKey, method)
 		}
 		if err := c.retry.sleep(ctx, wait); err != nil {
-			return giveUp(lastErr, attempt, idempotencyKey)
+			return giveUp(lastErr, attempt, idempotencyKey, method)
 		}
 	}
 }
@@ -507,20 +537,29 @@ func (c *Client) doJSON(ctx context.Context, method, fullURL string, body any, i
 // the error as it came, saying (for an error that is not an *APIError, which
 // carries its own count) how many sends it took, and, for a request that
 // carried an Idempotency-Key, how to recover when the failure leaves open that
-// the API processed it anyway.
-func giveUp(err error, attempts int, idempotencyKey string) error {
+// the API processed it anyway. The recovery sentence depends on the method: a
+// POST creates a resource (see lostCreateHint), while a PATCH changes one
+// (see lostHostnameHint).
+func giveUp(err error, attempts int, idempotencyKey, method string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
+	hint := lostCreateHint
+	if method == http.MethodPatch {
+		hint = lostHostnameHint
+	}
 
 	var apiErr *APIError
 	if errors.As(err, &apiErr) {
 		apiErr.MayHaveBeenApplied = lost
+		if lost {
+			apiErr.recovery = hint
+		}
 		return err
 	}
 	if attempts > 1 {
 		err = fmt.Errorf("%w; gave up after %d attempts", err, attempts)
 	}
 	if lost {
-		err = fmt.Errorf("%w; %s", err, lostCreateHint)
+		err = fmt.Errorf("%w; %s", err, hint)
 	}
 	return err
 }
@@ -549,11 +588,11 @@ func mayHaveBeenApplied(err error) bool {
 }
 
 // repeatable reports whether sending the request twice is safe: a GET, a
-// DELETE, or a POST that carries an Idempotency-Key (the API replays the first
-// answer for the same key and body).
+// DELETE, or a POST or PATCH that carries an Idempotency-Key (the API replays
+// the first answer for the same key and body).
 func repeatable(method, idempotencyKey string) bool {
 	return method == http.MethodGet || method == http.MethodDelete ||
-		(method == http.MethodPost && idempotencyKey != "")
+		((method == http.MethodPost || method == http.MethodPatch) && idempotencyKey != "")
 }
 
 // retryable decides whether a failed attempt may be repeated.
@@ -561,7 +600,8 @@ func repeatable(method, idempotencyKey string) bool {
 //   - 429 is retried for every method: the rate limiter refuses a request
 //     before it runs.
 //   - 502, 503, 504 and transport errors may have been applied, so only a
-//     repeatable request is retried.
+//     repeatable request (a GET, a DELETE, or a keyed POST or PATCH) is
+//     retried.
 //   - A 503 whose code is not_ready says a feature flag is off; retrying
 //     cannot help.
 //   - A 409 idempotency_in_progress on a request that carries an
@@ -659,7 +699,10 @@ func (c *Client) orgPath(p string) string {
 
 // --- Types -----------------------------------------------------------------
 
-// VmCreateRequest is the body of POST /v1/orgs/{org}/compute/vms.
+// VmCreateRequest is the body of POST /v1/orgs/{org}/compute/instances.
+//
+// Hostname, when set, is the lower-case FQDN the instance should carry; a nil
+// Hostname is left out of the body entirely, so the API picks its own.
 //
 // user_data and workload_type are intentionally not represented: the API
 // refuses any non-null user_data and any workload_type other than the
@@ -673,6 +716,7 @@ type VmCreateRequest struct {
 	StoragePool    string   `json:"storage_pool"`
 	Region         string   `json:"region"`
 	NetworkProfile string   `json:"network_profile"`
+	Hostname       *string  `json:"hostname,omitempty"`
 	SSHKeys        []string `json:"ssh_keys,omitempty"`
 }
 
@@ -682,29 +726,46 @@ type ImageRef struct {
 	Name    string `json:"name"`
 }
 
-// Vm is the VmOut representation returned by the compute/vms endpoints.
+// Vm is the VmOut representation returned by the compute/instances endpoints.
+//
+//   - Hostname is the lower-case FQDN the customer gave the instance. It is
+//     unique per organization among live instances, and is only a handle: it
+//     creates no DNS record.
+//   - InstanceType is the catalogue instance type the instance was created from
+//     (null when the API reports none).
+//   - Status is the VirtScale status word.
+//   - PrivateIP is the instance's private IPv4, once it has been observed.
+//   - Addresses are the instance's addresses, once they have been observed.
+//   - Generation is the number the PATCH precondition (If-Match) uses.
+//
+// The API still publishes observed_status and observed_addresses, but they are
+// deprecated cloud vocabulary: this struct deliberately does not decode them.
 type Vm struct {
-	ID                string         `json:"id"`
-	OrgID             string         `json:"org_id"`
-	RegionID          string         `json:"region_id"`
-	Name              string         `json:"name"`
-	FQDN              *string        `json:"fqdn"`
-	Image             ImageRef       `json:"image"`
-	VCPUs             int            `json:"vcpus"`
-	MemoryMB          int            `json:"memory_mb"`
-	DiskGB            int            `json:"disk_gb"`
-	StoragePoolID     string         `json:"storage_pool_id"`
-	NetworkProfileID  string         `json:"network_profile_id"`
-	State             string         `json:"state"`
-	DesiredState      string         `json:"desired_state"`
-	ErrorClass        *string        `json:"error_class"`
-	ErrorDetail       *string        `json:"error_detail"`
-	ObservedStatus    *string        `json:"observed_status"`
-	ObservedAddresses map[string]any `json:"observed_addresses"`
-	SSHKeyNames       []string       `json:"ssh_key_names"`
-	Protected         bool           `json:"protected"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	ID               string    `json:"id"`
+	OrgID            string    `json:"org_id"`
+	RegionID         string    `json:"region_id"`
+	Name             string    `json:"name"`
+	FQDN             *string   `json:"fqdn"`
+	Hostname         *string   `json:"hostname"`
+	InstanceType     *string   `json:"instance_type"`
+	Status           string    `json:"status"`
+	PrivateIP        *string   `json:"private_ip"`
+	Addresses        []string  `json:"addresses"`
+	Generation       int64     `json:"generation"`
+	Image            ImageRef  `json:"image"`
+	VCPUs            int       `json:"vcpus"`
+	MemoryMB         int       `json:"memory_mb"`
+	DiskGB           int       `json:"disk_gb"`
+	StoragePoolID    string    `json:"storage_pool_id"`
+	NetworkProfileID string    `json:"network_profile_id"`
+	State            string    `json:"state"`
+	DesiredState     string    `json:"desired_state"`
+	ErrorClass       *string   `json:"error_class"`
+	ErrorDetail      *string   `json:"error_detail"`
+	SSHKeyNames      []string  `json:"ssh_key_names"`
+	Protected        bool      `json:"protected"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 // Operation is the OperationRef representation returned alongside async
@@ -784,41 +845,62 @@ type publicIpAccepted struct {
 
 // --- VM methods --------------------------------------------------------
 
-// CreateVm sends POST /v1/orgs/{org}/compute/vms. When idempotencyKey is
+// CreateVm sends POST /v1/orgs/{org}/compute/instances. When idempotencyKey is
 // non-empty it is sent as the Idempotency-Key header.
 func (c *Client) CreateVm(ctx context.Context, req VmCreateRequest, idempotencyKey string) (*Vm, *Operation, error) {
 	var out vmAccepted
-	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("compute/vms"), req, idempotencyKey, &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("compute/instances"), req, idempotencyKey, &out); err != nil {
 		return nil, nil, err
 	}
 	return &out.Vm, &out.Operation, nil
 }
 
-// GetVm sends GET /v1/orgs/{org}/compute/vms/{id}.
+// GetVm sends GET /v1/orgs/{org}/compute/instances/{id}.
 func (c *Client) GetVm(ctx context.Context, id string) (*Vm, error) {
 	var out Vm
-	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/vms/"+url.PathEscape(id)), nil, "", &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/instances/"+url.PathEscape(id)), nil, "", &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
-// DeleteVm sends DELETE /v1/orgs/{org}/compute/vms/{id}.
+// DeleteVm sends DELETE /v1/orgs/{org}/compute/instances/{id}.
 func (c *Client) DeleteVm(ctx context.Context, id string) (*Vm, *Operation, error) {
 	var out vmAccepted
-	if err := c.doJSON(ctx, http.MethodDelete, c.orgPath("compute/vms/"+url.PathEscape(id)), nil, "", &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodDelete, c.orgPath("compute/instances/"+url.PathEscape(id)), nil, "", &out); err != nil {
 		return nil, nil, err
 	}
 	return &out.Vm, &out.Operation, nil
 }
 
-// ListVms sends GET /v1/orgs/{org}/compute/vms.
+// ListVms sends GET /v1/orgs/{org}/compute/instances.
 func (c *Client) ListVms(ctx context.Context) ([]Vm, error) {
 	var out listResponse[Vm]
-	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/vms"), nil, "", &out); err != nil {
+	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/instances"), nil, "", &out); err != nil {
 		return nil, err
 	}
 	return out.Items, nil
+}
+
+// UpdateVmHostname sends PATCH /v1/orgs/{org}/compute/instances/{id} with body
+// {"hostname": hostname} (null when hostname is nil, which clears it), and
+// answers 200 with the updated instance. The generation travels as the If-Match
+// precondition, so a change built on a stale read is refused instead of
+// overwriting a newer one. When idempotencyKey is non-empty it is sent as the
+// Idempotency-Key header, which makes the PATCH safe to repeat.
+func (c *Client) UpdateVmHostname(ctx context.Context, id string, generation int64, hostname *string, idempotencyKey string) (*Vm, error) {
+	body := struct {
+		Hostname *string `json:"hostname"`
+	}{Hostname: hostname}
+
+	headers := http.Header{}
+	headers.Set("If-Match", `"`+strconv.FormatInt(generation, 10)+`"`)
+
+	var out Vm
+	if err := c.doJSONWithHeaders(ctx, http.MethodPatch, c.orgPath("compute/instances/"+url.PathEscape(id)), body, idempotencyKey, headers, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // GetOperation sends GET /v1/orgs/{org}/operations/{id}.

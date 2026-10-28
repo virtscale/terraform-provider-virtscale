@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/netip"
 	"regexp"
-	"sort"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -76,6 +74,43 @@ func (vmNameValidator) ValidateString(_ context.Context, req validator.StringReq
 			fmt.Sprintf("%q is not a valid instance name: use 1-63 lowercase letters, digits or hyphens, "+
 				"starting and ending with a letter or digit. The API lower-cases names and strips a trailing "+
 				"\".virtscale.nl\", so any other form would come back different from the configuration.", name),
+		)
+	}
+}
+
+// hostnamePattern is the API's hostname rule: a dotted sequence of DNS labels,
+// at least two of them, the last starting with a letter.
+var hostnamePattern = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]([a-z0-9-]{0,61}[a-z0-9])?$`)
+
+// maxHostnameLen is the API's ceiling on a hostname, in characters.
+const maxHostnameLen = 253
+
+// hostnameValidator refuses, at plan time, a hostname the API would not store:
+// one that does not match its pattern, or is longer than 253 characters. Only a
+// known, non-null value is checked.
+type hostnameValidator struct{}
+
+func (hostnameValidator) Description(context.Context) string {
+	return "a lower-case fully qualified name such as web.example.com, at most 253 characters"
+}
+
+func (v hostnameValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (hostnameValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	name := req.ConfigValue.ValueString()
+	if len([]rune(name)) > maxHostnameLen || !hostnamePattern.MatchString(name) {
+		resp.Diagnostics.AddAttributeError(
+			req.Path,
+			"Invalid hostname",
+			fmt.Sprintf("%q is not a valid hostname: it must be a lower-case fully qualified name such as "+
+				"web.example.com -- dot-separated labels of lower-case letters, digits and hyphens, each 1-63 "+
+				"characters, not starting or ending with a hyphen, at least two labels, the last label starting "+
+				"with a letter, at most %d characters in all.", name, maxHostnameLen),
 		)
 	}
 }
@@ -170,6 +205,9 @@ type instanceResourceModel struct {
 	NetworkProfile types.String `tfsdk:"network_profile"`
 	SSHKeys        types.List   `tfsdk:"ssh_keys"`
 	State          types.String `tfsdk:"state"`
+	Status         types.String `tfsdk:"status"`
+	Hostname       types.String `tfsdk:"hostname"`
+	InstanceType   types.String `tfsdk:"instance_type"`
 	FQDN           types.String `tfsdk:"fqdn"`
 	PrivateIPv4    types.String `tfsdk:"private_ipv4"`
 	CreatedAt      types.String `tfsdk:"created_at"`
@@ -181,8 +219,8 @@ func (r *InstanceResource) Metadata(_ context.Context, req resource.MetadataRequ
 }
 
 // Schema declares the virtscale_instance attributes. Every required and
-// optional attribute forces replacement: in-place changes are out of scope
-// for v0.
+// optional attribute forces replacement, except hostname: it is the one
+// in-place change the API offers.
 func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "A VirtScale compute instance (VM).",
@@ -284,9 +322,29 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"state": schema.StringAttribute{
 				Computed:    true,
 				Description: "The instance's current lifecycle state, as reported by the API.",
+			},
+			"status": schema.StringAttribute{
+				Computed:    true,
+				Description: "The instance's status word, as the API reports it.",
+			},
+			"hostname": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "The lower-case FQDN the instance is known by in your organization; unique among the " +
+					"organization's live instances (a duplicate is 409 hostname_taken). It is a handle only: no DNS " +
+					"record is created. Changing it updates the instance in place; it is read back from the API on " +
+					"every refresh, so a change made elsewhere shows as a difference. Removing the attribute from " +
+					"the configuration keeps the current hostname (this provider does not remove one). Import " +
+					"fills it.",
+				Validators: []validator.String{hostnameValidator{}},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
+			},
+			"instance_type": schema.StringAttribute{
+				Computed: true,
+				Description: "The catalogue instance type the instance was created from; null when the API does " +
+					"not report one.",
 			},
 			"fqdn": schema.StringAttribute{
 				Computed:    true,
@@ -296,11 +354,9 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 			"private_ipv4": schema.StringAttribute{
-				Computed:    true,
-				Description: "The instance's first observed private IPv4 address. Empty until one is observed.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
-				},
+				Computed: true,
+				Description: "The instance's private IPv4 address, as reported by the platform; empty until it is " +
+					"known. An associated public IP is not the private address.",
 			},
 			"created_at": schema.StringAttribute{
 				Computed:    true,
@@ -355,6 +411,14 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 
+	// hostname is sent only when the configuration gave one: an omitted
+	// hostname is left out of the body entirely, so the API picks its own.
+	var hostname *string
+	if !plan.Hostname.IsNull() && !plan.Hostname.IsUnknown() {
+		h := plan.Hostname.ValueString()
+		hostname = &h
+	}
+
 	vm, _, err := r.client.CreateVm(ctx, client.VmCreateRequest{
 		Name:           plan.Name.ValueString(),
 		Image:          plan.Image.ValueString(),
@@ -364,6 +428,7 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		StoragePool:    plan.StoragePool.ValueString(),
 		Region:         plan.Region.ValueString(),
 		NetworkProfile: plan.NetworkProfile.ValueString(),
+		Hostname:       hostname,
 		SSHKeys:        sshKeys,
 	}, idempotencyKey)
 	if err != nil {
@@ -509,16 +574,70 @@ func sameNames(a, b []string) bool {
 	return true
 }
 
-// Update is never reached for a config change: every settable attribute
-// forces replacement. It is implemented to copy plan into state, matching
-// what the framework's Update contract expects.
+// Update carries out the one in-place change the API offers: a hostname
+// change. A configured, non-null hostname that differs from the state's is
+// sent as a PATCH, with the generation of a fresh read as its precondition and
+// a fresh Idempotency-Key. Everything else forces replacement, so a plan that
+// reaches Update changes nothing but the hostname -- and when even that does
+// not differ, the computed values the plan left unknown are resolved from a
+// read instead.
 func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan instanceResourceModel
+	var plan, prior instanceResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &prior)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	if hostnameChanged(plan.Hostname, prior.Hostname) {
+		// The generation the PATCH must carry is read fresh, not taken from
+		// the state: the instance may have moved on since the last refresh,
+		// and a stale If-Match would be refused with 412 generation_mismatch.
+		vm, err := r.client.GetVm(ctx, prior.ID.ValueString())
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
+			return
+		}
+
+		idempotencyKey, err := newIdempotencyKey()
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
+			return
+		}
+
+		hostname := plan.Hostname.ValueString()
+		updated, err := r.client.UpdateVmHostname(ctx, vm.ID, vm.Generation, &hostname, idempotencyKey)
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
+			return
+		}
+
+		applyVmToModel(&plan, updated)
+		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+		return
+	}
+
+	// Nothing to change: refresh the computed values the plan left unknown so
+	// that no unknown is written to state.
+	vm, err := r.client.GetVm(ctx, prior.ID.ValueString())
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
+		return
+	}
+	applyVmToModel(&plan, vm)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// hostnameChanged reports whether planned differs from prior: a known,
+// non-null planned hostname that the prior state does not already hold.
+func hostnameChanged(planned, prior types.String) bool {
+	if planned.IsNull() || planned.IsUnknown() {
+		return false
+	}
+	if prior.IsNull() || prior.IsUnknown() {
+		return true
+	}
+	return planned.ValueString() != prior.ValueString()
 }
 
 // Delete requests deletion and waits for the vm to report state deleted or
@@ -599,6 +718,7 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.StoragePool = types.StringValue(vm.StoragePoolID)
 	model.NetworkProfile = types.StringValue(vm.NetworkProfileID)
 	model.State = types.StringValue(vm.State)
+	model.Status = types.StringValue(vm.Status)
 	model.CreatedAt = types.StringValue(vm.CreatedAt.Format(time.RFC3339))
 
 	if vm.FQDN != nil {
@@ -607,64 +727,23 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 		model.FQDN = types.StringNull()
 	}
 
-	model.PrivateIPv4 = types.StringValue(firstIPv4(vm.ObservedAddresses))
-}
-
-// firstIPv4 returns the instance's private IPv4 address from the
-// observed_addresses map, iterating network names in sorted order for
-// determinism. It returns "" when there is none.
-//
-// The map is Nova's addresses structure, stored verbatim: network name to a
-// list of entries. The contract promises "addr" and little else -- the
-// platform's own readers and fixtures accept entries with just addr, or bare
-// address strings -- so an entry counts when its addr parses as IPv4 and it is
-// not explicitly marked as anything but fixed. A floating entry (an associated
-// public IP, which Nova lists next to the fixed address) is never the private
-// address.
-func firstIPv4(observed map[string]any) string {
-	if observed == nil {
-		return ""
+	if vm.Hostname != nil {
+		model.Hostname = types.StringValue(*vm.Hostname)
+	} else {
+		model.Hostname = types.StringNull()
 	}
 
-	names := make([]string, 0, len(observed))
-	for name := range observed {
-		names = append(names, name)
+	if vm.InstanceType != nil {
+		model.InstanceType = types.StringValue(*vm.InstanceType)
+	} else {
+		model.InstanceType = types.StringNull()
 	}
-	sort.Strings(names)
 
-	for _, name := range names {
-		entries, ok := observed[name].([]any)
-		if !ok {
-			continue
-		}
-		for _, e := range entries {
-			if addr := fixedIPv4Of(e); addr != "" {
-				return addr
-			}
-		}
+	if vm.PrivateIP != nil {
+		model.PrivateIPv4 = types.StringValue(*vm.PrivateIP)
+	} else {
+		model.PrivateIPv4 = types.StringValue("")
 	}
-	return ""
-}
-
-// fixedIPv4Of returns the IPv4 address of one addresses entry, or "" when the
-// entry is not an IPv4 address or is marked as other than fixed.
-func fixedIPv4Of(entry any) string {
-	var raw string
-	switch e := entry.(type) {
-	case string:
-		raw = e
-	case map[string]any:
-		if kind, ok := e["OS-EXT-IPS:type"].(string); ok && kind != "fixed" {
-			return ""
-		}
-		raw, _ = e["addr"].(string)
-	default:
-		return ""
-	}
-	if ip, err := netip.ParseAddr(raw); err == nil && ip.Is4() {
-		return ip.String()
-	}
-	return ""
 }
 
 func ptrOrEmpty(s *string) string {
