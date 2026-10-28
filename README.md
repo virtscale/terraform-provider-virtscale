@@ -306,6 +306,19 @@ The run counts only when `-v` shows `--- PASS: TestLiveSshKeyResource_LifecycleP
 refuses the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fails at once, instead of skipping,
 when a live run is requested and `tofu` cannot be found.
 
+In CI the job `provider-staging-live` does this for you, without anyone holding the key. It exists only in a pipeline
+started through the GitLab API on `main` with the variable `PROVIDER_STAGING_LIVE=1`; a push, a merge request or a web
+click never runs it. The job logs in to OpenBao with the JWT role `provider-staging-live` (this project, protected
+`main`, API pipelines), reads the staging test org's key, runs the test above against
+`http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the token. It fails unless the log shows
+`--- PASS` for the test, withholds the log if it contains the key, and checks that no `tf-live-*` key is left in the org.
+
+```bash
+curl -sS -X POST -H "PRIVATE-TOKEN: $GITLAB_TOKEN" -H "Content-Type: application/json" \
+  -d '{"ref":"main","variables":[{"key":"PROVIDER_STAGING_LIVE","value":"1"}]}' \
+  "$GITLAB_URL/api/v4/projects/225/pipeline"
+```
+
 ## Links
 
 - API reference: <https://learn.virtscale.nl>
