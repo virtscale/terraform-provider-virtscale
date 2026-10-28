@@ -53,12 +53,14 @@ test:
 # key in shell variables, hands it to the one `go test` process and revokes the OpenBao token. ci/provider-staging-live.sh
 # has the steps; the key is never exported, written to disk or printed, and the log is withheld if it contains it.
 # The staging API is reached on its in-cluster name, which the s3-staging NetworkPolicy admits from CI job pods only
-# (the gitlab-runner namespace). BAO_CA_PEM is the cluster CA, a public certificate, as a protected CI variable.
+# (the gitlab-runner namespace). The OpenBao CA is a committed public certificate (ci/bao-ca.pem).
 #
-# Hardening (a pipeline variable can reach the job's environment): no cache (the Go module cache is built fresh and
-# verified, never shared with unprivileged branch jobs), no global variables inherited, the script refuses to run
-# when the pipeline carries proxy, Go, curl, loader or Terraform variables, and project setting "minimum role to use
-# pipeline variables" is Maintainer. ci/check-provider-staging-live.sh (run by `test`) keeps these lines in place.
+# Hardening (a pipeline variable can reach the job's environment): the script re-executes itself under `env -i` with an
+# allowlist of variables and takes everything else from literals in the file, so nothing a trigger sets (proxy, Go,
+# curl, loader, Terraform, apt, PATH, shell startup) reaches it. There is no before_script (it would run before that
+# allowlist), no cache (the Go module cache is built fresh and verified, never shared with unprivileged branch jobs)
+# and no inherited global variables. The project setting "minimum role to use pipeline variables" is Maintainer.
+# ci/check-provider-staging-live.sh (run by `test`) keeps these lines in place.
 provider-staging-live:
   stage: test
   image: golang:1.25-bookworm
@@ -71,10 +73,8 @@ provider-staging-live:
   id_tokens:
     BAO_ID_TOKEN:
       aud: openbao.virtscale.nl
-  before_script:
-    - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates jq
   script:
-    - sh ci/provider-staging-live.sh
+    - /bin/sh ci/provider-staging-live.sh
   artifacts:
     when: always
     expire_in: 30 days

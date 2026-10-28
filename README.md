@@ -312,8 +312,9 @@ click never runs it. The job logs in to OpenBao with the JWT role `provider-stag
 `main`, API pipelines), reads the staging test org's key, runs the test above against
 `http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the token. It fails unless the log shows
 `--- PASS` for the test, withholds the log if it contains the key, and checks that the org's key list holds no more
-`tf-live-*` keys after the run than before. It refuses to run when the pipeline carries proxy, Go, curl, loader or
-Terraform variables, uses its own pinned and checksum-verified `tofu`, and runs without a cache. Only users with the
+`tf-live-*` keys after the run than before. The script re-executes itself under `env -i` with a short allowlist of
+variables, so nothing a trigger sets (proxy, Go, curl, apt, `PATH`, ...) reaches it; it uses its own pinned and
+checksum-verified `tofu`, the public OpenBao CA in `ci/bao-ca.pem`, and runs without a cache. Only users with the
 Maintainer role can start a pipeline with variables in this project.
 
 ```bash
