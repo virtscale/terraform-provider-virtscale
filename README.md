@@ -17,6 +17,9 @@ from there.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
 - Data source `virtscale_images`: the image catalogue for a region.
+- Data sources `virtscale_regions`, `virtscale_instance_types` and `virtscale_plans`: the catalogues a configuration
+  chooses from.
+- Data source `virtscale_caller`: who the API key is (`GET /v1/me`): its organization, scopes and permissions.
 
 See [examples/main.tf](examples/main.tf) for a complete, runnable configuration.
 
@@ -88,7 +91,8 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_instance` (create, destroy, refresh) | `compute:write` |
 | `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
-| `virtscale_images` (data source) | `compute:read` (`compute:write` covers it too) |
+| `virtscale_images`, `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources) | `compute:read` (`compute:write` covers it too) |
+| `virtscale_caller` (data source) | any key: `GET /v1/me` asks for no permission |
 | `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances, SSH keys and images, `network:read` for public IPs |
 
 A configuration with an instance and a public IP associated to it needs both `compute:write` and
@@ -257,6 +261,34 @@ region as the address (`422 region_mismatch`), and an instance carries one publi
 beyond the quota is `422 quota_exceeded`. Destroying disassociates first when the address is associated, then
 releases it.
 
+### `virtscale_caller` (data source)
+
+Who the API key is, from `GET /v1/me`. It fails early, with the organization named, when the key does not belong to
+the provider's `organization`, which is easier to read than the `404` of the first resource.
+
+| Attribute              | Type        | Notes |
+| ---------------------- | ----------- | ----- |
+| `id`, `subject`        | string      | `api-token:<key id>` for an API key. |
+| `realm`, `credential`  | string      | `credential` is `api_token` for an API key. |
+| `organization_id`      | string      | The provider's `organization`, confirmed to be one the credential names. |
+| `permissions_enforced` | bool        | Whether the deployment refuses a request that lacks a permission. |
+| `scopes`               | set(string) | The key's scopes; empty when the credential is not an API key. |
+| `permissions`          | set(string) | Every permission the credential holds in the organization. |
+| `role`                 | string      | Null for an API key. |
+| `api_key_id`           | string      | Null when the credential is not an API key. |
+| `project_id`           | string      | Set when the key is restricted to one project. Such a key is refused on `/v1/orgs/{org}/...`. |
+| `expires_at`           | string      | RFC 3339; null when the key never expires. |
+
+### `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources)
+
+Read-only catalogues, in the order the API gives them. `virtscale_regions.regions` lists `id`, `name`, `datacenter`,
+`status` (`active`, `coming_soon`, `maintenance`, `retired`), `access`, `entitled` (whether this organization may use
+a restricted region), `default` and `disk_types` (`disk_type` and `status`). `virtscale_instance_types.instance_types`
+lists `id`, `vrn`, `name`, `family`, `cpu_kind`, `vcpus`, `memory_mb`, `disk_gb`, `regions` (where it can be ordered
+now) and `status`; the optional `region` keeps the types that can be ordered there. `virtscale_plans.plans` lists the
+Managed VPS plans with `id`, `name`, `vcpus`, `ram_mb`, `disk_gb`, `monthly_price_cents`, `currency`, `status`,
+`management_level` and `backup_policy`.
+
 ### `virtscale_images` (data source)
 
 | Attribute | Type   | Required/Computed | Notes |
@@ -271,7 +303,12 @@ Unit tests (client package) run with plain `go test`. Provider and resource test
 tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
 `TF_ACC=1` and `tofu` on `PATH`. The fake is written from the deployed API's spec and handlers
 (s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
-own types, so a wrong field name or status in the client fails a test instead of being mirrored back. Its SSH-key
+own types, so a wrong field name or status in the client fails a test instead of being mirrored back. On top of
+that, every request the client sends the fake and every answer it gets back is checked against the OpenAPI document
+the provider was written against, `internal/contract/customer-v1.json` (s3-control-plane `87607618`; `SOURCE` says
+how to update it): a route the contract does not have, a deprecated `/compute/vms` route, a request field it does
+not know and an answer that lacks a required field all fail the test. This stands in for a generated client until
+`sdk-go` can be used (decision D12 in `docs/plans/terraform-provider-virtscale.md`). Its SSH-key
 routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
 parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Run
 everything with:

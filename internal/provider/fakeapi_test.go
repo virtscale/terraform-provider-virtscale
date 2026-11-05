@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/contract"
 )
 
 // fakeAPI is an in-process httptest fake of the VirtScale customer API
@@ -39,6 +41,11 @@ type fakeAPI struct {
 	apiKey string
 	org    string
 	srv    *httptest.Server
+
+	// contract checks every exchange with the provider's client against customer-v1.json (internal/contract);
+	// a mismatch fails t.
+	contract *contract.Spec
+	t        *testing.T
 
 	mu          sync.Mutex
 	vms         map[string]*fakeVm
@@ -149,6 +156,37 @@ type wireVmOut struct {
 	AllowedActions    []string       `json:"allowed_actions"`
 	CreatedAt         time.Time      `json:"created_at"`
 	UpdatedAt         time.Time      `json:"updated_at"`
+}
+
+// wireActionAvailability is ActionAvailabilityOut: whether one action can be asked of the VM right now.
+type wireActionAvailability struct {
+	Action    string  `json:"action"`
+	Available bool    `json:"available"`
+	Code      *string `json:"code"`
+	Reason    *string `json:"reason"`
+}
+
+// MarshalJSON adds available_actions, which VmOut requires: one entry per action of the vocabulary, available when
+// allowed_actions lists it and refused by policy otherwise.
+func (v wireVmOut) MarshalJSON() ([]byte, error) {
+	type plain wireVmOut
+	out := struct {
+		plain
+		AvailableActions []wireActionAvailability `json:"available_actions"`
+	}{plain: plain(v)}
+	allowed := map[string]bool{}
+	for _, a := range v.AllowedActions {
+		allowed[a] = true
+	}
+	for _, a := range allVmActions {
+		e := wireActionAvailability{Action: a, Available: allowed[a]}
+		if !e.Available {
+			code, reason := "vm_action_not_allowed", "this action is not allowed here"
+			e.Code, e.Reason = &code, &reason
+		}
+		out.AvailableActions = append(out.AvailableActions, e)
+	}
+	return json.Marshal(out)
 }
 
 type wireOperationRef struct {
@@ -280,9 +318,53 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		sshKeys:        make(map[string]*wireSshKeyOut),
 		sshKeyQuota:    20,
 	}
+	spec, err := contract.Load()
+	if err != nil {
+		t.Fatalf("load the contract: %v", err)
+	}
+	f.contract, f.t = spec, t
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+// capture records the status and body a handler writes, and passes them on.
+type capture struct {
+	http.ResponseWriter
+	status int
+	body   bytes.Buffer
+}
+
+func (c *capture) WriteHeader(status int) {
+	if c.status == 0 {
+		c.status = status
+	}
+	c.ResponseWriter.WriteHeader(status)
+}
+
+func (c *capture) Write(p []byte) (int, error) {
+	if c.status == 0 {
+		c.status = http.StatusOK
+	}
+	c.body.Write(p)
+	return c.ResponseWriter.Write(p)
+}
+
+// serveChecked serves rc and, for a request the provider's client made (the fake's own tests send others, some
+// deliberately wrong), checks the exchange against the contract.
+func (f *fakeAPI) serveChecked(rc *reqCtx) {
+	if !strings.HasPrefix(rc.r.UserAgent(), "terraform-provider-virtscale/") {
+		f.serve(rc)
+		return
+	}
+	body, _ := io.ReadAll(rc.r.Body)
+	rc.r.Body = io.NopCloser(bytes.NewReader(body))
+	rec := &capture{ResponseWriter: rc.w}
+	rc.w = rec
+	f.serve(rc)
+	for _, problem := range f.contract.Check(rc.r.Method, rc.r.URL.Path, body, rec.status, rec.Header().Get("Content-Type"), rec.body.Bytes()) {
+		f.t.Errorf("contract: %s", problem)
+	}
 }
 
 // URL returns the fake server's base URL, suitable for the provider's
@@ -799,6 +881,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
+	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types":
+		key = rest
 	case rest == "compute/public-ips":
 		key = "compute/public-ips"
 	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "public-ips":
@@ -815,7 +899,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	switch method + " " + key {
 	case "POST compute/instances", "GET compute/instances/{vm_id}",
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
-		"GET compute/images",
+		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
 		"POST compute/ssh-keys", "GET compute/ssh-keys",
@@ -837,7 +921,7 @@ func (f *fakeAPI) handle(w http.ResponseWriter, r *http.Request) {
 		fault.respond(rc)
 		return
 	}
-	f.serve(rc)
+	f.serveChecked(rc)
 }
 
 // routePermissions is ROUTE_PERMISSIONS (permissions.py) restricted to the
@@ -848,6 +932,9 @@ var routePermissions = map[string]string{
 	"DELETE compute/instances/{vm_id}":                    "compute.instance.delete",
 	"PATCH compute/instances/{vm_id}":                     "compute.instance.update",
 	"GET compute/images":                                  "compute.instance.list",
+	"GET compute/regions":                                 "compute.instance.list",
+	"GET compute/plans":                                   "compute.instance.list",
+	"GET instance-types":                                  "compute.instance_type.list",
 	"GET compute/public-ips":                              "edge.public_ip.read",
 	"POST compute/public-ips":                             "edge.public_ip.allocate",
 	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
@@ -900,6 +987,10 @@ func (rc *reqCtx) allows(perm string) bool {
 
 func (f *fakeAPI) serve(rc *reqCtx) {
 	r := rc.r
+	if r.URL.Path == "/v1/me" {
+		f.serveMe(rc)
+		return
+	}
 	orgRaw, rest, ok := splitOrgPath(r.URL.Path)
 	if !ok {
 		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
@@ -974,6 +1065,12 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.releasePublicIp(rc, id)
 	case "GET compute/images":
 		f.listImages(rc)
+	case "GET compute/regions":
+		f.listRegions(rc)
+	case "GET compute/plans":
+		f.listPlans(rc)
+	case "GET instance-types":
+		f.listInstanceTypes(rc)
 	case "POST compute/ssh-keys":
 		f.importSshKey(rc)
 	case "GET compute/ssh-keys":
@@ -2320,7 +2417,7 @@ var (
 		"memory_mb", "disk_gb", "storage_pool_id", "workload_type", "network_profile_id", "state",
 		"status", "desired_state", "private_ip", "addresses", "generation", "error_class",
 		"error_detail", "observed_status", "observed_addresses", "observed_at", "ssh_key_names",
-		"user_data_present", "protected", "allowed_actions", "created_at", "updated_at",
+		"user_data_present", "protected", "allowed_actions", "available_actions", "created_at", "updated_at",
 	}
 	specOperationRefKeys = []string{
 		"id", "type", "state", "resource_type", "resource_id", "attempt", "max_attempts",
