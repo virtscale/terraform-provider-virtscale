@@ -1111,9 +1111,10 @@ func failWith(t *testing.T, status int, code, detail string) *Client {
 // permission_denied names the permission it wants (permissions.py); the
 // diagnostic adds the key scope that grants it: compute.* and operation.* come
 // with compute:write (compute:read for the reads), edge.* and network.* with
-// network:write (network:read for the reads).
+// network:write (network:read for the reads), storage.* with storage:write
+// (storage:read for the reads).
 func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
-	const compute, network = "compute", "network"
+	const compute, network, storage = "compute", "network", "storage"
 	cases := []struct {
 		permission, family string
 		read               bool
@@ -1130,6 +1131,14 @@ func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
 		{"edge.public_ip.read", network, true},
 		{"network.firewall.update", network, false},
 		{"network.read", network, true},
+		{"network.vpc.create", network, false},
+		{"network.vpc.list", network, true},
+		{"storage.bucket.create", storage, false},
+		{"storage.access_key.revoke", storage, false},
+		{"storage.bucket.read", storage, true},
+		{"compute.instance_type.list", compute, true},
+		{"project.list", compute, true},
+		{"project.read", compute, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.permission, func(t *testing.T) {
@@ -1148,8 +1157,23 @@ func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
 	}
 }
 
+// Creating, renaming and deleting a project is not part of compute:write: only the legacy write scope (and a role)
+// holds project.create, project.update and project.delete.
+func TestAPIError_ProjectWritesNeedTheLegacyWriteScope(t *testing.T) {
+	for _, perm := range []string{"project.create", "project.update", "project.delete"} {
+		detail := "this credential does not carry the '" + perm + "' permission"
+		c := failWith(t, 403, "permission_denied", detail)
+
+		_, err := c.GetVm(context.Background(), "vm-1")
+		want := "virtscale API 403 permission_denied: " + detail + " (request req-7); the API key needs the 'write' scope (compute:write does not create, rename or delete projects)"
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: Error() = %v\nwant %q", perm, err, want)
+		}
+	}
+}
+
 func TestAPIError_PermissionDeniedForAnotherFamilyOnlySendsYouToTheScopes(t *testing.T) {
-	for _, perm := range []string{"iam.token.read", "storage.bucket.create", "billing.update"} {
+	for _, perm := range []string{"iam.token.read", "billing.update", "audit.read"} {
 		detail := "this credential does not carry the '" + perm + "' permission"
 		c := failWith(t, 403, "permission_denied", detail)
 

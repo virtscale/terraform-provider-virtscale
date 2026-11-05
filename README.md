@@ -14,6 +14,9 @@ from there.
 - Provider `virtscale`: configured with an API key and an organization id.
 - Resource `virtscale_instance`: a VirtScale compute instance (VM).
 - Resource `virtscale_ssh_key`: an SSH public key imported into the organization, which instances take by name.
+- Resource `virtscale_project`: a project, which groups servers, public IPs and networks. Data source
+  `virtscale_project` finds one by name, or the organization's default project.
+- Resource `virtscale_vpc`: a VPC, a private address space in one project and one region.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
 - Data source `virtscale_images`: the image catalogue for a region.
@@ -91,16 +94,20 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_instance` (create, destroy, refresh) | `compute:write` |
 | `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
+| `virtscale_vpc` (create, destroy, refresh) | `network:write` |
+| `virtscale_project` (create, rename, destroy) | `write`: `compute:write` only reads projects |
+| `virtscale_project` (data source, refresh) | `compute:read` (`compute:write` covers it too) |
 | `virtscale_images`, `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources) | `compute:read` (`compute:write` covers it too) |
 | `virtscale_caller` (data source) | any key: `GET /v1/me` asks for no permission |
-| `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances, SSH keys and images, `network:read` for public IPs |
+| `plan` and refresh only, no `apply` | the read halves: `compute:read` for instances, SSH keys, images and projects, `network:read` for public IPs and VPCs |
 
 A configuration with an instance and a public IP associated to it needs both `compute:write` and
 `network:write`.
 
 `compute:write` covers every `compute.*` and `operation.*` permission, reads included (SSH keys are
-`compute.ssh_key.*`); `network:write` covers every `network.*` and `edge.*` permission (public IPs are
-`edge.public_ip.*`). The `:read` scopes cover the `.read` and `.list` permissions of their family. The older
+`compute.ssh_key.*`), and reading projects (`project.list`, `project.read`); `network:write` covers every
+`network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`, VPCs `network.vpc.*`). Creating, renaming and
+deleting projects (`project.create`, `project.update`, `project.delete`) is covered by the older `write` scope only. The `:read` scopes cover the `.read` and `.list` permissions of their family. The older
 all-family scopes also work: `write` for everything above, `read` for plan-only use.
 
 A key can also carry network limits (allowed CIDRs). A request from an address outside them is refused with
@@ -155,9 +162,10 @@ including the field list the API sends with a `400`. Where the fix is on your si
 | Response | Hint |
 | -------- | ---- |
 | `401 unauthorized` | check `VIRTSCALE_API_KEY`: the key may be wrong, revoked or expired |
-| `403 permission_denied` | the scope that grants the permission it names: `compute:write` or `compute:read` for `compute.*` (instances, SSH keys, images) and `operation.*`, `network:write` or `network:read` for `edge.*` and `network.*` |
+| `403 permission_denied` | the scope that grants the permission it names: `compute:write` or `compute:read` for `compute.*` (instances, SSH keys, images) and `operation.*`, `network:write` or `network:read` for `edge.*` and `network.*`, `write` for creating, renaming and deleting a project |
 | `403 source_address_not_allowed` | the key's network limits do not include this address |
 | `404` about the organization | check `VIRTSCALE_ORGANIZATION`, or that the key belongs to that organization |
+| `412 generation_mismatch` | the resource was changed by something else while the change was made: apply again |
 
 Only a `404` that says the resource itself is gone is read as "gone": its code is `not_found` and its detail is
 the API's sentence for that kind of resource (an instance, a public IP or an SSH key, as asked about). Every other
@@ -245,6 +253,52 @@ it: they keep the key they booted with, and `virtscale_instance.ssh_keys` is not
 this API yet; it is not retried.
 
 Import by id: `tofu import virtscale_ssh_key.laptop <id>`.
+
+### `virtscale_project`
+
+A project groups an organization's servers, public IPs and networks. Every organization has a default project, which
+is never deleted (read it with the `virtscale_project` data source, or `tofu import` it to read it as a resource;
+destroying it is refused with `409 default_project`).
+
+| Attribute     | Type        | Required/Computed | Notes |
+| ------------- | ----------- | ----------------- | ----- |
+| `name`        | string      | Required | 1-63 lower-case letters, digits or hyphens, not starting or ending with a hyphen (checked at plan time). Unique among the organization's projects (`409 name_taken`). Changing it renames the project in place. |
+| `description` | string      | Optional, default `""` | At most 255 characters. In place. |
+| `labels`      | map(string) | Optional, default `{}` | At most 64; keys of 1-63 characters from letters, digits and `_ . : / -`, values of at most 255. Setting labels replaces the whole set. In place. |
+| `id`, `vrn`   | string      | Computed | `vrn:<organization>:project:<id>`. |
+| `is_default`  | bool        | Computed | |
+| `created_at`, `updated_at` | string | Computed | RFC 3339. |
+
+A change is one `PATCH` under the generation of a fresh read (`If-Match`): a change made at the same moment by someone
+else is refused with `412 generation_mismatch` and the next run picks it up. A project that still holds a server, a
+public IP or a network cannot be deleted (`409 project_not_empty`). The organization has a quota of 100 projects
+(`422 quota_exceeded`). Import by id: `tofu import virtscale_project.web <id>`.
+
+The data source `virtscale_project` takes an optional `name` and returns `id`, `vrn`, `description`, `labels`,
+`is_default` and `created_at`; without a `name` it is the default project.
+
+### `virtscale_vpc`
+
+A private address space in one project and one region, built and deleted asynchronously: apply waits (up to 20
+minutes) until the VPC is `active` and fails with the platform's reason if it ends in `error`; destroy waits (up to 10
+minutes) until it is gone. A VPC has no update call, so a change to any attribute replaces it. VPCs are switched on per
+deployment: where they are not, every call is `503 not_ready` and the error says so.
+
+| Attribute         | Type   | Required/Computed | Notes |
+| ----------------- | ------ | ----------------- | ----- |
+| `project_id`      | string | Required, forces replacement | The project's id, from `virtscale_project`. |
+| `name`            | string | Required, forces replacement | 1-63 lower-case letters, digits or hyphens. Unique among the project's VPCs in one region (`409 name_taken`). |
+| `region`          | string | Required, forces replacement | A region id from `virtscale_regions`; one that is not available to you is `422 region_unavailable`. |
+| `description`     | string | Optional, default `""`, forces replacement | At most 255 characters. |
+| `prefix_length`   | number | Optional, Computed, forces replacement when set to another value | 20 to 24. Leave it out for the address plan's default; it is read back from `cidr`. |
+| `id`, `vrn`       | string | Computed | |
+| `cidr`            | string | Computed | The private address block the platform gave it. |
+| `status`          | string | Computed | `pending`, `creating`, `active`, `deleting`, `deleted` or `error`. |
+| `is_default`, `internet_egress` | bool | Computed | |
+| `created_at`      | string | Computed | RFC 3339. |
+
+The organization has a quota of VPCs (`422 quota_exceeded`). A VPC that still has subnets cannot be deleted
+(`409 vpc_not_empty`). Import by `<project id>/<vpc id>`: `tofu import virtscale_vpc.net <project id>/<vpc id>`.
 
 ### `virtscale_public_ip`
 

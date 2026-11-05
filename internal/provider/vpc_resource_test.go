@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -23,6 +24,10 @@ resource "virtscale_vpc" "test" {
   region     = "gro"
 %s}
 `, name, extra)
+}
+
+func vpcInRegion(fake *fakeAPI, name, region string) string {
+	return testAccProviderBlock(fake) + fmt.Sprintf("resource \"virtscale_vpc\" \"x\" {\n  project_id = %q\n  name       = %q\n  region     = %q\n}\n", fakeUUID(5, 1), name, region)
 }
 
 func checkVpcsGone(fake *fakeAPI) resource.TestCheckFunc {
@@ -133,7 +138,7 @@ func TestAccVpcResource_RefusalsCarryTheAPIsCode(t *testing.T) {
 			PreCheck:                 func() { testAccPreCheck(t) },
 			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 			Steps: []resource.TestStep{{
-				Config:      testAccProviderBlock(fake) + `resource "virtscale_vpc" "x" { project_id = "` + fakeUUID(5, 1) + `"` + "\n" + `name = "net-e"` + "\n" + `region = "ams" }`,
+				Config:      vpcInRegion(fake, "net-e", "ams"),
 				ExpectError: wrapSafeInOrder("422 region_unavailable", "not available to you")}},
 		})
 	})
@@ -144,7 +149,7 @@ func TestAccVpcResource_RefusalsCarryTheAPIsCode(t *testing.T) {
 			PreCheck:                 func() { testAccPreCheck(t) },
 			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 			Steps: []resource.TestStep{{
-				Config:      testAccProviderBlockWith(fake, "compute-only", testOrgID) + `resource "virtscale_vpc" "x" { project_id = "` + fakeUUID(5, 1) + `"` + "\n" + `name = "net-f"` + "\n" + `region = "gro" }`,
+				Config:      strings.Replace(vpcInRegion(fake, "net-f", "gro"), `"test-api-key"`, `"compute-only"`, 1),
 				ExpectError: wrapSafeInOrder("403 permission_denied", "'network.vpc.create' permission", "needs the 'network:write' scope")}},
 		})
 	})
@@ -204,4 +209,25 @@ func TestAccVpcResource_VanishedOutOfBandIsRecreated(t *testing.T) {
 
 func regexpEnding(suffix string) *regexp.Regexp {
 	return regexp.MustCompile(regexp.QuoteMeta(suffix) + `$`)
+}
+
+// A 404 about the project is not a 404 about the VPC: the VPC stays in state, and the error is shown.
+func TestAccVpcResource_AMissingProjectKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := vpcConfig(fake, "net-i", "")
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             checkVpcsGone(fake),
+		Steps: []resource.TestStep{
+			{Config: config},
+			{
+				PreConfig:   func() { fake.HideProject(fakeUUID(5, 1), true) },
+				Config:      config,
+				PlanOnly:    true,
+				ExpectError: wrapSafe("no project matching that identifier"),
+			},
+			{PreConfig: func() { fake.HideProject(fakeUUID(5, 1), false) }, Config: config, PlanOnly: true},
+		},
+	})
 }

@@ -978,6 +978,10 @@ func scopeGrants(scope, perm string) bool {
 		if perm == "org.read" {
 			return true
 		}
+		// compute:read and compute:write also carry project.list and project.read (permissions.py).
+		if (perm == "project.list" || perm == "project.read") && strings.HasPrefix(scope, "compute:") {
+			return true
+		}
 		family, half, _ := strings.Cut(scope, ":")
 		prefixes := []string{"compute.", "operation."}
 		if family == "network" {
