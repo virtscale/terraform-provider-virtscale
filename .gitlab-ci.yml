@@ -42,7 +42,7 @@ test:
     - go build ./...
     - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v
 
-# Live acceptance of virtscale_ssh_key against the staging customer API (PROV-001 criterion 6). Started by an
+# Live acceptance of the provider's resources against the staging customer API (PROV-001 criterion 6; TF-002). Started by an
 # orchestrator through the GitLab API on main, never by a push, a schedule or a merge request:
 #
 #   POST /api/v4/projects/225/pipeline  {"ref":"main","variables":[{"key":"PROVIDER_STAGING_LIVE","value":"1"}]}
@@ -66,7 +66,7 @@ provider-staging-live:
   image: golang:1.25-bookworm
   needs: []
   interruptible: false
-  timeout: 30m
+  timeout: 90m
   resource_group: provider-staging-live
   inherit:
     variables: false

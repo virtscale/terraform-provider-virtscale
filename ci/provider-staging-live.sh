@@ -18,10 +18,12 @@
 #      protected main, API pipelines only, token 300 s / 4 uses),
 #   4. read kv/platform/s3-staging/test-keys (the one path the role's policy allows), keep stg-org-a's id and key in
 #      shell variables, and revoke the OpenBao token,
-#   5. run TestLiveSshKeyResource_LifecycleProof with the key in that one process's environment and the Go module
-#      proxy switched off: apply, an empty second plan, import by id, destroy,
-#   6. withhold the test log if it contains the key, require `--- PASS` for the test, and count the
-#      tf-live-* keys the org holds before and after (the run must leave none behind).
+#   5. run the live tests one after another, each in its own `go test` process with the key in that process's
+#      environment and the Go module proxy switched off (SSH keys, the catalogue data sources, projects, VPCs, an
+#      instance with its firewall, S3): apply, an empty second plan, an update, import, destroy,
+#   6. withhold the test log if it contains the key, require `--- PASS` for every test (a failed test does not stop
+#      the others, so one run shows which families work), and count the tf-live-* objects the org holds before and
+#      after (the run must leave none behind).
 #
 # Not coverable here: the id_token is also in the environment of the runner's own shell, which any process of the
 # job can read. The role limits what it opens (this project, protected main, API pipelines, the staging document).
@@ -53,7 +55,8 @@ BAO_CA_FILE="ci/bao-ca.pem"
 BAO_ROLE="provider-staging-live"
 KEYS_PATH="kv/data/platform/s3-staging/test-keys"
 ENDPOINT="http://s3-staging-customer-api.s3-staging.svc.cluster.local"
-TEST_NAME="TestLiveSshKeyResource_LifecycleProof"
+# The live tests, in the order they run. An instance is the heaviest and the staging host is small: it runs last, alone.
+TESTS="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof TestLiveS3Resources_LifecycleProof TestLiveInstanceFirewallResource_LifecycleProof"
 # OpenTofu release archive, pinned: the version and the SHA-256 of tofu_<version>_linux_amd64.zip from the release's
 # own tofu_<version>_SHA256SUMS.
 TOFU_VERSION_PINNED=1.12.5
@@ -145,30 +148,78 @@ vsk_?*) ;;
 *) fail "the key document has no usable S3CP_STAGING_ORG_A_KEY" ;;
 esac
 
-# How many tf-live-* keys the org holds right now (the whole list; a count, never names or keys).
-count_live_keys() {
-  c=$(printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
-    curl_safe -sS --max-time 30 -K - -o "$work/list.json" -w '%{http_code}' "$ENDPOINT/v1/orgs/$org/compute/ssh-keys") || c=000
-  [ "$c" = 200 ] || fail "listing the org's SSH keys answered HTTP $c"
+# GET path (below the API root) into a file; the key goes to curl on stdin. Prints the HTTP status only.
+api_get() {
+  printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
+    curl_safe -sS --max-time 60 -K - -o "$2" -w '%{http_code}' "$ENDPOINT$1" || echo 000
+}
+
+# How many objects named tf-live-* a list holds (a count, never names or keys). 503 means the feature is switched off, so
+# nothing of it can exist; any other answer but 200 stops the run.
+count_named() { # count_named PATH
+  c=$(api_get "$1" "$work/list.json")
+  [ "$c" != 503 ] || { echo 0; return 0; }
+  [ "$c" = 200 ] || fail "listing $1 answered HTTP $c"
   jq -r '[.items[]? | select(.name | startswith("tf-live-"))] | length' "$work/list.json"
   rm -f "$work/list.json"
 }
-before=$(count_live_keys)
-echo "tf-live-* keys in the staging org before the run: $before"
 
-# 5. The test. A prefix assignment gives the key to this one command and its children only, and GOPROXY=off keeps the
-# Go toolchain off the network while the key is in the environment (the modules were fetched and verified above).
+# One line with what the org holds now: SSH keys, projects, instances and buckets that are named tf-live-* and not
+# deleted, VPCs of every project named tf-live-*, and access keys that are not revoked (all of the org's).
+leftovers() {
+  ssh=$(count_named "/v1/orgs/$org/compute/ssh-keys")
+  projects=$(count_named "/v1/orgs/$org/projects")
+  instances=$(count_named "/v1/orgs/$org/compute/instances")
+  c=$(api_get "/v1/orgs/$org/s3/buckets" "$work/list.json")
+  if [ "$c" = 200 ]; then
+    buckets=$(jq -r '[.items[]? | select((.name | startswith("tf-live-")) and (.state | IN("deleting_soft", "purging", "purged", "deleted") | not))] | length' "$work/list.json")
+  elif [ "$c" = 503 ]; then buckets=0; else fail "listing the buckets answered HTTP $c"; fi
+  c=$(api_get "/v1/orgs/$org/s3/access-keys" "$work/list.json")
+  if [ "$c" = 200 ]; then
+    keys=$(jq -r '[.items[]? | select(.state != "revoked")] | length' "$work/list.json")
+  elif [ "$c" = 503 ]; then keys=0; else fail "listing the access keys answered HTTP $c"; fi
+  c=$(api_get "/v1/orgs/$org/projects" "$work/projects.json")
+  [ "$c" = 200 ] || fail "listing the projects answered HTTP $c"
+  vpcs=0
+  for project in $(jq -r '.items[]?.id' "$work/projects.json"); do
+    c=$(api_get "/v1/projects/$project/vpcs" "$work/list.json")
+    if [ "$c" = 200 ]; then
+      n=$(jq -r '[.items[]? | select(.name | startswith("tf-live-"))] | length' "$work/list.json")
+      vpcs=$((vpcs + n))
+    elif [ "$c" != 503 ]; then fail "listing the VPCs of a project answered HTTP $c"; fi
+  done
+  rm -f "$work/list.json" "$work/projects.json"
+  echo "ssh_keys=$ssh projects=$projects instances=$instances buckets=$buckets vpcs=$vpcs access_keys=$keys"
+}
+before=$(leftovers)
+echo "the staging org before the run: $before"
+
+# 5. The tests, one `go test` process each. A prefix assignment gives the key to this one command and its children only,
+# and GOPROXY=off keeps the Go toolchain off the network while the key is in the environment (the modules were fetched
+# and verified above). A test that fails or skips is recorded and the next one still runs.
 rc=0
-TF_ACC=1 \
-  TF_ACC_TERRAFORM_PATH="$work/bin/tofu" \
-  TF_ACC_PROVIDER_NAMESPACE=virtscale \
-  TF_ACC_PROVIDER_HOST=registry.terraform.io \
-  VIRTSCALE_LIVE=1 \
-  VIRTSCALE_ENDPOINT="$ENDPOINT" \
-  VIRTSCALE_ORGANIZATION="$org" \
-  VIRTSCALE_API_KEY="$api_key" \
-  GOPROXY=off \
-  go test ./internal/provider -run "^${TEST_NAME}\$" -count=1 -v >"$work/go-test.log" 2>&1 || rc=$?
+results=""
+: >"$work/go-test.log"
+for name in $TESTS; do
+  trc=0
+  TF_ACC=1 \
+    TF_ACC_TERRAFORM_PATH="$work/bin/tofu" \
+    TF_ACC_PROVIDER_NAMESPACE=virtscale \
+    TF_ACC_PROVIDER_HOST=registry.terraform.io \
+    VIRTSCALE_LIVE=1 \
+    VIRTSCALE_ENDPOINT="$ENDPOINT" \
+    VIRTSCALE_ORGANIZATION="$org" \
+    VIRTSCALE_API_KEY="$api_key" \
+    GOPROXY=off \
+    go test ./internal/provider -run "^${name}\$" -count=1 -v -timeout 25m >"$work/test.log" 2>&1 || trc=$?
+  cat "$work/test.log" >>"$work/go-test.log"
+  if [ "$trc" -eq 0 ] && grep -q -- "--- PASS: ${name}" "$work/test.log" && ! grep -q -- "--- SKIP: ${name}" "$work/test.log"; then
+    results="$results $name=PASS"
+  else
+    results="$results $name=FAIL"
+    rc=1
+  fi
+done
 
 # 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
 # it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
@@ -178,11 +229,12 @@ fi
 cat "$work/go-test.log"
 cp "$work/go-test.log" provider-staging-live.log
 
-after=$(count_live_keys)
-echo "tf-live-* keys in the staging org after the run: $after"
+after=$(leftovers)
+echo "the staging org after the run: $after"
+echo "provider-staging-live: results:$results"
 
-[ "$rc" -eq 0 ] || fail "go test exited with status $rc"
-grep -q -- "--- PASS: ${TEST_NAME}" "$work/go-test.log" || fail "the log has no '--- PASS: ${TEST_NAME}' (a skip also exits 0)"
-if grep -q -- "--- SKIP: ${TEST_NAME}" "$work/go-test.log"; then fail "the live test was skipped"; fi
-[ "$after" = "$before" ] || fail "the run left tf-live-* keys behind ($before before, $after after)"
-echo "provider-staging-live: PASS (apply, empty second plan, import, destroy; no key left behind)"
+[ "$rc" -eq 0 ] || fail "at least one live test failed or was skipped (results:$results)"
+# Soft-deleted buckets and revoked keys stay on the API as history, which is why they are not counted; everything else
+# the run made must be gone. The org's access keys are counted as a whole: the run must not leave one active.
+[ "$after" = "$before" ] || fail "the run left objects behind (before: $before; after: $after)"
+echo "provider-staging-live: PASS (every live test passed; no object left behind)"
