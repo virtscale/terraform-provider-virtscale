@@ -229,3 +229,23 @@ func TestAccInstanceFirewallResource_AKeyWithoutTheNetworkScopeIsToldSo(t *testi
 		}},
 	})
 }
+
+// A 404 about the organization is not a 404 about the instance: the firewall stays in state, and the error is shown.
+// The instance is made outside Terraform, so that only the firewall resource reads it.
+func TestAccInstanceFirewallResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	vm := createVmVia(t, fake, "test-api-key", namedVmBody("seeded"))
+	id, _ := vm.get("vm")["id"].(string)
+	config := func(org string) string {
+		return testAccProviderBlockWith(fake, "test-api-key", org) + fmt.Sprintf("resource \"virtscale_instance_firewall\" \"test\" {\n  instance_id = %q\n%s}\n", id, ruleSSH)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: config(testOrgID)},
+			{Config: config(testOtherOrg), PlanOnly: true, ExpectError: wrapSafeInOrder("no organization matching", "check VIRTSCALE_ORGANIZATION")},
+			{Config: config(testOrgID), PlanOnly: true},
+		},
+	})
+}

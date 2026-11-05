@@ -556,7 +556,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 func giveUp(err error, attempts int, idempotencyKey, method string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
 	hint := lostCreateHint
-	if method == http.MethodPatch {
+	if method == http.MethodPatch || method == http.MethodPut {
 		hint = lostPatchHint
 	}
 
@@ -601,11 +601,11 @@ func mayHaveBeenApplied(err error) bool {
 }
 
 // repeatable reports whether sending the request twice is safe: a GET, a
-// DELETE, or a POST or PATCH that carries an Idempotency-Key (the API replays
+// DELETE, or a POST, PATCH or PUT that carries an Idempotency-Key (the API replays
 // the first answer for the same key and body).
 func repeatable(method, idempotencyKey string) bool {
 	return method == http.MethodGet || method == http.MethodDelete ||
-		((method == http.MethodPost || method == http.MethodPatch) && idempotencyKey != "")
+		((method == http.MethodPost || method == http.MethodPatch || method == http.MethodPut) && idempotencyKey != "")
 }
 
 // retryable decides whether a failed attempt may be repeated.
@@ -613,7 +613,7 @@ func repeatable(method, idempotencyKey string) bool {
 //   - 429 is retried for every method: the rate limiter refuses a request
 //     before it runs.
 //   - 502, 503, 504 and transport errors may have been applied, so only a
-//     repeatable request (a GET, a DELETE, or a keyed POST or PATCH) is
+//     repeatable request (a GET, a DELETE, or a keyed POST, PATCH or PUT) is
 //     retried.
 //   - A 503 whose code is not_ready says a feature flag is off; retrying
 //     cannot help.
