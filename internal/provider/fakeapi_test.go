@@ -1009,8 +1009,11 @@ func scopeGrants(scope, perm string) bool {
 		}
 		family, half, _ := strings.Cut(scope, ":")
 		prefixes := []string{"compute.", "operation."}
-		if family == "network" {
+		switch family {
+		case "network":
 			prefixes = []string{"network.", "edge."}
+		case "storage":
+			prefixes = []string{"storage."}
 		}
 		for _, prefix := range prefixes {
 			if strings.HasPrefix(perm, prefix) {

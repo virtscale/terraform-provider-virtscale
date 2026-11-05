@@ -138,6 +138,8 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 		NewProjectResource,
 		NewVpcResource,
 		NewInstanceFirewallResource,
+		NewS3BucketResource,
+		NewS3AccessKeyResource,
 	}
 }
 

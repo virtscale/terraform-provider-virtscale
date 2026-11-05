@@ -54,8 +54,8 @@ func TestAccS3AccessKeyResource_Lifecycle(t *testing.T) {
 				),
 			},
 			{ // The secret stays in the state; a refresh does not lose it.
-				Config:   accessKeyConfig(fake, "storage"),
-				PlanOnly: true,
+				Config: accessKeyConfig(fake, "storage"),
+				Check:  resource.TestCheckResourceAttr("virtscale_s3_access_key.test", "secret_access_key", canarySecret),
 			},
 			{ // Import fills what the API still knows; the secret is not among it.
 				ResourceName:            "virtscale_s3_access_key.test",
@@ -126,5 +126,24 @@ func TestAccS3AccessKeyResource_AKeyWithoutTheStorageScopeIsToldSo(t *testing.T)
 			Config:      accessKeyConfig(fake, "test-api-key"),
 			ExpectError: wrapSafeInOrder("403 permission_denied", "'storage.access_key.create' permission", "needs the 'storage:write' scope"),
 		}},
+	})
+}
+
+// A 404 about the organization is not a 404 about the key: it stays in state, with its secret, and the error is shown.
+func TestAccS3AccessKeyResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.AddKey("storage", "storage:write")
+	config := func(org string) string {
+		return testAccProviderBlockWith(fake, "storage", org) + "resource \"virtscale_s3_access_key\" \"test\" {}\n"
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             checkAccessKeysRevoked(fake),
+		Steps: []resource.TestStep{
+			{Config: config(testOrgID)},
+			{Config: config(testOtherOrg), PlanOnly: true, ExpectError: wrapSafeInOrder("no organization matching", "check VIRTSCALE_ORGANIZATION")},
+			{Config: config(testOrgID), PlanOnly: true},
+		},
 	})
 }

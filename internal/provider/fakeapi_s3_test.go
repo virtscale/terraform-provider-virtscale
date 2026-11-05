@@ -162,8 +162,8 @@ func (f *fakeAPI) ActiveAccessKeys() int {
 }
 
 var (
-	bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
-	ipLikeRE     = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
+	fakeBucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
+	fakeIPLikeRE     = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
 )
 
 func (f *fakeAPI) bucketAccepted(b *fakeBucket, typ string) wireBucketAccepted {
@@ -193,7 +193,7 @@ func (f *fakeAPI) createBucket(rc *reqCtx) {
 	if replied {
 		return
 	}
-	if !bucketNameRE.MatchString(name) || ipLikeRE.MatchString(name) || regexp.MustCompile(`--`).MatchString(name) {
+	if !fakeBucketNameRE.MatchString(name) || fakeIPLikeRE.MatchString(name) || regexp.MustCompile(`--`).MatchString(name) {
 		rc.unprocessable("bucket_name_invalid", "a bucket name is 3 to 63 lowercase letters, digits and single hyphens, starting and ending with a letter or digit")
 		return
 	}

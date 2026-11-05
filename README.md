@@ -17,6 +17,8 @@ from there.
 - Resource `virtscale_project`: a project, which groups servers, public IPs and networks. Data source
   `virtscale_project` finds one by name, or the organization's default project.
 - Resource `virtscale_instance_firewall`: the firewall rules of one instance.
+- Resources `virtscale_s3_bucket` (with its own size and object ceilings) and `virtscale_s3_access_key`: object
+  storage.
 - Resource `virtscale_vpc`: a VPC, a private address space in one project and one region.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
@@ -97,6 +99,7 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
 | `virtscale_vpc` (create, destroy, refresh) | `network:write` |
 | `virtscale_instance_firewall` (set, clear, refresh) | `network:write` |
+| `virtscale_s3_bucket`, `virtscale_s3_access_key` (create, change, destroy, refresh) | `storage:write` (or the older `write`) |
 | `virtscale_project` (create, rename, destroy) | `write`: `compute:write` only reads projects |
 | `virtscale_project` (data source, refresh) | `compute:read` (`compute:write` covers it too) |
 | `virtscale_images`, `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources) | `compute:read` (`compute:write` covers it too) |
@@ -108,7 +111,8 @@ A configuration with an instance and a public IP associated to it needs both `co
 
 `compute:write` covers every `compute.*` and `operation.*` permission, reads included (SSH keys are
 `compute.ssh_key.*`), and reading projects (`project.list`, `project.read`); `network:write` covers every
-`network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`, VPCs `network.vpc.*`). Creating, renaming and
+`network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`, VPCs `network.vpc.*`); `storage:write` covers
+every `storage.*` permission (buckets, their ceilings and access keys). Creating, renaming and
 deleting projects (`project.create`, `project.update`, `project.delete`) is covered by the older `write` scope only. The `:read` scopes cover the `.read` and `.list` permissions of their family. The older
 all-family scopes also work: `write` for everything above, `read` for plan-only use.
 
@@ -339,6 +343,58 @@ resource "virtscale_instance_firewall" "web" {
 ```
 
 Import by the instance's id: `tofu import virtscale_instance_firewall.web <instance id>`.
+
+### `virtscale_s3_bucket`
+
+An object-storage bucket. It is created, resized and deleted asynchronously: apply waits (up to 20 minutes) until the
+bucket is `active` and fails if it ends in `provision_failed`, `degraded` or `suspended`. The organization needs the S3
+service switched on (the panel does it), and has a limit of buckets (`422 bucket_limit_reached`).
+
+| Attribute        | Type   | Required/Computed | Notes |
+| ---------------- | ------ | ----------------- | ----- |
+| `name`           | string | Required, forces replacement | 3-63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no two hyphens in a row, not an IP address (checked at plan time). Unique within the organization (`409 name_taken`). |
+| `versioning`     | bool   | Optional, default `false`, forces replacement | Keep previous versions of overwritten and deleted objects. Fixed at creation. |
+| `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
+| `max_objects`    | number | Optional | The most objects. Same rules. |
+| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
+| `id`, `state`, `created_at` | string | Computed | |
+
+Deleting is a **soft delete**: the bucket is cut off at once, its data is kept for a retention window (7 days) and then
+purged, and the plan's bucket slot is freed. A bucket in that state reads as gone. The API also limits how many
+buckets, live and soft-deleted, an organization holds in all (`422 bucket_retention_limit_reached`), so creating and
+destroying buckets in a loop eventually has to wait for purges. The ceilings are applied by the object store after the
+API accepts them. Import by id: `tofu import virtscale_s3_bucket.logs <id>`.
+
+### `virtscale_s3_access_key`
+
+An S3 access key for the organization's storage. There is nothing to configure. **The secret is returned exactly once,
+by the request that creates the key**, so the provider keeps `secret_access_key` in the state, marked sensitive. That
+means the state holds a credential: use an encrypted backend (or OpenTofu's state encryption), and do not print the
+attribute in an output. A key's secret cannot be read back, so an imported key has none (`secret_access_key` is null).
+Destroying the resource revokes the key and waits until it reads revoked. To rotate, replace the resource
+(`tofu apply -replace=virtscale_s3_access_key.app`, or `replace_triggered_by`). The key is a key on the organization's
+own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete
+window.
+
+If a create is repeated after a lost answer (a gateway error), the API answers the repeat with the stored result, which
+never holds the secret. The key exists then, so the provider keeps it in the state and fails with "Access Key Secret Not
+Returned": run `tofu destroy` (or apply again, which replaces it) to revoke it and get a new one.
+
+| Attribute           | Type   | Required/Computed | Notes |
+| ------------------- | ------ | ----------------- | ----- |
+| `id`                | string | Computed | |
+| `access_key_id`     | string | Computed | The public half, to use as the S3 access key id. |
+| `secret_access_key` | string | Computed, sensitive | Known only after the create here. |
+| `state`, `created_at` | string | Computed | |
+
+Import by id: `tofu import virtscale_s3_access_key.app <id>`.
+
+### What the provider does not manage: IAM
+
+Members, invitations and API keys are managed by people, not by API keys: the `iam.*` permissions are in no key scope
+(an API key cannot list, mint or revoke keys, or invite, change or remove members; the writes also need a fresh
+second factor). That is deliberate, so a leaked key cannot widen its own reach, and the provider has no resource for
+them. Use the panel for members and keys; `virtscale_caller` shows what the key you run Terraform with can do.
 
 ### `virtscale_public_ip`
 
