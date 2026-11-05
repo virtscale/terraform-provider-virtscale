@@ -32,7 +32,7 @@ func TestAccCallerDataSource_ReadsTheIdentityOfTheKey(t *testing.T) {
 		resource.TestCheckTypeSetElemAttr("data.virtscale_caller.me", "scopes.*", "compute:write"),
 		resource.TestCheckTypeSetElemAttr("data.virtscale_caller.me", "scopes.*", "network:write"),
 		resource.TestCheckTypeSetElemAttr("data.virtscale_caller.me", "permissions.*", "compute.instance.create"),
-		resource.TestCheckTypeSetElemAttr("data.virtscale_caller.me", "permissions.*", "network.firewall.update"),
+		resource.TestCheckTypeSetElemAttr("data.virtscale_caller.me", "permissions.*", "edge.public_ip.allocate"),
 		// An organization-wide key with no expiry and no role has nothing to say about them.
 		resource.TestCheckNoResourceAttr("data.virtscale_caller.me", "project_id"),
 		resource.TestCheckNoResourceAttr("data.virtscale_caller.me", "expires_at"),
