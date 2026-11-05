@@ -881,6 +881,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
+	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types":
+		key = rest
 	case rest == "compute/public-ips":
 		key = "compute/public-ips"
 	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "public-ips":
@@ -897,7 +899,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	switch method + " " + key {
 	case "POST compute/instances", "GET compute/instances/{vm_id}",
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
-		"GET compute/images",
+		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
 		"POST compute/ssh-keys", "GET compute/ssh-keys",
@@ -930,6 +932,9 @@ var routePermissions = map[string]string{
 	"DELETE compute/instances/{vm_id}":                    "compute.instance.delete",
 	"PATCH compute/instances/{vm_id}":                     "compute.instance.update",
 	"GET compute/images":                                  "compute.instance.list",
+	"GET compute/regions":                                 "compute.instance.list",
+	"GET compute/plans":                                   "compute.instance.list",
+	"GET instance-types":                                  "compute.instance_type.list",
 	"GET compute/public-ips":                              "edge.public_ip.read",
 	"POST compute/public-ips":                             "edge.public_ip.allocate",
 	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
@@ -982,6 +987,10 @@ func (rc *reqCtx) allows(perm string) bool {
 
 func (f *fakeAPI) serve(rc *reqCtx) {
 	r := rc.r
+	if r.URL.Path == "/v1/me" {
+		f.serveMe(rc)
+		return
+	}
 	orgRaw, rest, ok := splitOrgPath(r.URL.Path)
 	if !ok {
 		rc.problem(http.StatusNotFound, "not_found", "Not Found", "Not Found")
@@ -1056,6 +1065,12 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.releasePublicIp(rc, id)
 	case "GET compute/images":
 		f.listImages(rc)
+	case "GET compute/regions":
+		f.listRegions(rc)
+	case "GET compute/plans":
+		f.listPlans(rc)
+	case "GET instance-types":
+		f.listInstanceTypes(rc)
 	case "POST compute/ssh-keys":
 		f.importSshKey(rc)
 	case "GET compute/ssh-keys":
