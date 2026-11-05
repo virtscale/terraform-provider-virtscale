@@ -184,12 +184,12 @@ const lostCreateHint = "the first request may still have created the resource: "
 	"if the next apply reports name_taken, find it in the panel or with the API " +
 	"and bring it under management with tofu import"
 
-// lostHostnameHint is what the error of a keyed PATCH that gave up adds
+// lostPatchHint is what the error of a keyed PATCH that gave up adds
 // instead: nothing was created, so the create hint would send the user looking
-// for a resource that does not exist. Another plan reads the instance's
-// current hostname, which is what the change may have set.
-const lostHostnameHint = "the first request may still have been applied: " +
-	"run another plan to see the instance's current hostname"
+// for a resource that does not exist. Another plan reads the current state,
+// which is what the change may have set.
+const lostPatchHint = "the first request may still have been applied: " +
+	"run another plan to see the current state"
 
 // FieldError is one entry of a problem body's errors[]: which request field
 // the API refused and why.
@@ -250,9 +250,9 @@ func (e *APIError) hint() string {
 		return "the key's network limits do not include this address; " +
 			"run Terraform from an allowed address or widen the key's network limits"
 	case e.Status == http.StatusPreconditionFailed && e.Code == "generation_mismatch":
-		// The API says to retry with the new ETag; the provider read the instance just before, so
-		// this is a race with another change of the same instance, and what the user can do is plan again.
-		return "the instance was changed by something else while this change was being made; run apply again"
+		// The API says to retry with the new ETag; the provider read the resource just before, so
+		// this is a race with another change of the same resource, and what the user can do is plan again.
+		return "it was changed by something else while this change was being made; run apply again"
 	case isOrganizationNotVisible(e):
 		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
 			"or VIRTSCALE_API_KEY belongs to another organization"
@@ -280,6 +280,15 @@ func scopeHint(detail string) string {
 		family = "compute"
 	case strings.HasPrefix(permission, "edge."), strings.HasPrefix(permission, "network."):
 		family = "network"
+	case strings.HasPrefix(permission, "storage."):
+		family = "storage"
+	case strings.HasPrefix(permission, "project."):
+		// compute:read and compute:write carry project.list and project.read; creating, renaming and deleting a
+		// project is the legacy write scope's (and the roles').
+		if strings.HasSuffix(permission, ".read") || strings.HasSuffix(permission, ".list") {
+			return "the API key needs the 'compute:read' or 'compute:write' scope"
+		}
+		return "the API key needs the 'write' scope (compute:write does not create, rename or delete projects)"
 	default:
 		return generic
 	}
@@ -543,12 +552,12 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 // carried an Idempotency-Key, how to recover when the failure leaves open that
 // the API processed it anyway. The recovery sentence depends on the method: a
 // POST creates a resource (see lostCreateHint), while a PATCH changes one
-// (see lostHostnameHint).
+// (see lostPatchHint).
 func giveUp(err error, attempts int, idempotencyKey, method string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
 	hint := lostCreateHint
-	if method == http.MethodPatch {
-		hint = lostHostnameHint
+	if method == http.MethodPatch || method == http.MethodPut {
+		hint = lostPatchHint
 	}
 
 	var apiErr *APIError
@@ -592,11 +601,11 @@ func mayHaveBeenApplied(err error) bool {
 }
 
 // repeatable reports whether sending the request twice is safe: a GET, a
-// DELETE, or a POST or PATCH that carries an Idempotency-Key (the API replays
+// DELETE, or a POST, PATCH or PUT that carries an Idempotency-Key (the API replays
 // the first answer for the same key and body).
 func repeatable(method, idempotencyKey string) bool {
 	return method == http.MethodGet || method == http.MethodDelete ||
-		((method == http.MethodPost || method == http.MethodPatch) && idempotencyKey != "")
+		((method == http.MethodPost || method == http.MethodPatch || method == http.MethodPut) && idempotencyKey != "")
 }
 
 // retryable decides whether a failed attempt may be repeated.
@@ -604,7 +613,7 @@ func repeatable(method, idempotencyKey string) bool {
 //   - 429 is retried for every method: the rate limiter refuses a request
 //     before it runs.
 //   - 502, 503, 504 and transport errors may have been applied, so only a
-//     repeatable request (a GET, a DELETE, or a keyed POST or PATCH) is
+//     repeatable request (a GET, a DELETE, or a keyed POST, PATCH or PUT) is
 //     retried.
 //   - A 503 whose code is not_ready says a feature flag is off; retrying
 //     cannot help.

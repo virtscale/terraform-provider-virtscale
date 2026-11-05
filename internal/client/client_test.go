@@ -726,11 +726,50 @@ func testOps() []op {
 			_, err := c.UpdateVmHostname(context.Background(), "vm-1", 3, &hostname, "")
 			return err
 		}},
+		// The calls of the projects, VPCs and firewalls follow the same rule. A PUT that replaces the whole firewall
+		// is safe to send twice when it carries a key, like a keyed POST or PATCH.
+		{"SetFirewall (keyed)", http.MethodPut, true, jsonStep(202, testVmAcceptedJSON), func(c *Client) error {
+			_, err := c.SetFirewall(context.Background(), "vm-1", []FirewallRuleIn{{Direction: "ingress", Protocol: "icmp", RemoteCIDR: "0.0.0.0/0"}}, "key-1")
+			return err
+		}},
+		{"SetFirewall (no key)", http.MethodPut, false, jsonStep(202, testVmAcceptedJSON), func(c *Client) error {
+			_, err := c.SetFirewall(context.Background(), "vm-1", nil, "")
+			return err
+		}},
+		{"GetFirewall", http.MethodGet, false, jsonStep(200, `{"vm_id":"vm-1","state":"applied","error":null,"rules":[]}`), func(c *Client) error {
+			_, err := c.GetFirewall(context.Background(), "vm-1")
+			return err
+		}},
+		{"CreateProject (keyed)", http.MethodPost, true, jsonStep(201, testProjectJSON), func(c *Client) error {
+			_, err := c.CreateProject(context.Background(), ProjectCreateRequest{Name: "web"}, "key-1")
+			return err
+		}},
+		{"UpdateProject (keyed)", http.MethodPatch, true, jsonStep(200, testProjectJSON), func(c *Client) error {
+			name := "web2"
+			_, err := c.UpdateProject(context.Background(), "p-1", 3, ProjectUpdateRequest{Name: &name}, "key-1")
+			return err
+		}},
+		{"DeleteProject (keyed)", http.MethodDelete, true, noContentStep, func(c *Client) error {
+			return c.DeleteProject(context.Background(), "p-1", "key-1")
+		}},
+		{"CreateVpc (keyed)", http.MethodPost, true, jsonStep(202, `{"vpc":`+testVpcJSON+`,"operation":{"id":"op-1","type":"vpc.create","state":"pending","resource_type":"vpc","resource_id":"v-1","attempt":0,"max_attempts":3,"created_at":"2026-01-02T03:04:05Z"}}`), func(c *Client) error {
+			_, _, err := c.CreateVpc(context.Background(), "p-1", VpcCreateRequest{Name: "net", Region: "gro"}, "key-1")
+			return err
+		}},
+		{"GetVpc", http.MethodGet, false, jsonStep(200, testVpcJSON), func(c *Client) error { _, err := c.GetVpc(context.Background(), "p-1", "v-1"); return err }},
+		{"GetMe", http.MethodGet, false, jsonStep(200, `{"subject":"s","realm":"r","credential":"api_token","permissions_enforced":true,"organizations":[],"api_key":null}`), func(c *Client) error {
+			_, err := c.GetMe(context.Background())
+			return err
+		}},
 	}
 }
 
+const testProjectJSON = `{"id":"p-1","vrn":"vrn:o:project:p-1","name":"web","description":"","is_default":false,"labels":{},"generation":1,"created_at":"2026-01-02T03:04:05Z","updated_at":"2026-01-02T03:04:05Z"}`
+
+const testVpcJSON = `{"id":"v-1","vrn":"vrn:o:project:p-1:vpc:v-1","name":"net","description":"","region":"gro","cidr":"10.0.0.0/22","is_default":false,"status":"pending","status_reason":null,"internet_egress":true,"created_at":"2026-01-02T03:04:05Z","generation":1}`
+
 // repeatable is the rule for 502/503/504 and transport errors: only a request
-// that is safe to send twice (a GET, a DELETE, or a POST or PATCH carrying an
+// that is safe to send twice (a GET, a DELETE, or a POST, PATCH or PUT carrying an
 // Idempotency-Key).
 func (o op) repeatable() bool {
 	return o.method == http.MethodGet || o.method == http.MethodDelete || o.keyed
@@ -1111,9 +1150,10 @@ func failWith(t *testing.T, status int, code, detail string) *Client {
 // permission_denied names the permission it wants (permissions.py); the
 // diagnostic adds the key scope that grants it: compute.* and operation.* come
 // with compute:write (compute:read for the reads), edge.* and network.* with
-// network:write (network:read for the reads).
+// network:write (network:read for the reads), storage.* with storage:write
+// (storage:read for the reads).
 func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
-	const compute, network = "compute", "network"
+	const compute, network, storage = "compute", "network", "storage"
 	cases := []struct {
 		permission, family string
 		read               bool
@@ -1130,6 +1170,14 @@ func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
 		{"edge.public_ip.read", network, true},
 		{"network.firewall.update", network, false},
 		{"network.read", network, true},
+		{"network.vpc.create", network, false},
+		{"network.vpc.list", network, true},
+		{"storage.bucket.create", storage, false},
+		{"storage.access_key.revoke", storage, false},
+		{"storage.bucket.read", storage, true},
+		{"compute.instance_type.list", compute, true},
+		{"project.list", compute, true},
+		{"project.read", compute, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.permission, func(t *testing.T) {
@@ -1148,8 +1196,23 @@ func TestAPIError_PermissionDeniedNamesTheScopeThatGrantsIt(t *testing.T) {
 	}
 }
 
+// Creating, renaming and deleting a project is not part of compute:write: only the legacy write scope (and a role)
+// holds project.create, project.update and project.delete.
+func TestAPIError_ProjectWritesNeedTheLegacyWriteScope(t *testing.T) {
+	for _, perm := range []string{"project.create", "project.update", "project.delete"} {
+		detail := "this credential does not carry the '" + perm + "' permission"
+		c := failWith(t, 403, "permission_denied", detail)
+
+		_, err := c.GetVm(context.Background(), "vm-1")
+		want := "virtscale API 403 permission_denied: " + detail + " (request req-7); the API key needs the 'write' scope (compute:write does not create, rename or delete projects)"
+		if err == nil || err.Error() != want {
+			t.Errorf("%s: Error() = %v\nwant %q", perm, err, want)
+		}
+	}
+}
+
 func TestAPIError_PermissionDeniedForAnotherFamilyOnlySendsYouToTheScopes(t *testing.T) {
-	for _, perm := range []string{"iam.token.read", "storage.bucket.create", "billing.update"} {
+	for _, perm := range []string{"iam.token.read", "billing.update", "audit.read"} {
 		detail := "this credential does not carry the '" + perm + "' permission"
 		c := failWith(t, 403, "permission_denied", detail)
 

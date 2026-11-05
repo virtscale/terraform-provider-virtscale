@@ -135,6 +135,9 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 		NewInstanceResource,
 		NewPublicIpResource,
 		NewSshKeyResource,
+		NewProjectResource,
+		NewVpcResource,
+		NewInstanceFirewallResource,
 	}
 }
 
@@ -142,5 +145,10 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 func (p *VirtscaleProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
 		NewImagesDataSource,
+		NewCallerDataSource,
+		NewRegionsDataSource,
+		NewInstanceTypesDataSource,
+		NewPlansDataSource,
+		NewProjectDataSource,
 	}
 }

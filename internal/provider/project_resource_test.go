@@ -209,3 +209,23 @@ func TestAccProjectDataSource_UnknownName(t *testing.T) {
 		}},
 	})
 }
+
+// The API answers 404 not_found both for a missing project and for an organization the key cannot see; Read must not
+// take the second for the first, or pointing the provider at the wrong organization would drop every project from state.
+func TestAccProjectResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.AddKey("writer", "write")
+	config := func(org string) string {
+		return testAccProviderBlockWith(fake, "writer", org) + `resource "virtscale_project" "test" { name = "org-guard" }`
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             checkProjectGone(fake),
+		Steps: []resource.TestStep{
+			{Config: config(testOrgID)},
+			{Config: config(testOtherOrg), PlanOnly: true, ExpectError: regexp.MustCompile(`(?s)no\s+organization\s+matching.*check\s+VIRTSCALE_ORGANIZATION`)},
+			{Config: config(testOrgID), PlanOnly: true},
+		},
+	})
+}
