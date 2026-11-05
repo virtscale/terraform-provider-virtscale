@@ -65,7 +65,8 @@ type projectState struct {
 	vpcsOff    bool // S3CP_COMPUTE_VPC_ENABLED=false: every VPC route is 503 not_ready
 	failVpcs   bool // new VPCs end in status error
 	vpcQuota   int
-	patches    []string // "id If-Match" of every PATCH of a project, as it arrived
+	hidden     map[string]bool // projects the project-scoped routes answer 404 project for
+	patches    []string        // "id If-Match" of every PATCH of a project, as it arrived
 	idemKeys   []string
 }
 
@@ -123,6 +124,16 @@ func (f *fakeAPI) ProjectIdempotencyKeys() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.ps.idemKeys...)
+}
+
+// HideProject makes the project-scoped routes answer 404 about the project (not about the VPC under it).
+func (f *fakeAPI) HideProject(id string, hidden bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ps.hidden == nil {
+		f.ps.hidden = map[string]bool{}
+	}
+	f.ps.hidden[id] = hidden
 }
 
 func (f *fakeAPI) SetVpcsOff(off bool) {
@@ -483,6 +494,7 @@ func (f *fakeAPI) serveProjectScoped(rc *reqCtx) {
 	}
 	f.mu.Lock()
 	_, known := f.ps.projects[m[1]]
+	known = known && !f.ps.hidden[m[1]]
 	f.mu.Unlock()
 	if !known {
 		rc.notFound("project")

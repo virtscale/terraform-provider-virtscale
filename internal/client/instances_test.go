@@ -384,7 +384,7 @@ func TestUpdateVmHostname_AnUnkeyedRequestIsNotRepeatedAfterAGatewayError(t *tes
 // open that it was applied says instead of the create hint. The sentence is
 // pinned here, apart from the client's own, so a different wording fails.
 const hostnameHint = "the first request may still have been applied: " +
-	"run another plan to see the instance's current hostname"
+	"run another plan to see the current state"
 
 // A keyed PATCH that gives up on a gateway error or a lost connection says the
 // first request may still have been applied, and where to look. It must not
