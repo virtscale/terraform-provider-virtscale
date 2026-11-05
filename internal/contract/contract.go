@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -35,6 +36,7 @@ type Spec struct {
 	doc      map[string]any
 	compiler *jsonschema.Compiler
 	ops      []*operation
+	mu       sync.Mutex // the compiler and its cache are not safe for the fake API's concurrent requests
 	schemas  map[string]*jsonschema.Schema
 }
 
@@ -211,6 +213,8 @@ func (s *Spec) schemaLocation(obj map[string]any, base, ct string) string {
 }
 
 func (s *Spec) validate(what, loc string, body []byte) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	sch, ok := s.schemas[loc]
 	if !ok {
 		var err error
@@ -226,6 +230,9 @@ func (s *Spec) validate(what, loc string, body []byte) []string {
 	}
 	if err := sch.Validate(value); err != nil {
 		msg := err.Error()
+		if _, rest, found := strings.Cut(msg, "\n"); found {
+			msg = strings.TrimSpace(rest) // the first line only repeats the schema's location
+		}
 		if len(msg) > 700 {
 			msg = msg[:700] + "..."
 		}
