@@ -1,9 +1,15 @@
 package provider
 
 import (
+	"context"
+	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+
+	"gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/client"
 )
 
 // Acceptance tests (TF_ACC=1, see instance_resource_test.go) of the read-only data sources: the caller
@@ -70,7 +76,7 @@ func TestAccRegionsDataSource(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	dataSourceTest(t, fake, `data "virtscale_regions" "all" {}`, resource.ComposeAggregateTestCheckFunc(
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "id", "regions"),
-		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.#", "2"),
+		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.#", "3"),
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.0.id", "gro"),
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.0.name", "Groningen"),
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.0.datacenter", "GRO1"),
@@ -84,6 +90,10 @@ func TestAccRegionsDataSource(t *testing.T) {
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.1.id", "ams"),
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.1.entitled", "false"),
 		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.1.default", "false"),
+		// Entitled and the default are two facts: Frankfurt is open to this organization and is not the default.
+		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.2.id", "fra"),
+		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.2.entitled", "true"),
+		resource.TestCheckResourceAttr("data.virtscale_regions.all", "regions.2.default", "false"),
 	))
 }
 
@@ -151,5 +161,45 @@ func TestAccCatalogueDataSources_AKeyWithoutTheScopeIsToldWhichToAdd(t *testing.
 				ExpectError: wrapSafeInOrder("403 permission_denied", "needs the 'compute:read' or 'compute:write' scope"),
 			}},
 		})
+	}
+}
+
+// A key restricted to a project, with an expiry, says so; the organization is compared without regard to case.
+func TestAccCallerDataSource_AKeyRestrictedToAProjectAndExpiring(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	expires := time.Date(2027, 3, 4, 5, 6, 7, 0, time.UTC)
+	fake.AddRestrictedKey("scoped", fakeUUID(5, 1), expires, "compute:read")
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config: testAccProviderBlockWith(fake, "scoped", strings.ToUpper(testOrgID)) + `data "virtscale_caller" "me" {}`,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("data.virtscale_caller.me", "project_id", fakeUUID(5, 1)),
+				resource.TestCheckResourceAttr("data.virtscale_caller.me", "expires_at", "2027-03-04T05:06:07Z"),
+				resource.TestCheckResourceAttr("data.virtscale_caller.me", "scopes.#", "1"),
+			),
+		}},
+	})
+}
+
+// The fake checks what the provider's client exchanges with it against the contract; the checks are counted so that a
+// fake that stopped checking would fail here.
+func TestFakeAPI_ClientExchangesAreCheckedAgainstTheContract(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	c, err := client.New(fake.URL(), "test-api-key", testOrgID, client.WithUserAgentVersion("test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.ListRegions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if n := fake.ContractChecked(); n != 1 {
+		t.Errorf("checked %d exchanges after one client call, want 1", n)
+	}
+	// A request that is not the client's (the fake's own tests send wrong ones on purpose) is not checked.
+	fakeHTTP(t, fake, "test-api-key", http.MethodGet, "/v1/orgs/"+testOrgID+"/compute/regions", "")
+	if n := fake.ContractChecked(); n != 1 {
+		t.Errorf("checked %d exchanges after a request that is not the client's, want still 1", n)
 	}
 }

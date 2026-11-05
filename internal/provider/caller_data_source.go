@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -83,7 +84,7 @@ func (d *CallerDataSource) Read(ctx context.Context, _ datasource.ReadRequest, r
 	org := d.client.Organization()
 	var held *client.MeOrganization
 	for i := range me.Organizations {
-		if me.Organizations[i].OrgID == org {
+		if strings.EqualFold(me.Organizations[i].OrgID, org) {
 			held = &me.Organizations[i]
 		}
 	}
