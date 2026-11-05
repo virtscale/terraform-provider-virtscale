@@ -50,6 +50,8 @@ type fakeAPI struct {
 	// a mismatch fails t.
 	contract *contract.Spec
 	t        *testing.T
+	keyMetas map[string]keyMeta
+	checked  int // exchanges of the provider's client that were checked against the contract
 
 	mu          sync.Mutex
 	vms         map[string]*fakeVm
@@ -370,6 +372,16 @@ func (f *fakeAPI) serveChecked(rc *reqCtx) {
 	for _, problem := range f.contract.Check(rc.r.Method, rc.r.URL.Path, body, rec.status, rec.Header().Get("Content-Type"), rec.body.Bytes()) {
 		f.t.Errorf("contract: %s", problem)
 	}
+	f.mu.Lock()
+	f.checked++
+	f.mu.Unlock()
+}
+
+// ContractChecked is how many exchanges of the provider's client the fake has checked against the contract.
+func (f *fakeAPI) ContractChecked() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checked
 }
 
 // URL returns the fake server's base URL, suitable for the provider's
