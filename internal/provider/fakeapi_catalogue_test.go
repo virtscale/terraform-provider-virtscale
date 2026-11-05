@@ -3,6 +3,7 @@ package provider
 import (
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -79,6 +80,8 @@ var fakeRegions = []wireRegionOut{
 		DiskTypes: []wireDiskTypeOut{{"ssd", "active"}, {"hdd", "coming_soon"}}},
 	{ID: "ams", Name: "Amsterdam", Datacenter: "AMS1", Status: "coming_soon", Access: "restricted", Entitled: false,
 		DiskTypes: []wireDiskTypeOut{{"ssd", "coming_soon"}, {"hdd", "coming_soon"}}},
+	{ID: "fra", Name: "Frankfurt", Datacenter: "FRA1", Status: "active", Access: "public", Entitled: true,
+		DiskTypes: []wireDiskTypeOut{{"ssd", "active"}}},
 }
 
 var fakeInstanceTypes = []wireInstanceTypeOut{
@@ -135,8 +138,36 @@ func (f *fakeAPI) serveMe(rc *reqCtx) {
 	rc.json(http.StatusOK, wireMeOut{
 		Subject: "api-token:" + fakeUUID(4, 1), Realm: "customers", Credential: "api_token", PermissionsEnforced: true,
 		Organizations: []wireMeOrganization{{OrgID: f.org, Permissions: permissions}},
-		ApiKey:        &wireMeApiKey{ID: fakeUUID(4, 1), Scopes: scopes},
+		ApiKey:        f.meKey(rc, scopes),
 	})
+}
+
+// keyMeta is what a key carries besides its scopes: the project it is restricted to and when it expires.
+type keyMeta struct {
+	projectID string
+	expires   time.Time
+}
+
+// AddRestrictedKey registers a key restricted to one project that expires at expires.
+func (f *fakeAPI) AddRestrictedKey(key, projectID string, expires time.Time, scopes ...string) {
+	f.AddKey(key, scopes...)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.keyMetas == nil {
+		f.keyMetas = map[string]keyMeta{}
+	}
+	f.keyMetas[key] = keyMeta{projectID, expires}
+}
+
+func (f *fakeAPI) meKey(rc *reqCtx, scopes []string) *wireMeApiKey {
+	out := &wireMeApiKey{ID: fakeUUID(4, 1), Scopes: scopes}
+	bearer, _ := strings.CutPrefix(rc.r.Header.Get("Authorization"), "Bearer ")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if m, ok := f.keyMetas[bearer]; ok {
+		out.ProjectID, out.ExpiresAt = &m.projectID, &m.expires
+	}
+	return out
 }
 
 func (f *fakeAPI) listRegions(rc *reqCtx) {
