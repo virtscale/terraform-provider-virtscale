@@ -1,0 +1,8 @@
+# Vendored OpenAPI document of the customer API. Changed only by the command below, never by hand.
+# The provider's client and its fake API are checked against it (internal/contract, D12 of
+# docs/plans/terraform-provider-virtscale.md).
+project: virtscale/virtscale-platform/apps/s3-control-plane
+path: docs/openapi/generated/customer-v1.json
+commit: 87607618
+sha256: 4278131f3f5bf39ac719e84775abbf5d0bb48a2ddf3f84de0b0394d98d09ddfd
+update: git -C <s3-control-plane clone> show <commit>:docs/openapi/generated/customer-v1.json > internal/contract/customer-v1.json && sha256sum internal/contract/customer-v1.json, then edit commit and sha256 here
