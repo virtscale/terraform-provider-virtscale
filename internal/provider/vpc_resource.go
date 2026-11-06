@@ -273,8 +273,10 @@ func (r *VpcResource) Update(ctx context.Context, req resource.UpdateRequest, re
 }
 
 // Delete asks for the VPC to be removed and waits until it is gone. The VPC stays visible (status deleting) until the
-// cloud has let go of it. A VPC that is gone already is what destroy wanted, and so is a delete that is already
-// running (409 operation_in_flight); a VPC that still holds subnets is refused with the API's code.
+// cloud has let go of it. A VPC that is gone already is what destroy wanted; a 409 operation_in_flight is believed to
+// mean "a delete is already running" only after the VPC is read back (the API also answers it while a create runs); a
+// VPC that still holds subnets is refused with the API's code. A delete that ends in status error fails at once with the
+// platform's reason instead of waiting out the timeout.
 func (r *VpcResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state vpcResourceModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -287,17 +289,40 @@ func (r *VpcResource) Delete(ctx context.Context, req resource.DeleteRequest, re
 		return
 	}
 	project, id := state.ProjectID.ValueString(), state.ID.ValueString()
-	if _, err := r.client.DeleteVpc(ctx, project, id, key); err != nil && !client.IsNotFound(err, client.ResourceVpc) && !operationInFlight(err) {
+	if _, err := r.client.DeleteVpc(ctx, project, id, key); err != nil && !client.IsNotFound(err, client.ResourceVpc) && !r.deleteAlreadyRunning(ctx, project, id, err) {
 		resp.Diagnostics.AddError("Unable to Delete VPC", apiErrorDetail(err))
 		return
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
-	if _, err := r.client.WaitVpc(waitCtx, project, id, pollInterval, func(v *client.Vpc) (bool, error) {
+	if final, err := r.client.WaitVpc(waitCtx, project, id, pollInterval, func(v *client.Vpc) (bool, error) {
+		if v != nil && v.Status == "error" {
+			return true, errVpcBuildFailed
+		}
 		return v == nil || v.Status == "deleted", nil
-	}); err != nil {
+	}); errors.Is(err, errVpcBuildFailed) && final != nil {
+		reason := "the platform gave no reason"
+		if final.StatusReason != nil {
+			reason = *final.StatusReason
+		}
+		resp.Diagnostics.AddError("VPC Failed to Delete", "the VPC ended in status error: "+reason)
+	} else if err != nil {
 		resp.Diagnostics.AddError("Unable to Wait for VPC Deletion", err.Error())
 	}
+}
+
+// deleteAlreadyRunning reports whether err, from a DELETE, only says that a delete of the VPC is already underway:
+// 409 operation_in_flight, and the VPC reads deleting (or is gone). The same 409 is the answer while another operation,
+// a create for instance, runs, and then it is a refusal to show.
+func (r *VpcResource) deleteAlreadyRunning(ctx context.Context, project, id string, err error) bool {
+	if !operationInFlight(err) {
+		return false
+	}
+	v, getErr := r.client.GetVpc(ctx, project, id)
+	if client.IsNotFound(getErr, client.ResourceVpc) {
+		return true
+	}
+	return getErr == nil && (v.Status == "deleting" || v.Status == "deleted")
 }
 
 // operationInFlight reports whether err is the 409 that says another operation already runs for the resource.

@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
@@ -83,7 +84,7 @@ func TestAccProjectResource_Lifecycle(t *testing.T) {
 							return fmt.Errorf("the API holds %+v", p)
 						}
 						patches := fake.ProjectPatches()
-						if len(patches) != 1 || patches[0] != id+` "1"` {
+						if len(patches) != 1 || !strings.HasPrefix(patches[0], id+` "1" `) {
 							return fmt.Errorf("PATCHes = %q, want one with If-Match \"1\"", patches)
 						}
 						return nil

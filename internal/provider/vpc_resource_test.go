@@ -56,7 +56,7 @@ func TestAccVpcResource_Lifecycle(t *testing.T) {
 					resource.TestCheckResourceAttr("virtscale_vpc.test", "status", "active"),
 					resource.TestCheckResourceAttr("virtscale_vpc.test", "prefix_length", "22"),
 					resource.TestCheckResourceAttr("virtscale_vpc.test", "is_default", "false"),
-					resource.TestCheckResourceAttr("virtscale_vpc.test", "internet_egress", "true"),
+					resource.TestCheckResourceAttr("virtscale_vpc.test", "internet_egress", "false"), // only the default VPC has a gateway
 					resource.TestCheckResourceAttrSet("virtscale_vpc.test", "cidr"),
 					resource.TestCheckResourceAttrSet("virtscale_vpc.test", "vrn"),
 					func(s *terraform.State) error {
