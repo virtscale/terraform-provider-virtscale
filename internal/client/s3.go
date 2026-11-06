@@ -65,8 +65,20 @@ type bucketAccepted struct {
 	Operation Operation `json:"operation"`
 }
 
+// lostBucketHint is what the error of a keyed bucket create that gave up adds: the API's code for a name that is taken is
+// bucket_already_exists, and a bucket that was made is imported by its id.
+const lostBucketHint = "the first request may still have created the bucket: if the next apply reports " +
+	"bucket_already_exists, find it in the panel or with the API and bring it under management with tofu import"
+
+// lostAccessKeyHint is what the error of a keyed access key create that gave up adds. A key has no name to collide on, and
+// its secret was in the answer that was lost, so an imported key would be useless: the key that may exist must be revoked.
+const lostAccessKeyHint = "the first request may still have created an access key whose secret was lost with the answer: " +
+	"list the organization's access keys in the panel or with the API and revoke any you did not receive " +
+	"(an organization holds at most 5), then apply again"
+
 // CreateBucket sends POST /v1/orgs/{org}/s3/buckets, which answers 202 with the bucket as it stands.
 func (c *Client) CreateBucket(ctx context.Context, req BucketCreateRequest, idempotencyKey string) (*Bucket, error) {
+	ctx = withLostCreateHint(ctx, lostBucketHint)
 	var out bucketAccepted
 	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("s3/buckets"), req, idempotencyKey, &out); err != nil {
 		return nil, err
@@ -138,6 +150,7 @@ type accessKeyAccepted struct {
 // nowhere else, ever: it is nil when the answer is the stored replay of a repeated request (the replay has it
 // stripped), and then it is lost for good.
 func (c *Client) CreateAccessKey(ctx context.Context, idempotencyKey string) (*AccessKey, *string, error) {
+	ctx = withLostCreateHint(ctx, lostAccessKeyHint)
 	var out accessKeyCreated
 	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("s3/access-keys"), nil, idempotencyKey, &out); err != nil {
 		return nil, nil, err

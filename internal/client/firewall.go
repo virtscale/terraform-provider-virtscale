@@ -18,8 +18,9 @@ type FirewallRule struct {
 	Description string `json:"description"`
 }
 
-// Firewall is an instance's whole rule set as last confirmed (FirewallOut): never the mid-flight one. State is
-// pending while a change is being applied, applied once it is, and error when it could not be (Error says why).
+// Firewall is an instance's whole rule set (FirewallOut): the rows of the last PUT, shown at once, with the State of
+// applying them: pending while the change is being applied, applied once it is, error when it could not be (Error says
+// why). (The API's docstring says "never the mid-flight one"; its code and its own test show the new rows at once.)
 type Firewall struct {
 	VmID  string         `json:"vm_id"`
 	State string         `json:"state"`

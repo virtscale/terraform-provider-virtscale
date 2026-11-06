@@ -1,10 +1,12 @@
 package provider
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"sort"
@@ -50,10 +52,11 @@ type wireVpcAccepted struct {
 
 type fakeVpc struct {
 	wireVpcOut
-	project   string
-	stepsLeft int  // reads a delete stays in "deleting"
-	failBuild bool // the build ends in status error
-	notEmpty  bool // subnets hang off it: a delete is 409 vpc_not_empty
+	project    string
+	stepsLeft  int  // reads a delete stays in "deleting"
+	failBuild  bool // the build ends in status error
+	notEmpty   bool // subnets hang off it: a delete is 409 vpc_not_empty
+	failDelete bool // the next delete ends in status error
 }
 
 // projectState is the fake's projects and VPCs. All access is under fakeAPI.mu.
@@ -112,7 +115,7 @@ func (f *fakeAPI) VanishProject(id string) {
 	delete(f.ps.projects, id)
 }
 
-// ProjectPatches is "id If-Match" of every PATCH of a project, in order.
+// ProjectPatches is "id If-Match body" of every PATCH of a project, in order.
 func (f *fakeAPI) ProjectPatches() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -175,6 +178,24 @@ func (f *fakeAPI) VanishVpc(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.ps.vpcs, id)
+}
+
+// FailNextVpcDelete makes the next delete of the VPC end in status error (and only that one).
+func (f *fakeAPI) FailNextVpcDelete(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if v, ok := f.ps.vpcs[id]; ok {
+		v.failDelete = true
+	}
+}
+
+// StartVpcDelete is a delete another client asked for: the VPC reads deleting, and a second delete is 409 operation_in_flight.
+func (f *fakeAPI) StartVpcDelete(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if v, ok := f.ps.vpcs[id]; ok {
+		v.Status, v.stepsLeft = "deleting", 3
+	}
 }
 
 // MakeVpcNotEmpty puts a subnet in the VPC: deleting it is 409 vpc_not_empty.
@@ -333,11 +354,12 @@ func (f *fakeAPI) getProject(rc *reqCtx, id string) {
 // current ETag, name_taken is 409, a field that is sent may not be null.
 func (f *fakeAPI) patchProject(rc *reqCtx, id string) {
 	ifMatch := rc.r.Header.Get("If-Match")
+	raw, _ := io.ReadAll(rc.r.Body)
 	f.mu.Lock()
-	f.ps.patches = append(f.ps.patches, id+" "+ifMatch)
+	f.ps.patches = append(f.ps.patches, id+" "+ifMatch+" "+string(bytes.TrimSpace(raw)))
 	f.mu.Unlock()
 
-	b := newBodyCheck(rc.r.Body)
+	b := newBodyCheck(bytes.NewReader(raw))
 	var name, description *string
 	var labels map[string]string
 	if raw, ok := b.present("name", false); ok {
@@ -408,7 +430,8 @@ func (f *fakeAPI) patchProject(rc *reqCtx, id string) {
 	rc.json(http.StatusOK, p, "ETag", generationETag(p.Generation))
 }
 
-// deleteProject is DELETE /projects/{id}: 204; 409 default_project; 409 project_not_empty while it holds a VPC.
+// deleteProject is DELETE /projects/{id}: 204; 409 default_project. (409 project_not_empty is for a server, a public IP or
+// an address allocation, which the fake does not model; a test makes it with a fault.)
 func (f *fakeAPI) deleteProject(rc *reqCtx, id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -424,12 +447,6 @@ func (f *fakeAPI) deleteProject(rc *reqCtx, id string) {
 	if p.IsDefault {
 		rc.conflict("default_project", "the organization's default project cannot be deleted")
 		return
-	}
-	for _, v := range f.ps.vpcs {
-		if v.project == id && v.Status != "deleted" {
-			rc.conflict("project_not_empty", "the project still holds a network")
-			return
-		}
 	}
 	delete(f.ps.projects, id)
 	f.idemKeep(storeKey, digest, http.StatusNoContent, nil, "", "")
@@ -488,16 +505,16 @@ func (f *fakeAPI) serveProjectScoped(rc *reqCtx) {
 		rc.invalid(errs...)
 		return
 	}
-	if off {
-		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", "VPCs are not switched on yet")
-		return
-	}
 	f.mu.Lock()
 	_, known := f.ps.projects[m[1]]
 	known = known && !f.ps.hidden[m[1]]
 	f.mu.Unlock()
 	if !known {
 		rc.notFound("project")
+		return
+	}
+	if off {
+		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", "VPCs are not switched on yet")
 		return
 	}
 	switch route {
@@ -583,7 +600,7 @@ func (f *fakeAPI) createVpc(rc *reqCtx, project string) {
 	id := fakeUUID(6, f.ps.vpcSeq)
 	v := &fakeVpc{project: project, failBuild: f.ps.failVpcs, wireVpcOut: wireVpcOut{
 		ID: id, VRN: "vrn:" + f.org + ":project:" + project + ":vpc:" + id, Name: name, Description: description, Region: region,
-		CIDR: fmt.Sprintf("10.%d.0.0/%d", 100+f.ps.vpcSeq, prefix), Status: "pending", InternetEgress: true,
+		CIDR: fmt.Sprintf("10.%d.0.0/%d", 100+f.ps.vpcSeq, prefix), Status: "pending", InternetEgress: false,
 		CreatedAt: time.Now().UTC(), Generation: 1}}
 	f.ps.vpcs[id] = v
 	accepted := f.vpcAccepted(rc, v, "vpc.create")
@@ -607,7 +624,12 @@ func advanceVpc(v *fakeVpc) {
 		}
 	case "deleting":
 		if v.stepsLeft--; v.stepsLeft <= 0 {
-			v.Status = "deleted"
+			if v.failDelete {
+				reason := "the network could not be removed"
+				v.Status, v.StatusReason, v.failDelete = "error", &reason, false
+			} else {
+				v.Status = "deleted"
+			}
 		}
 	}
 	v.Generation++

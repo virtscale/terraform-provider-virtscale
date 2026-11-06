@@ -28,7 +28,7 @@ test:
     # of a module version other than the main module refuses to honour. Fall
     # back to the official release archive, verified against its own
     # SHA256SUMS.
-    - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates
+    - apt-get update && apt-get install -y --no-install-recommends unzip ca-certificates jq
     - mkdir -p "$(go env GOPATH)/bin"
     - curl -sSLO "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_linux_amd64.zip"
     - curl -sSLO "https://github.com/opentofu/opentofu/releases/download/v${TOFU_VERSION}/tofu_${TOFU_VERSION}_SHA256SUMS"
@@ -50,7 +50,7 @@ test:
 # How the key reaches the test without anyone seeing it: the job asks GitLab for an id_token (audience
 # openbao.virtscale.nl), logs in to OpenBao with JWT role `provider-staging-live` (terraform-openbao: this project,
 # protected main, API pipelines only; it reads kv/platform/s3-staging/test-keys and nothing else), keeps stg-org-a's
-# key in shell variables, hands it to the one `go test` process and revokes the OpenBao token. ci/provider-staging-live.sh
+# key in shell variables, hands it to one `go test` process per live test and revokes the OpenBao token. ci/provider-staging-live.sh
 # has the steps; the key is never exported, written to disk or printed, and the log is withheld if it contains it.
 # The staging API is reached on its in-cluster name, which the s3-staging NetworkPolicy admits from CI job pods only
 # (the gitlab-runner namespace). The OpenBao CA is a committed public certificate (ci/bao-ca.pem).

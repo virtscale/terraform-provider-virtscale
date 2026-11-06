@@ -35,7 +35,9 @@ var (
 // can shorten it; production code never overrides it.
 var pollInterval = 5 * time.Second
 
-const (
+// How long Create/Update and Delete wait for the platform. Vars, like pollInterval, only so that tests in this package
+// can shorten them; production code never overrides them.
+var (
 	createTimeout = 20 * time.Minute
 	deleteTimeout = 10 * time.Minute
 )

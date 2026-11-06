@@ -45,6 +45,14 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// shortTimeouts shortens the waits of Create/Update and Delete for one test (the tests do not run in parallel).
+func shortTimeouts(t *testing.T, create, del time.Duration) {
+	t.Helper()
+	oldCreate, oldDelete := createTimeout, deleteTimeout
+	createTimeout, deleteTimeout = create, del
+	t.Cleanup(func() { createTimeout, deleteTimeout = oldCreate, oldDelete })
+}
+
 // testAccProtoV6ProviderFactories builds a fresh provider instance per test
 // invocation (version "test").
 func testAccProtoV6ProviderFactories() map[string]func() (tfprotov6.ProviderServer, error) {

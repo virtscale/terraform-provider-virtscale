@@ -55,17 +55,19 @@ func (r *S3BucketResource) Metadata(_ context.Context, req resource.MetadataRequ
 	resp.TypeName = req.ProviderTypeName + "_s3_bucket"
 }
 
-// bucketNameValidator is the API's bucket name rule (domain/naming.py): 3 to 63 lower-case letters, digits and
-// hyphens, starting and ending with a letter or digit, no two hyphens in a row, not an IP address.
+// bucketNameValidator is the API's bucket name rule (domain/naming.py), in the API's order and with its sentences: 3 to 63
+// characters, no dots, no two hyphens in a row, lower-case letters, digits and hyphens starting and ending with a letter or
+// digit, and not a name or prefix the platform keeps for itself.
 type bucketNameValidator struct{}
 
 var (
-	bucketNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
-	ipFormRE     = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
+	bucketNameRE           = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$`)
+	reservedBucketPrefixes = []string{"virtscale-", "vs-", "s3-", "rgw-", "admin-", "internal-", "system-"}
+	reservedBucketNames    = map[string]bool{"admin": true, "api": true, "www": true, "internal": true, "system": true, "backup": true, "billing": true, "metrics": true, "health": true}
 )
 
 func (bucketNameValidator) Description(context.Context) string {
-	return "3 to 63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no consecutive hyphens"
+	return "3 to 63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no consecutive hyphens, not a name or prefix the platform reserves"
 }
 
 func (v bucketNameValidator) MarkdownDescription(ctx context.Context) string {
@@ -79,12 +81,23 @@ func (bucketNameValidator) ValidateString(_ context.Context, req validator.Strin
 	name := req.ConfigValue.ValueString()
 	var problem string
 	switch {
-	case !bucketNameRE.MatchString(name):
-		problem = "a bucket name is 3 to 63 lowercase letters, digits and hyphens, and must start and end with a letter or digit"
+	case len(name) < 3 || len(name) > 63:
+		problem = "bucket names must be between 3 and 63 characters"
+	case strings.Contains(name, "."):
+		problem = "dots are not permitted: they break virtual-hosted addressing under the platform's wildcard certificate"
 	case strings.Contains(name, "--"):
-		problem = "a bucket name may not contain consecutive hyphens"
-	case ipFormRE.MatchString(name):
-		problem = "a bucket name may not be formatted as an IP address"
+		problem = "bucket names may not contain consecutive hyphens"
+	case !bucketNameRE.MatchString(name):
+		problem = "bucket names may contain only lowercase letters, digits and hyphens, and must start and end with a letter or digit"
+	case reservedBucketNames[name]:
+		problem = fmt.Sprintf("the bucket name %q is reserved by the platform", name)
+	default:
+		for _, prefix := range reservedBucketPrefixes {
+			if strings.HasPrefix(name, prefix) {
+				problem = fmt.Sprintf("bucket names starting with %q are reserved by the platform", prefix)
+				break
+			}
+		}
 	}
 	if problem != "" {
 		resp.Diagnostics.AddAttributeError(req.Path, "Invalid bucket name", fmt.Sprintf("%q is not valid: %s", name, problem))
@@ -217,12 +230,34 @@ func (r *S3BucketResource) ModifyPlan(ctx context.Context, req resource.ModifyPl
 	var plan, state s3BucketModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() || plan.Versioning.IsUnknown() || plan.Versioning.Equal(state.Versioning) {
+	// A new name is a new bucket: the replacement the name makes can take any versioning.
+	if resp.Diagnostics.HasError() || plan.Versioning.IsUnknown() || plan.Versioning.Equal(state.Versioning) || !plan.Name.Equal(state.Name) {
 		return
 	}
 	resp.Diagnostics.AddAttributeError(path.Root("versioning"), "Versioning cannot be changed",
 		"versioning is fixed when a bucket is created. Replacing the bucket would soft-delete it, and its name stays taken until it is "+
 			"purged, so a bucket of the same name could not be created. Create a bucket under another name (and move the objects) instead.")
+}
+
+// inFlightRetries is how often a change of a bucket is repeated while the API says another operation runs for it: the
+// executor makes the bucket active a moment before it marks the create done, and a ceiling that was just set is applied
+// by an operation of its own.
+const inFlightRetries = 12
+
+// retryWhileInFlight repeats fn, waiting pollInterval between the tries, while it fails with 409 operation_in_flight.
+func retryWhileInFlight(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 0; attempt <= inFlightRetries; attempt++ {
+		if err = fn(); err == nil || !operationInFlight(err) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(pollInterval):
+		}
+	}
+	return err
 }
 
 // Create asks for the bucket with a fresh Idempotency-Key, keeps what it knows in the state at once so that a failed
@@ -244,8 +279,7 @@ func (r *S3BucketResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 	wantSize, wantObjects := plan.MaxSizeBytes, plan.MaxObjects
-	applyBucket(&plan, b)
-	plan.MaxSizeBytes, plan.MaxObjects = wantSize, wantObjects // not yet set: the ceilings follow once the bucket is active
+	applyBucket(&plan, b) // the state holds what the API holds (no ceilings yet); the configured ones follow
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 	if resp.Diagnostics.HasError() {
 		return
@@ -266,7 +300,9 @@ func (r *S3BucketResource) Create(ctx context.Context, req resource.CreateReques
 		return false, nil
 	})
 	if errors.Is(waitErr, errBucketBuildFailed) && final != nil {
-		resp.Diagnostics.AddError("Bucket Failed to Build", "the bucket ended in state "+final.State)
+		resp.Diagnostics.AddError("Bucket Failed to Build", "the bucket ended in state "+final.State+
+			". It is in the state, tainted by this error, and the next apply would replace it: the failed bucket's name stays taken "+
+			"until it is purged, so give the bucket another name (or restore it in the panel and import it)")
 		return
 	}
 	if waitErr != nil {
@@ -274,7 +310,6 @@ func (r *S3BucketResource) Create(ctx context.Context, req resource.CreateReques
 		return
 	}
 	applyBucket(&plan, final)
-	plan.MaxSizeBytes, plan.MaxObjects = wantSize, wantObjects
 
 	if change, changed := quotaChange(types.Int64Null(), types.Int64Null(), wantSize, wantObjects); changed {
 		quotaKey, err := newIdempotencyKey()
@@ -282,11 +317,19 @@ func (r *S3BucketResource) Create(ctx context.Context, req resource.CreateReques
 			resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
 			return
 		}
-		if _, err := r.client.SetBucketQuota(ctx, b.ID, change, quotaKey); err != nil {
+		if err := retryWhileInFlight(ctx, func() error {
+			_, e := r.client.SetBucketQuota(ctx, b.ID, change, quotaKey)
+			return e
+		}); err != nil {
+			// The bucket exists and has no ceilings: the state says so. Terraform taints a resource whose create failed, and a
+			// replacement would meet the soft-deleted bucket's name.
 			resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
-			resp.Diagnostics.AddError("Unable to Set the Bucket's Ceilings", apiErrorDetail(err))
+			resp.Diagnostics.AddError("Unable to Set the Bucket's Ceilings", apiErrorDetail(err)+
+				". The bucket was created and is in the state without ceilings, tainted by this error: its name would stay taken after a "+
+				"replacement. Fix the ceilings in the configuration, run `tofu untaint` on the bucket, and apply again to set them")
 			return
 		}
+		plan.MaxSizeBytes, plan.MaxObjects = wantSize, wantObjects
 	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -332,7 +375,10 @@ func (r *S3BucketResource) Update(ctx context.Context, req resource.UpdateReques
 			resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
 			return
 		}
-		if _, err := r.client.SetBucketQuota(ctx, id, change, key); err != nil {
+		if err := retryWhileInFlight(ctx, func() error {
+			_, e := r.client.SetBucketQuota(ctx, id, change, key)
+			return e
+		}); err != nil {
 			resp.Diagnostics.AddError("Unable to Set the Bucket's Ceilings", apiErrorDetail(err))
 			return
 		}
@@ -361,11 +407,16 @@ func (r *S3BucketResource) Delete(ctx context.Context, req resource.DeleteReques
 		resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
 		return
 	}
-	if _, err := r.client.DeleteBucket(ctx, state.ID.ValueString(), state.ForceDestroy.ValueBool(), key); err != nil && !client.IsNotFound(err, client.ResourceBucket) {
+	err = retryWhileInFlight(ctx, func() error {
+		_, e := r.client.DeleteBucket(ctx, state.ID.ValueString(), state.ForceDestroy.ValueBool(), key)
+		return e
+	})
+	if err != nil && !client.IsNotFound(err, client.ResourceBucket) {
 		detail := apiErrorDetail(err)
 		var apiErr *client.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "bucket_not_empty" {
-			detail += "; set force_destroy = true to soft-delete it with its objects (they are kept for the retention window)"
+			detail += "; to soft-delete it with its objects (they are kept for the retention window) set force_destroy = true, run " +
+				"`tofu apply` so that the setting is stored, and destroy again"
 		}
 		resp.Diagnostics.AddError("Unable to Delete Bucket", detail)
 	}

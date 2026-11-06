@@ -1,12 +1,15 @@
 package provider
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"regexp"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -72,7 +75,8 @@ type fakeBucket struct {
 
 type fakeAccessKey struct {
 	wireAccessKeyOut
-	stepsLeft int
+	stepsLeft  int
+	failRevoke bool // the next revoke ends in state degraded
 }
 
 type s3State struct {
@@ -84,6 +88,7 @@ type s3State struct {
 	maxBuckets int      // 0 means the default of 3
 	secret     string   // the secret the next minted key carries
 	deletes    []string // "name force=<bool>" of every bucket DELETE
+	quotaPuts  []string // the body of every quota PUT, as it arrived
 }
 
 func (f *fakeAPI) s3() *s3State {
@@ -166,6 +171,30 @@ var (
 	fakeIPLikeRE     = regexp.MustCompile(`^\d{1,3}(\.\d{1,3}){3}$`)
 )
 
+// fakeBucketNameProblem is domain/naming.py validate_bucket_name for a name of 3 to 63 characters (the request model
+// has refused the others): the code and sentence of the first rule it breaks, or "".
+func fakeBucketNameProblem(name string) (code, detail string) {
+	switch {
+	case strings.Contains(name, "."):
+		return "bucket_name_invalid", "dots are not permitted: they break virtual-hosted addressing under the platform's wildcard certificate"
+	case strings.Contains(name, "--"):
+		return "bucket_name_invalid", "bucket names may not contain consecutive hyphens"
+	case !fakeBucketNameRE.MatchString(name):
+		return "bucket_name_invalid", "bucket names may contain only lowercase letters, digits and hyphens, and must start and end with a letter or digit"
+	}
+	for _, reserved := range []string{"admin", "api", "www", "internal", "system", "backup", "billing", "metrics", "health"} {
+		if name == reserved {
+			return "bucket_name_reserved", fmt.Sprintf("the bucket name %q is reserved by the platform", name)
+		}
+	}
+	for _, prefix := range []string{"virtscale-", "vs-", "s3-", "rgw-", "admin-", "internal-", "system-"} {
+		if strings.HasPrefix(name, prefix) {
+			return "bucket_name_reserved", fmt.Sprintf("bucket names starting with %q are reserved by the platform", prefix)
+		}
+	}
+	return "", ""
+}
+
 func (f *fakeAPI) bucketAccepted(b *fakeBucket, typ string) wireBucketAccepted {
 	op := f.newOperation(typ, "bucket", b.ID, time.Now().UTC())
 	b.OperationID = &op.ID
@@ -193,8 +222,8 @@ func (f *fakeAPI) createBucket(rc *reqCtx) {
 	if replied {
 		return
 	}
-	if !fakeBucketNameRE.MatchString(name) || fakeIPLikeRE.MatchString(name) || regexp.MustCompile(`--`).MatchString(name) {
-		rc.unprocessable("bucket_name_invalid", "a bucket name is 3 to 63 lowercase letters, digits and single hyphens, starting and ending with a letter or digit")
+	if code, detail := fakeBucketNameProblem(name); code != "" {
+		rc.problem(http.StatusBadRequest, code, "Invalid request", detail)
 		return
 	}
 	limit := s.maxBuckets
@@ -206,7 +235,7 @@ func (f *fakeAPI) createBucket(rc *reqCtx) {
 		// uq_buckets_org_id_name_live: only a purged or deleted bucket gives its name up; a soft-deleted one keeps it
 		// for the retention window. A soft-deleted bucket no longer holds one of the organization's slots.
 		if x.State != "purged" && x.State != "deleted" && x.Name == name {
-			rc.conflict("name_taken", fmt.Sprintf("a bucket named '%s' already exists in this organization", name))
+			rc.conflict("bucket_already_exists", fmt.Sprintf("this organization already has a bucket named %q", name))
 			return
 		}
 		if x.State != "deleting_soft" && x.State != "purging" && x.State != "purged" && x.State != "deleted" {
@@ -275,7 +304,11 @@ func (f *fakeAPI) listBuckets(rc *reqCtx) {
 
 // putBucketQuota is PUT .../quota: an omitted dimension is left alone, an explicit null clears it; the answer is 202.
 func (f *fakeAPI) putBucketQuota(rc *reqCtx, id string) {
-	b := newBodyCheck(rc.r.Body)
+	raw, _ := io.ReadAll(rc.r.Body)
+	f.mu.Lock()
+	f.s3().quotaPuts = append(f.s3().quotaPuts, string(bytes.TrimSpace(raw)))
+	f.mu.Unlock()
+	b := newBodyCheck(bytes.NewReader(raw))
 	read := func(name string) (set bool, value *int64) {
 		raw, ok := b.present(name, false)
 		if !ok {
@@ -365,6 +398,16 @@ func (f *fakeAPI) createAccessKey(rc *reqCtx) {
 	if replied {
 		return
 	}
+	live := 0
+	for _, k := range s.keys {
+		if k.State != "revoked" {
+			live++
+		}
+	}
+	if live >= 5 {
+		rc.unprocessable("access_key_limit_reached", fmt.Sprintf("this organization already holds %d of its 5 access keys; revoke one before creating another", live))
+		return
+	}
 	s.keySeq++
 	id := fakeUUID(9, s.keySeq)
 	now := time.Now().UTC()
@@ -396,6 +439,9 @@ func advanceAccessKey(k *fakeAccessKey) {
 	case "revoking":
 		if k.stepsLeft--; k.stepsLeft <= 0 {
 			k.State = "revoked"
+			if k.failRevoke {
+				k.State, k.failRevoke = "degraded", false
+			}
 		}
 	}
 }
@@ -433,6 +479,34 @@ func (f *fakeAPI) revokeAccessKey(rc *reqCtx, id string) {
 	location := f.operationLocation(op)
 	f.idemKeep(storeKey, digest, http.StatusAccepted, accepted, location, "")
 	rc.json(http.StatusAccepted, accepted, "Location", location)
+}
+
+// QuotaPuts is the body of every quota PUT, in order.
+func (f *fakeAPI) QuotaPuts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.s3().quotaPuts...)
+}
+
+// FailNextRevoke makes the next revoke of the key end in state degraded (and only that one).
+func (f *fakeAPI) FailNextRevoke(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if k, ok := f.s3().keys[id]; ok {
+		k.failRevoke = true
+	}
+}
+
+// ForceAccessKeyState puts the key in a state at once.
+func (f *fakeAPI) ForceAccessKeyState(id, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if k, ok := f.s3().keys[id]; ok {
+		k.State = state
+		if state == "revoking" {
+			k.stepsLeft = 1000 // still being revoked after any number of reads
+		}
+	}
 }
 
 // SetMaxBuckets is the organization's bucket limit (the fake's default is 3).
