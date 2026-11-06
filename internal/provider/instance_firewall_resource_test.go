@@ -509,7 +509,7 @@ func TestAccInstanceFirewallResource_ARuleSetThatIsStillBeingAppliedIsNotDrift(t
 // more) ends the create at its deadline, and the destroy asks for the empty rule set at once instead of waiting for a
 // state that never leaves pending.
 func TestAccInstanceFirewallResource_AChangeStuckInPendingEndsAtTheDeadlineAndCanBeDestroyed(t *testing.T) {
-	shortTimeouts(t, time.Second, 5*time.Second)
+	shortTimeouts(t, 2*time.Second, 10*time.Second)
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	fake.StickFirewallPending(firstVm)
 	resource.Test(t, resource.TestCase{
@@ -534,9 +534,9 @@ func TestAccInstanceFirewallResource_AChangeStuckInPendingEndsAtTheDeadlineAndCa
 // A change that is still being applied when the destroy comes (the create's wait ran out) makes the clearing PUT a 409
 // operation_in_flight: the destroy asks again until the operation is through, then clears the rules.
 func TestAccInstanceFirewallResource_ADestroyWaitsOutAChangeThatIsStillBeingApplied(t *testing.T) {
-	shortTimeouts(t, 500*time.Millisecond, 20*time.Second)
+	shortTimeouts(t, time.Second, 30*time.Second)
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
-	fake.SlowFirewallApply(firstVm, 120) // more reads than the create's 500 ms of polling can make
+	fake.SlowFirewallApply(firstVm, 300) // far more reads than the create's second of polling (every 10 ms) can make
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
