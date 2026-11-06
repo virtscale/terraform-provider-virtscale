@@ -16,6 +16,7 @@ from there.
 - Resource `virtscale_ssh_key`: an SSH public key imported into the organization, which instances take by name.
 - Resource `virtscale_project`: a project, which groups servers, public IPs and networks. Data source
   `virtscale_project` finds one by name, or the organization's default project.
+- Resource `virtscale_instance_firewall`: the firewall rules of one instance.
 - Resource `virtscale_vpc`: a VPC, a private address space in one project and one region.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
@@ -95,6 +96,7 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
 | `virtscale_vpc` (create, destroy, refresh) | `network:write`, and `compute:read` to find its project with the `virtscale_project` data source |
+| `virtscale_instance_firewall` (set, clear, refresh) | `network:write` |
 | `virtscale_project` (create, rename, destroy) | `write`: `compute:write` only reads projects |
 | `virtscale_project` (data source, refresh) | `compute:read` (`compute:write` covers it too) |
 | `virtscale_images`, `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources) | `compute:read` (`compute:write` covers it too) |
@@ -302,6 +304,51 @@ The organization has a quota of VPCs (`422 quota_exceeded`). A VPC that still ha
 (`409 vpc_not_empty`). A delete that the platform cannot carry out ends the VPC in status `error`; destroy says so with the
 platform's reason. `internet_egress` is true only for the project's default VPC. An imported VPC that has a description
 needs the same `description` in the configuration, or the plan replaces it. Import by `<project id>/<vpc id>`: `tofu import virtscale_vpc.net <project id>/<vpc id>`.
+
+### `virtscale_instance_firewall`
+
+The whole firewall rule set of one instance. The API replaces the set as one and applies it asynchronously, so the
+resource owns all of it: a rule added in the panel shows up as a difference and is removed by the next apply. Apply
+waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. A set that
+ended in `error` is not in force, so the resource then reports no confirmed rules: the next plan shows the difference
+and the next apply sets the rules again. Destroying the resource waits for a change that is still being applied and then
+clears the rules this API lets you set (an empty set); the platform's own base rules are not part of the set. An
+instance that is gone has no rules to clear.
+
+**The first apply replaces whatever rules the instance already holds** (set in the panel or at creation), without a
+preview of them. To see them first, import the instance's firewall (`tofu import`, below) and run `tofu plan`: the
+difference to your configuration is what the apply would change.
+
+| Attribute     | Type   | Required/Computed | Notes |
+| ------------- | ------ | ----------------- | ----- |
+| `instance_id` | string | Required, forces replacement | The instance's id. |
+| `rule`        | set of blocks | Optional, at most 50 | The order does not matter. See below. |
+| `id`          | string | Computed | The instance's id. |
+| `state`       | string | Computed | `pending` while the API applies a change, `applied`, or `error`. |
+
+A `rule` block has `direction` (`ingress` or `egress`), `protocol` (`tcp`, `udp`, `icmp` or `any`), `port_min` and
+`port_max` (1 to 65535; required for `tcp` and `udp`, not allowed for `icmp` and `any`), `remote_cidr` (an IPv4 CIDR
+with no host bits set: `10.0.0.0/24`, not `10.0.0.5/24`, because the API would store it masked) and an optional
+`description` (1 to 80 characters). The rules are checked at plan time against the API's limits (its sentences for the
+ports and the description; the direction, protocol and CIDR sentences are the provider's own); whatever else the API
+refuses comes back as `422 invalid_rule` with the field of every rule it refused (`422 too_many_rules` past 50).
+
+```hcl
+resource "virtscale_instance_firewall" "web" {
+  instance_id = virtscale_instance.web.id
+
+  rule {
+    direction   = "ingress"
+    protocol    = "tcp"
+    port_min    = 22
+    port_max    = 22
+    remote_cidr = "203.0.113.0/24"
+    description = "ssh from the office"
+  }
+}
+```
+
+Import by the instance's id: `tofu import virtscale_instance_firewall.web <instance id>`.
 
 ### `virtscale_public_ip`
 

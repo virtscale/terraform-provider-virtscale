@@ -42,8 +42,9 @@ type fakeAPI struct {
 	org    string
 	srv    *httptest.Server
 
-	// ps is the projects and VPCs (fakeapi_projects_test.go).
-	ps projectState
+	// ps is the projects and VPCs (fakeapi_projects_test.go), fws the firewalls (fakeapi_firewall_test.go).
+	ps  projectState
+	fws firewallState
 
 	// contract checks every exchange with the provider's client against customer-v1.json (internal/contract);
 	// a mismatch fails t.
@@ -895,6 +896,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key = "compute/instances"
 	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "instances":
 		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
+	case len(parts) == 4 && parts[0] == "compute" && parts[1] == "instances" && parts[3] == "firewall":
+		key, param, id = "compute/instances/{vm_id}/firewall", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
 	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types", rest == "projects":
@@ -918,6 +921,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	case "POST compute/instances", "GET compute/instances/{vm_id}",
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
 		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
+		"GET compute/instances/{vm_id}/firewall", "PUT compute/instances/{vm_id}/firewall",
 		"GET projects", "POST projects", "GET projects/{project}", "PATCH projects/{project}", "DELETE projects/{project}",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
@@ -954,6 +958,8 @@ var routePermissions = map[string]string{
 	"GET compute/regions":                                 "compute.instance.list",
 	"GET compute/plans":                                   "compute.instance.list",
 	"GET instance-types":                                  "compute.instance_type.list",
+	"GET compute/instances/{vm_id}/firewall":              "network.read",
+	"PUT compute/instances/{vm_id}/firewall":              "network.firewall.update",
 	"GET projects":                                        "project.list",
 	"POST projects":                                       "project.create",
 	"GET projects/{project}":                              "project.read",
@@ -1107,6 +1113,10 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.listPlans(rc)
 	case "GET instance-types":
 		f.listInstanceTypes(rc)
+	case "GET compute/instances/{vm_id}/firewall":
+		f.getFirewall(rc, id)
+	case "PUT compute/instances/{vm_id}/firewall":
+		f.putFirewall(rc, id)
 	case "POST projects":
 		f.createProject(rc)
 	case "GET projects":

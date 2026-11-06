@@ -137,6 +137,7 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 		NewSshKeyResource,
 		NewProjectResource,
 		NewVpcResource,
+		NewInstanceFirewallResource,
 	}
 }
 

@@ -551,11 +551,11 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 // carries its own count) how many sends it took, and, for a request that
 // carried an Idempotency-Key, how to recover when the failure leaves open that
 // the API processed it anyway. The recovery sentence depends on the method: a
-// POST creates a resource (see lostCreateHint), while a PATCH or a DELETE changes or
+// POST creates a resource (see lostCreateHint), while a PATCH, a PUT or a DELETE changes or
 // removes one (see lostPatchHint).
 func giveUp(err error, attempts int, idempotencyKey, method string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
-	// Only a POST creates something to look for; a keyed PATCH or DELETE changed or removed a resource that is in the
+	// Only a POST creates something to look for; a keyed PATCH, PUT or DELETE changed or removed a resource that is in the
 	// state already, so another plan shows where it stands.
 	hint := lostPatchHint
 	if method == http.MethodPost {
@@ -603,11 +603,11 @@ func mayHaveBeenApplied(err error) bool {
 }
 
 // repeatable reports whether sending the request twice is safe: a GET, a
-// DELETE, or a POST or PATCH that carries an Idempotency-Key (the API replays
+// DELETE, or a POST, PATCH or PUT that carries an Idempotency-Key (the API replays
 // the first answer for the same key and body).
 func repeatable(method, idempotencyKey string) bool {
 	return method == http.MethodGet || method == http.MethodDelete ||
-		((method == http.MethodPost || method == http.MethodPatch) && idempotencyKey != "")
+		((method == http.MethodPost || method == http.MethodPatch || method == http.MethodPut) && idempotencyKey != "")
 }
 
 // retryable decides whether a failed attempt may be repeated.
@@ -615,7 +615,7 @@ func repeatable(method, idempotencyKey string) bool {
 //   - 429 is retried for every method: the rate limiter refuses a request
 //     before it runs.
 //   - 502, 503, 504 and transport errors may have been applied, so only a
-//     repeatable request (a GET, a DELETE, or a keyed POST or PATCH) is
+//     repeatable request (a GET, a DELETE, or a keyed POST, PATCH or PUT) is
 //     retried.
 //   - A 503 whose code is not_ready says a feature flag is off; retrying
 //     cannot help.
