@@ -26,46 +26,14 @@ var (
 	_ resource.ResourceWithValidateConfig = &InstanceFirewallResource{}
 )
 
-var (
-	errFirewallApplyFailed = errors.New("firewall entered error state")
-	errFirewallDiffers     = errors.New("firewall confirmed another rule set")
+var errFirewallApplyFailed = errors.New("firewall entered error state")
+
+const (
+	// maxFirewallRules is how many rules the API takes for one instance (422 too_many_rules beyond it).
+	maxFirewallRules = 50
+	// maxRuleDescription is the longest description of a rule (COMPUTE_FIREWALL_DESCRIPTION_MAX_LENGTH).
+	maxRuleDescription = 80
 )
-
-// firewallGracePolls is how many reads may show "applied" with a rule set other than the one sent before it is believed:
-// the API's state change may reach the row a moment after the PUT answers, and the old set reads applied until then.
-const firewallGracePolls = 12
-
-// ruleKey is a rule as one comparable string.
-func ruleKey(direction, protocol string, portMin, portMax *int, cidr, description string) string {
-	return fmt.Sprintf("%s|%s|%s|%s|%s|%s", direction, protocol, intText(portMin), intText(portMax), cidr, description)
-}
-
-func intText(p *int) string {
-	if p == nil {
-		return "-"
-	}
-	return fmt.Sprint(*p)
-}
-
-// sameRules reports whether the confirmed rules are the rules that were sent, as sets of rules.
-func sameRules(sent []client.FirewallRuleIn, confirmed []client.FirewallRule) bool {
-	counts := map[string]int{}
-	for _, r := range sent {
-		counts[ruleKey(r.Direction, r.Protocol, r.PortMin, r.PortMax, r.RemoteCIDR, r.Description)]++
-	}
-	for _, r := range confirmed {
-		counts[ruleKey(r.Direction, r.Protocol, r.PortMin, r.PortMax, r.RemoteCIDR, r.Description)]--
-	}
-	for _, n := range counts {
-		if n != 0 {
-			return false
-		}
-	}
-	return true
-}
-
-// maxFirewallRules is how many rules the API takes for one instance.
-const maxFirewallRules = 50
 
 // InstanceFirewallResource implements virtscale_instance_firewall: the whole rule set of one instance. The API
 // replaces the set as one, so the resource owns all of it: rules added elsewhere show as a difference and are removed
@@ -138,7 +106,7 @@ func (r *InstanceFirewallResource) Schema(_ context.Context, _ resource.SchemaRe
 					"remote_cidr": schema.StringAttribute{Required: true,
 						Description: "The remote network, an IPv4 CIDR with no host bits set: 10.0.0.0/24, not 10.0.0.5/24."},
 					"description": schema.StringAttribute{Optional: true,
-						Description: "Free text, 1 to 255 characters; leave it out for none."},
+						Description: "Free text, 1 to 80 characters; leave it out for none."},
 				}},
 			},
 		},
@@ -154,7 +122,7 @@ func (r *InstanceFirewallResource) ValidateConfig(ctx context.Context, req resou
 		return
 	}
 	if n := len(rules.Elements()); n > maxFirewallRules {
-		resp.Diagnostics.AddAttributeError(path.Root("rule"), "Too many firewall rules", fmt.Sprintf("%d rules; an instance takes at most %d", n, maxFirewallRules))
+		resp.Diagnostics.AddAttributeError(path.Root("rule"), "Too many firewall rules", fmt.Sprintf("%d rules; an instance takes at most %d (the API refuses more with 422 too_many_rules)", n, maxFirewallRules))
 	}
 	var models []firewallRuleModel
 	if diags := rules.ElementsAs(ctx, &models, false); diags.HasError() {
@@ -207,8 +175,8 @@ func firewallRuleRefusal(m firewallRuleModel) string {
 		return fmt.Sprintf("%q is not a canonical CIDR: use %q", raw, network.String())
 	}
 	if !m.Description.IsNull() {
-		if n := len([]rune(m.Description.ValueString())); n == 0 || n > 255 {
-			return "description, when given, is 1 to 255 characters"
+		if n := len([]rune(m.Description.ValueString())); n == 0 || n > maxRuleDescription {
+			return fmt.Sprintf("description must be at most %d characters (and not empty when given)", maxRuleDescription)
 		}
 	}
 	return ""
@@ -283,30 +251,18 @@ func (r *InstanceFirewallResource) apply(ctx context.Context, model *instanceFir
 
 	waitCtx, cancel := context.WithTimeout(ctx, createTimeout)
 	defer cancel()
-	differs := 0
 	final, waitErr := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
 		if f == nil {
 			return false, errors.New("the instance disappeared while its firewall was being changed")
 		}
 		switch f.State {
 		case "applied":
-			if sameRules(rules, f.Rules) {
-				return true, nil
-			}
-			if differs++; differs > firewallGracePolls {
-				return true, errFirewallDiffers
-			}
+			return true, nil
 		case "error":
 			return true, errFirewallApplyFailed
 		}
 		return false, nil
 	})
-	if errors.Is(waitErr, errFirewallDiffers) && final != nil {
-		state.diags.AddError("Firewall Rules Differ", fmt.Sprintf(
-			"the API says the rule set is applied, but it holds %d rules and %d were sent; run apply again, and tell support if it repeats",
-			len(final.Rules), len(rules)))
-		return
-	}
 	if errors.Is(waitErr, errFirewallApplyFailed) && final != nil {
 		model.State = types.StringValue(final.State)
 		state.save()
@@ -363,7 +319,7 @@ func (r *InstanceFirewallResource) Update(ctx context.Context, req resource.Upda
 	resp.Diagnostics.Append(st.diags...)
 }
 
-// Read refreshes the rules from the API. Only the instance 404 of the API's shared not_found helper removes the
+// Read refreshes the rules from the API (see below for a set that failed). Only the instance 404 of the API's shared not_found helper removes the
 // resource from state; any other 404 is an error.
 func (r *InstanceFirewallResource) Read(ctx context.Context, req resource.ReadRequest, resp *resource.ReadResponse) {
 	var state instanceFirewallModel
@@ -380,7 +336,13 @@ func (r *InstanceFirewallResource) Read(ctx context.Context, req resource.ReadRe
 		resp.Diagnostics.AddError("Unable to Read Firewall", apiErrorDetail(err))
 		return
 	}
-	set, diags := rulesFromAPI(ctx, f.Rules)
+	// The API shows the rules last asked for with the state of applying them. When that is error they are not in force,
+	// so none are confirmed: the next plan then differs from the configuration and the next apply sets them again.
+	rules := f.Rules
+	if f.State == "error" {
+		rules = nil
+	}
+	set, diags := rulesFromAPI(ctx, rules)
 	resp.Diagnostics.Append(diags...)
 	state.ID, state.Rules, state.State = types.StringValue(f.VmID), set, types.StringValue(f.State)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
@@ -399,16 +361,24 @@ func (r *InstanceFirewallResource) Delete(ctx context.Context, req resource.Dele
 		return
 	}
 	id := state.InstanceID.ValueString()
+	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
+	// A change that is still being applied (a create whose wait failed, an interrupted apply) makes the PUT a 409
+	// operation_in_flight: let it finish first.
+	if _, err := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
+		return f == nil || f.State != "pending", nil
+	}); err != nil {
+		resp.Diagnostics.AddError("Unable to Clear Firewall", err.Error())
+		return
+	}
 	if _, err := r.client.SetFirewall(ctx, id, nil, key); err != nil {
 		if !client.IsNotFound(err, client.ResourceVm) {
 			resp.Diagnostics.AddError("Unable to Clear Firewall", apiErrorDetail(err))
 		}
 		return
 	}
-	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
-	defer cancel()
 	if _, err := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
-		if f == nil || (f.State == "applied" && len(f.Rules) == 0) {
+		if f == nil || f.State == "applied" {
 			return true, nil
 		}
 		if f.State == "error" {

@@ -310,9 +310,15 @@ The organization has a quota of VPCs (`422 quota_exceeded`). A VPC that still ha
 
 The whole firewall rule set of one instance. The API replaces the set as one and applies it asynchronously, so the
 resource owns all of it: a rule added in the panel shows up as a difference and is removed by the next apply. Apply
-waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`; destroying
-the resource clears the instance's rules (an empty set), which leaves the instance without any rule the API
-would allow in. An instance that is gone has no rules to clear.
+waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. A set that
+ended in `error` is not in force, so the resource then reports no confirmed rules: the next plan shows the difference
+and the next apply sets the rules again. Destroying the resource waits for a change that is still being applied and then
+clears the rules this API lets you set (an empty set); the platform's own base rules are not part of the set. An
+instance that is gone has no rules to clear.
+
+**The first apply replaces whatever rules the instance already holds** (set in the panel or at creation), without a
+preview of them. To see them first, import the instance's firewall (`tofu import`, below) and run `tofu plan`: the
+difference to your configuration is what the apply would change.
 
 | Attribute     | Type   | Required/Computed | Notes |
 | ------------- | ------ | ----------------- | ----- |
@@ -324,8 +330,9 @@ would allow in. An instance that is gone has no rules to clear.
 A `rule` block has `direction` (`ingress` or `egress`), `protocol` (`tcp`, `udp`, `icmp` or `any`), `port_min` and
 `port_max` (1 to 65535; required for `tcp` and `udp`, not allowed for `icmp` and `any`), `remote_cidr` (an IPv4 CIDR
 with no host bits set: `10.0.0.0/24`, not `10.0.0.5/24`, because the API would store it masked) and an optional
-`description` (1 to 255 characters). The rules are checked at plan time with the API's own sentences; whatever else
-the API refuses comes back as `422 invalid_rule` with the field of every rule it refused.
+`description` (1 to 80 characters). The rules are checked at plan time against the API's limits (its sentences for the
+ports and the description; the direction, protocol and CIDR sentences are the provider's own); whatever else the API
+refuses comes back as `422 invalid_rule` with the field of every rule it refused (`422 too_many_rules` past 50).
 
 ```hcl
 resource "virtscale_instance_firewall" "web" {

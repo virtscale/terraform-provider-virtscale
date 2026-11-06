@@ -8,9 +8,11 @@ import (
 	"time"
 )
 
-// An instance's firewall (routes/compute.py, domain/compute/edge.py of s3-control-plane 87607618): GET shows the rules
-// last confirmed and a state, PUT replaces the whole set and answers 202 with the instance and a firewall.apply
-// operation. Shapes are FirewallOut, FirewallRuleOut and VmAccepted of customer-v1.json.
+// An instance's firewall (routes/compute.py, domain/compute/edge.py of s3-control-plane 87607618): PUT replaces the whole
+// set (the rows are written in the PUT's own transaction, the state is pending) and answers 202 with the instance and a
+// firewall.apply operation; GET shows those rows at once with the state of applying them (pending, applied, error).
+// (The FirewallOut docstring says "never the mid-flight one"; the code and the API's own test do not do that.) Shapes
+// are FirewallOut, FirewallRuleOut and VmAccepted of customer-v1.json.
 
 type wireFirewallRuleOut struct {
 	ID          string `json:"id"`
@@ -38,14 +40,13 @@ type wireFirewallRuleIn struct {
 	Description string `json:"description"`
 }
 
-// fakeFirewall is one instance's rule set: applied is what firewall.apply last wrote, pending what it is writing.
+// fakeFirewall is one instance's rule set and the state of applying it.
 type fakeFirewall struct {
-	applied, pending []wireFirewallRuleOut
-	state            string
-	err              *string
-	stepsLeft        int
-	fail             bool
-	lag              int // reads after a PUT that still show the old set as applied, before the state flips to pending
+	rules     []wireFirewallRuleOut
+	state     string
+	err       *string
+	stepsLeft int
+	fail      bool
 }
 
 type firewallState struct {
@@ -67,14 +68,6 @@ func (f *fakeAPI) fw(id string) *fakeFirewall {
 	return fw
 }
 
-// SetFirewallLag makes the next PUT of the instance show the old rule set as applied for n reads before the state flips
-// to pending: an API whose state change is asynchronous. A client that stops at the first applied reads the old rules.
-func (f *fakeAPI) SetFirewallLag(vmID string, n int) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.fw(vmID).lag = n
-}
-
 // FailFirewallApply makes the next firewall.apply of the instance end in state error.
 func (f *fakeAPI) FailFirewallApply(vmID string) {
 	f.mu.Lock()
@@ -87,7 +80,7 @@ func (f *fakeAPI) FirewallRules(vmID string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := []string{}
-	for _, r := range f.fw(vmID).applied {
+	for _, r := range f.fw(vmID).rules {
 		out = append(out, fmt.Sprintf("%s %s %s-%s %s", r.Direction, r.Protocol, intOrDash(r.PortMin), intOrDash(r.PortMax), r.RemoteCIDR))
 	}
 	return out
@@ -111,10 +104,6 @@ func (f *fakeAPI) advanceFirewall(fw *fakeFirewall) {
 	if fw.state != "pending" {
 		return
 	}
-	if fw.lag > 0 {
-		fw.lag--
-		return
-	}
 	if fw.stepsLeft--; fw.stepsLeft > 0 {
 		return
 	}
@@ -124,7 +113,7 @@ func (f *fakeAPI) advanceFirewall(fw *fakeFirewall) {
 		fw.state, fw.err = "error", &msg
 		return
 	}
-	fw.applied, fw.pending, fw.state, fw.err = fw.pending, nil, "applied", nil
+	fw.state, fw.err = "applied", nil
 }
 
 func (f *fakeAPI) getFirewall(rc *reqCtx, id string) {
@@ -136,15 +125,11 @@ func (f *fakeAPI) getFirewall(rc *reqCtx, id string) {
 	}
 	fw := f.fw(id)
 	f.advanceFirewall(fw)
-	rules := fw.applied
+	rules := fw.rules
 	if rules == nil {
 		rules = []wireFirewallRuleOut{}
 	}
-	state := fw.state
-	if state == "pending" && fw.lag > 0 {
-		state = "applied" // the change has not shown yet
-	}
-	rc.json(http.StatusOK, wireFirewallOut{VmID: id, State: state, Error: fw.err, Rules: rules})
+	rc.json(http.StatusOK, wireFirewallOut{VmID: id, State: fw.state, Error: fw.err, Rules: rules})
 }
 
 // putFirewall replaces the rule set: the whole body is validated first and every rule that fails is named
@@ -176,7 +161,8 @@ func (f *fakeAPI) putFirewall(rc *reqCtx, id string) {
 	var refusals []wireFieldError
 	var first string
 	if len(in) > 50 {
-		rc.unprocessable("invalid_rule", "a firewall holds at most 50 rules")
+		rc.problem(http.StatusUnprocessableEntity, "too_many_rules", "Unprocessable", "a firewall holds at most 50 rules",
+			wireFieldError{Field: "rules", Message: "a firewall holds at most 50 rules"})
 		return
 	}
 	rules := make([]wireFirewallRuleOut, 0, len(in))
@@ -192,8 +178,10 @@ func (f *fakeAPI) putFirewall(rc *reqCtx, id string) {
 			field, sentence = "port_min", r.Protocol+" rules carry no port range"
 		case (r.Protocol == "tcp" || r.Protocol == "udp") && (r.PortMin == nil || r.PortMax == nil):
 			field, sentence = "port_min", r.Protocol+" rules need a port range"
-		case r.PortMin != nil && (*r.PortMin < 1 || *r.PortMin > 65535 || *r.PortMax < 1 || *r.PortMax > 65535):
+		case r.PortMin != nil && (*r.PortMin < 1 || *r.PortMin > 65535):
 			field, sentence = "port_min", "ports must be between 1 and 65535"
+		case r.PortMax != nil && (*r.PortMax < 1 || *r.PortMax > 65535):
+			field, sentence = "port_max", "ports must be between 1 and 65535"
 		case r.PortMin != nil && *r.PortMin > *r.PortMax:
 			field, sentence = "port_min", "port_min must not exceed port_max"
 		}
@@ -205,8 +193,8 @@ func (f *fakeAPI) putFirewall(rc *reqCtx, id string) {
 				cidr = n.String() // host bits masked
 			}
 		}
-		if sentence == "" && len(r.Description) > 255 {
-			field, sentence = "description", "description must be at most 255 characters"
+		if sentence == "" && len([]rune(r.Description)) > 80 {
+			field, sentence = "description", "description must be at most 80 characters"
 		}
 		if sentence != "" {
 			if first == "" {
@@ -229,8 +217,8 @@ func (f *fakeAPI) putFirewall(rc *reqCtx, id string) {
 		return
 	}
 	f.fws.puts = append(f.fws.puts, string(payload))
-	fw.pending, fw.state, fw.err, fw.stepsLeft = rules, "pending", nil, 2
-	op := f.newOperation("firewall.apply", "vm", id, time.Now().UTC())
+	fw.rules, fw.state, fw.err, fw.stepsLeft = rules, "pending", nil, 2
+	op := f.newOperation("firewall.apply", "vm", id+":firewall", time.Now().UTC())
 	accepted := vmAccepted{Vm: f.vms[id].wireVmOut, Operation: op}
 	f.idemKeep(storeKey, digest, http.StatusAccepted, accepted, f.operationLocation(op), "")
 	rc.json(http.StatusAccepted, accepted, "Location", f.operationLocation(op))
