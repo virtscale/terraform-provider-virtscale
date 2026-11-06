@@ -148,10 +148,12 @@ func TestAccS3BucketResource_NamesTheAPIWouldRefuseAreRefusedAtPlanTime(t *testi
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	for name, want := range map[string]string{
 		"UPPER":       "lowercase letters",
-		"ab":          "3 to 63",
+		"ab":          "between 3 and 63 characters",
 		"has--double": "consecutive hyphens",
-		"10.0.0.1":    "lowercase letters",
+		"10.0.0.1":    "dots are not permitted",
 		"-lead":       "start and end",
+		"admin":       "reserved by the platform",
+		"vs-logs":     `starting with "vs-"`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			resource.Test(t, resource.TestCase{
@@ -257,8 +259,27 @@ func TestAccS3BucketResource_ASoftDeletedBucketKeepsItsNameForTheRetentionWindow
 			{
 				PreConfig:   func() { fake.ForceSoftDeleteBucket(id) },
 				Config:      config,
-				ExpectError: wrapSafeInOrder("409 name_taken", "a bucket named 'tf-bucket-h' already exists"),
+				ExpectError: wrapSafeInOrder("409 bucket_already_exists", "already has a bucket named \"tf-bucket-h\""),
 			},
+		},
+	})
+}
+
+// A 404 about the organization is not a 404 about the bucket: it stays in state, and the error is shown.
+func TestAccS3BucketResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.AddKey("storage", "storage:write")
+	config := func(org string) string {
+		return testAccProviderBlockWith(fake, "storage", org) + "resource \"virtscale_s3_bucket\" \"x\" {\n  name = \"tf-bucket-g\"\n}\n"
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             checkBucketsSoftDeleted(fake),
+		Steps: []resource.TestStep{
+			{Config: config(testOrgID)},
+			{Config: config(testOtherOrg), PlanOnly: true, ExpectError: wrapSafeInOrder("no organization matching", "check VIRTSCALE_ORGANIZATION")},
+			{Config: config(testOrgID), PlanOnly: true},
 		},
 	})
 }

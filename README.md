@@ -359,19 +359,28 @@ service switched on (the panel does it), and has a limit of buckets (`422 bucket
 
 | Attribute        | Type   | Required/Computed | Notes |
 | ---------------- | ------ | ----------------- | ----- |
-| `name`           | string | Required, forces replacement | 3-63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no two hyphens in a row, not an IP address (checked at plan time). Unique within the organization (`409 name_taken`). |
+| `name`           | string | Required, forces replacement | 3-63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no dots, no two hyphens in a row, and not a name (`admin`, `api`, `www`, `internal`, `system`, `backup`, `billing`, `metrics`, `health`) or a prefix (`virtscale-`, `vs-`, `s3-`, `rgw-`, `admin-`, `internal-`, `system-`) the platform keeps: checked at plan time with the API's sentences (`400 bucket_name_invalid`, `400 bucket_name_reserved`). Unique within the organization (`409 bucket_already_exists`). |
 | `versioning`     | bool   | Optional, default `false` | Keep previous versions of overwritten and deleted objects. Fixed at creation: a change is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken (below). |
 | `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
 | `max_objects`    | number | Optional | The most objects. Same rules. |
 | `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
 | `id`, `state`, `created_at` | string | Computed | |
 
-Deleting is a **soft delete**: the bucket is cut off at once, its data is kept for a retention window (7 days) and then
-purged, and the plan's bucket slot is freed. A bucket in that state reads as gone, but **its name stays taken** until it
-is purged (`409 name_taken` for a new bucket of that name; the panel can restore a soft-deleted bucket). The API also limits how many
-buckets, live and soft-deleted, an organization holds in all (`422 bucket_retention_limit_reached`), so creating and
-destroying buckets in a loop eventually has to wait for purges. The ceilings are applied by the object store after the
-API accepts them. Import by id: `tofu import virtscale_s3_bucket.logs <id>`.
+Deleting is a **soft delete**: the bucket is cut off at once, its data is kept for a retention window, and the plan's
+bucket slot is freed. A bucket in that state reads as gone, but **its name stays taken** until it is purged
+(`409 bucket_already_exists` for a new bucket of that name; the panel can restore a soft-deleted bucket). **The
+platform's purge worker ships switched off** (`S3CP_BUCKET_PURGE_ENABLED=false`); until it is on, a soft-deleted bucket is
+never purged, its name stays taken, and it keeps a retention row: the API limits the buckets an organization holds, live
+and soft-deleted, to twice its bucket limit (`422 bucket_retention_limit_reached`), so do not create and destroy buckets
+in a loop. The ceilings are applied by the object store after the API accepts them, and a change right after another
+operation of the bucket can meet `409 operation_in_flight`, which the provider repeats for about a minute.
+
+If a create fails after the bucket was made (the API refuses a ceiling, `422 bucket_quota_exceeds_plan`; the bucket ends
+in `provision_failed`), the bucket is in the state, tainted by the error, and the next apply would replace it, which
+cannot work because the soft-deleted bucket keeps the name. After a refused ceiling, fix it in the configuration, run
+`tofu untaint` on the bucket and apply again; after a failed build, give the bucket another name. To destroy a bucket that
+holds objects, set `force_destroy = true`, run `tofu apply` so that the setting is stored, and destroy again. Import by
+id: `tofu import virtscale_s3_bucket.logs <id>`.
 
 ### `virtscale_s3_access_key`
 
@@ -386,12 +395,15 @@ window.
 
 If a create is repeated after a lost answer (a gateway error), the API answers the repeat with the stored result, which
 never holds the secret. The key exists then, so the provider keeps it in the state and fails with "Access Key Secret Not
-Returned": run `tofu destroy` (or apply again, which replaces it) to revoke it and get a new one.
+Returned": run `tofu destroy` (or apply again, which replaces it) to revoke it and get a new one. If the provider gives up
+before it gets any answer, the key may exist with its secret lost: look at the organization's access keys (at most 5) in the
+panel or with the API, and revoke any you did not receive. Destroying the resource revokes the key; a revoke that fails
+leaves it `degraded`, which the destroy reports at once.
 
 | Attribute           | Type   | Required/Computed | Notes |
 | ------------------- | ------ | ----------------- | ----- |
 | `id`                | string | Computed | |
-| `access_key_id`     | string | Computed | The public half, to use as the S3 access key id. |
+| `access_key_id`     | string | Computed | The public half, to use as the S3 access key id. An organization holds at most 5 keys (`422 access_key_limit_reached`). |
 | `secret_access_key` | string | Computed, sensitive | Known only after the create here. |
 | `state`, `created_at` | string | Computed | |
 
@@ -400,9 +412,10 @@ Import by id: `tofu import virtscale_s3_access_key.app <id>`.
 ### What the provider does not manage: IAM
 
 Members, invitations and API keys are managed by people, not by API keys: the `iam.*` permissions are in no key scope
-(an API key cannot list, mint or revoke keys, or invite, change or remove members; the writes also need a fresh
-second factor). That is deliberate, so a leaked key cannot widen its own reach, and the provider has no resource for
-them. Use the panel for members and keys; `virtscale_caller` shows what the key you run Terraform with can do.
+(no scope map of an API key holds them, so a key cannot mint or revoke keys or invite, change or remove members; for
+people the writes also need a fresh second factor, where the deployment enforces it). That is deliberate, so a leaked
+key cannot widen its own reach, and the provider has no resource for them. Use the panel for members and keys;
+`virtscale_caller` shows what the key you run Terraform with can do.
 
 ### `virtscale_public_ip`
 
