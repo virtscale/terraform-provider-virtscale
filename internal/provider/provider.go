@@ -135,6 +135,8 @@ func (p *VirtscaleProvider) Resources(_ context.Context) []func() resource.Resou
 		NewInstanceResource,
 		NewPublicIpResource,
 		NewSshKeyResource,
+		NewProjectResource,
+		NewVpcResource,
 	}
 }
 
@@ -146,5 +148,6 @@ func (p *VirtscaleProvider) DataSources(_ context.Context) []func() datasource.D
 		NewRegionsDataSource,
 		NewInstanceTypesDataSource,
 		NewPlansDataSource,
+		NewProjectDataSource,
 	}
 }

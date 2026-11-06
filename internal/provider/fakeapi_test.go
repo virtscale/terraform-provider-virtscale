@@ -42,10 +42,15 @@ type fakeAPI struct {
 	org    string
 	srv    *httptest.Server
 
+	// ps is the projects and VPCs (fakeapi_projects_test.go).
+	ps projectState
+
 	// contract checks every exchange with the provider's client against customer-v1.json (internal/contract);
 	// a mismatch fails t.
 	contract *contract.Spec
 	t        *testing.T
+	keyMetas map[string]keyMeta
+	checked  int // exchanges of the provider's client that were checked against the contract
 
 	mu          sync.Mutex
 	vms         map[string]*fakeVm
@@ -323,6 +328,7 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		t.Fatalf("load the contract: %v", err)
 	}
 	f.contract, f.t = spec, t
+	f.ps = newProjectState(org)
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -365,6 +371,16 @@ func (f *fakeAPI) serveChecked(rc *reqCtx) {
 	for _, problem := range f.contract.Check(rc.r.Method, rc.r.URL.Path, body, rec.status, rec.Header().Get("Content-Type"), rec.body.Bytes()) {
 		f.t.Errorf("contract: %s", problem)
 	}
+	f.mu.Lock()
+	f.checked++
+	f.mu.Unlock()
+}
+
+// ContractChecked is how many exchanges of the provider's client the fake has checked against the contract.
+func (f *fakeAPI) ContractChecked() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.checked
 }
 
 // URL returns the fake server's base URL, suitable for the provider's
@@ -881,8 +897,10 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
-	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types":
+	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types", rest == "projects":
 		key = rest
+	case len(parts) == 2 && parts[0] == "projects":
+		key, param, id = "projects/{project}", "project", parts[1]
 	case rest == "compute/public-ips":
 		key = "compute/public-ips"
 	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "public-ips":
@@ -900,6 +918,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	case "POST compute/instances", "GET compute/instances/{vm_id}",
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
 		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
+		"GET projects", "POST projects", "GET projects/{project}", "PATCH projects/{project}", "DELETE projects/{project}",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
 		"POST compute/ssh-keys", "GET compute/ssh-keys",
@@ -935,6 +954,15 @@ var routePermissions = map[string]string{
 	"GET compute/regions":                                 "compute.instance.list",
 	"GET compute/plans":                                   "compute.instance.list",
 	"GET instance-types":                                  "compute.instance_type.list",
+	"GET projects":                                        "project.list",
+	"POST projects":                                       "project.create",
+	"GET projects/{project}":                              "project.read",
+	"PATCH projects/{project}":                            "project.update",
+	"DELETE projects/{project}":                           "project.delete",
+	"POST projects/{project}/vpcs":                        "network.vpc.create",
+	"GET projects/{project}/vpcs":                         "network.vpc.list",
+	"GET projects/{project}/vpcs/{vpc}":                   "network.vpc.read",
+	"DELETE projects/{project}/vpcs/{vpc}":                "network.vpc.delete",
 	"GET compute/public-ips":                              "edge.public_ip.read",
 	"POST compute/public-ips":                             "edge.public_ip.allocate",
 	"DELETE compute/public-ips/{public_ip_id}":            "edge.public_ip.release",
@@ -960,6 +988,10 @@ func scopeGrants(scope, perm string) bool {
 		return !strings.HasPrefix(perm, "iam.") && isRead
 	case "compute:read", "compute:write", "network:read", "network:write":
 		if perm == "org.read" {
+			return true
+		}
+		// compute:read and compute:write also carry project.list and project.read (permissions.py).
+		if (perm == "project.list" || perm == "project.read") && strings.HasPrefix(scope, "compute:") {
 			return true
 		}
 		family, half, _ := strings.Cut(scope, ":")
@@ -989,6 +1021,10 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 	r := rc.r
 	if r.URL.Path == "/v1/me" {
 		f.serveMe(rc)
+		return
+	}
+	if strings.HasPrefix(r.URL.Path, "/v1/projects/") {
+		f.serveProjectScoped(rc)
 		return
 	}
 	orgRaw, rest, ok := splitOrgPath(r.URL.Path)
@@ -1071,6 +1107,16 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.listPlans(rc)
 	case "GET instance-types":
 		f.listInstanceTypes(rc)
+	case "POST projects":
+		f.createProject(rc)
+	case "GET projects":
+		f.listProjects(rc)
+	case "GET projects/{project}":
+		f.getProject(rc, id)
+	case "PATCH projects/{project}":
+		f.patchProject(rc, id)
+	case "DELETE projects/{project}":
+		f.deleteProject(rc, id)
 	case "POST compute/ssh-keys":
 		f.importSshKey(rc)
 	case "GET compute/ssh-keys":
