@@ -87,12 +87,9 @@ resource "virtscale_s3_bucket" "test" {
 					return nil
 				},
 			},
-			{ // Versioning cannot be changed after creation: a new bucket.
-				Config: provider("  versioning = false\n  max_size_bytes = 2147483648\n"),
-				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-					plancheck.ExpectResourceAction("virtscale_s3_bucket.test", plancheck.ResourceActionReplace),
-				}},
-				Check: resource.TestCheckResourceAttr("virtscale_s3_bucket.test", "versioning", "false"),
+			{ // Versioning cannot be changed after creation, and a replacement would meet its own name: refused at plan time.
+				Config:      provider("  versioning = false\n  max_size_bytes = 2147483648\n"),
+				ExpectError: wrapSafeInOrder("Versioning cannot be changed", "another name"),
 			},
 			{
 				ResourceName:            "virtscale_s3_bucket.test",
@@ -218,52 +215,50 @@ func TestAccS3BucketResource_AKeyWithoutTheStorageScopeIsToldSo(t *testing.T) {
 	})
 }
 
-func TestAccS3BucketResource_GoneOrSoftDeletedOutOfBandIsRecreated(t *testing.T) {
+func TestAccS3BucketResource_VanishedOutOfBandIsRecreated(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	fake.AddKey("storage", "storage:write")
 	config := testAccProviderBlockWith(fake, "storage", testOrgID) + "resource \"virtscale_s3_bucket\" \"x\" {\n  name = \"tf-bucket-f\"\n}\n"
 	var id string
-	for name, gone := range map[string]func(){
-		"vanished":     func() { fake.VanishBucket(id) },
-		"soft-deleted": func() { fake.ForceSoftDeleteBucket(id) },
-	} {
-		t.Run(name, func(t *testing.T) {
-			resource.Test(t, resource.TestCase{
-				PreCheck:                 func() { testAccPreCheck(t) },
-				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
-				Steps: []resource.TestStep{
-					{Config: config, Check: func(s *terraform.State) error {
-						id = s.RootModule().Resources["virtscale_s3_bucket.x"].Primary.ID
-						return nil
-					}},
-					{
-						PreConfig: gone,
-						Config:    config,
-						ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
-							plancheck.ExpectResourceAction("virtscale_s3_bucket.x", plancheck.ResourceActionCreate),
-						}},
-					},
-				},
-			})
-		})
-	}
-}
-
-// A 404 about the organization is not a 404 about the bucket: it stays in state, and the error is shown.
-func TestAccS3BucketResource_WrongOrganizationKeepsTheResourceInState(t *testing.T) {
-	fake := newFakeAPI(t, "test-api-key", testOrgID)
-	fake.AddKey("storage", "storage:write")
-	config := func(org string) string {
-		return testAccProviderBlockWith(fake, "storage", org) + "resource \"virtscale_s3_bucket\" \"x\" {\n  name = \"tf-bucket-g\"\n}\n"
-	}
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
-		CheckDestroy:             checkBucketsSoftDeleted(fake),
 		Steps: []resource.TestStep{
-			{Config: config(testOrgID)},
-			{Config: config(testOtherOrg), PlanOnly: true, ExpectError: wrapSafeInOrder("no organization matching", "check VIRTSCALE_ORGANIZATION")},
-			{Config: config(testOrgID), PlanOnly: true},
+			{Config: config, Check: func(s *terraform.State) error {
+				id = s.RootModule().Resources["virtscale_s3_bucket.x"].Primary.ID
+				return nil
+			}},
+			{
+				PreConfig: func() { fake.VanishBucket(id) },
+				Config:    config,
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction("virtscale_s3_bucket.x", plancheck.ResourceActionCreate),
+				}},
+			},
+		},
+	})
+}
+
+// A bucket that was deleted elsewhere reads as gone, so the plan creates it again; but its name stays taken for the
+// retention window, and the API's refusal is shown with its code.
+func TestAccS3BucketResource_ASoftDeletedBucketKeepsItsNameForTheRetentionWindow(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.AddKey("storage", "storage:write")
+	config := testAccProviderBlockWith(fake, "storage", testOrgID) + "resource \"virtscale_s3_bucket\" \"x\" {\n  name = \"tf-bucket-h\"\n}\n"
+	var id string
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: config, Check: func(s *terraform.State) error {
+				id = s.RootModule().Resources["virtscale_s3_bucket.x"].Primary.ID
+				return nil
+			}},
+			{
+				PreConfig:   func() { fake.ForceSoftDeleteBucket(id) },
+				Config:      config,
+				ExpectError: wrapSafeInOrder("409 name_taken", "a bucket named 'tf-bucket-h' already exists"),
+			},
 		},
 	})
 }

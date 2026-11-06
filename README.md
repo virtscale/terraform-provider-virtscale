@@ -353,14 +353,15 @@ service switched on (the panel does it), and has a limit of buckets (`422 bucket
 | Attribute        | Type   | Required/Computed | Notes |
 | ---------------- | ------ | ----------------- | ----- |
 | `name`           | string | Required, forces replacement | 3-63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no two hyphens in a row, not an IP address (checked at plan time). Unique within the organization (`409 name_taken`). |
-| `versioning`     | bool   | Optional, default `false`, forces replacement | Keep previous versions of overwritten and deleted objects. Fixed at creation. |
+| `versioning`     | bool   | Optional, default `false` | Keep previous versions of overwritten and deleted objects. Fixed at creation: a change is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken (below). |
 | `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
 | `max_objects`    | number | Optional | The most objects. Same rules. |
 | `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
 | `id`, `state`, `created_at` | string | Computed | |
 
 Deleting is a **soft delete**: the bucket is cut off at once, its data is kept for a retention window (7 days) and then
-purged, and the plan's bucket slot is freed. A bucket in that state reads as gone. The API also limits how many
+purged, and the plan's bucket slot is freed. A bucket in that state reads as gone, but **its name stays taken** until it
+is purged (`409 name_taken` for a new bucket of that name; the panel can restore a soft-deleted bucket). The API also limits how many
 buckets, live and soft-deleted, an organization holds in all (`422 bucket_retention_limit_reached`), so creating and
 destroying buckets in a loop eventually has to wait for purges. The ceilings are applied by the object store after the
 API accepts them. Import by id: `tofu import virtscale_s3_bucket.logs <id>`.
