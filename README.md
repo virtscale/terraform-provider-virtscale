@@ -335,7 +335,8 @@ such as a missing network binding) can stay `pending` for good: apply then ends 
 pending`, and a later apply or the destroy sets the rules again, because the API only refuses a new change while an
 operation really runs. Destroying the resource asks for the empty rule set (the rules this API lets you set; the
 platform's own base rules are not part of the set) at once, asks again while another change is still being applied
-(`409 operation_in_flight`, up to 10 minutes), and then waits until the empty set is applied. An instance that is gone
+(`409 operation_in_flight`), and then waits until the empty set is applied; asking and waiting share one budget of 10
+minutes. An instance that is gone
 has no rules to clear. An instance the platform does not let you change rules for (a region policy) is refused with
 `409 vm_action_not_allowed`.
 
@@ -565,8 +566,9 @@ updated each time), fails unless the log shows `--- PASS` for every test, and co
 nothing behind. Each test has 30 minutes (`-timeout 30m`) and the job 90 (the sum of the ceilings is larger, but a run
 that needs more than 90 minutes in all is stuck). A job that is killed can leave `tf-live-*` objects behind: the next run
 then refuses to start and says how many of which kind; delete them (instances and VPCs first, then projects, then SSH
-keys; buckets are only soft-deleted) before running again. The lists are read as one page (50 to 100 objects), which is
-plenty for a test org that holds nothing else of that name. The part of the script that counts is tested in CI against a
+keys; buckets are only soft-deleted) before running again. The lists are read as one page (the API's default: 50 buckets
+or VPCs, 100 instances; SSH keys and projects are not paged), which is plenty for a test org that holds nothing else of
+that name. The part of the script that counts is tested in CI against a
 local API (`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of
 variables, so nothing a trigger sets (proxy, Go, curl, apt, `PATH`, ...) reaches it; it uses its own pinned and
 checksum-verified `tofu`, the public OpenBao CA in `ci/bao-ca.pem`, and runs without a cache. Only users with the

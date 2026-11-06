@@ -362,6 +362,7 @@ func (r *InstanceFirewallResource) Delete(ctx context.Context, req resource.Dele
 	id := state.InstanceID.ValueString()
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
+	var inFlight error // the last 409 operation_in_flight
 	for {
 		key, err := newIdempotencyKey() // a refused attempt changed nothing, so every attempt has a key of its own
 		if err != nil {
@@ -375,14 +376,16 @@ func (r *InstanceFirewallResource) Delete(ctx context.Context, req resource.Dele
 		if client.IsNotFound(err, client.ResourceVm) {
 			return
 		}
-		if !operationInFlight(err) {
+		if operationInFlight(err) {
+			inFlight = err
+		} else if inFlight == nil || waitCtx.Err() == nil {
 			resp.Diagnostics.AddError("Unable to Clear Firewall", apiErrorDetail(err))
 			return
-		}
+		} // else the deadline cut the request short after an earlier 409: that 409 is what is reported below
 		select {
 		case <-waitCtx.Done():
 			resp.Diagnostics.AddError("Unable to Clear Firewall",
-				"another change of the firewall was still being applied when the wait ended: "+apiErrorDetail(err))
+				"another change of the firewall was still being applied when the wait ended: "+apiErrorDetail(inFlight))
 			return
 		case <-time.After(pollInterval):
 		}

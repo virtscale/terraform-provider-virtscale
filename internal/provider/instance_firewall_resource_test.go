@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -8,6 +9,10 @@ import (
 	"testing"
 	"time"
 
+	frameworkresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
@@ -509,7 +514,7 @@ func TestAccInstanceFirewallResource_ARuleSetThatIsStillBeingAppliedIsNotDrift(t
 // more) ends the create at its deadline, and the destroy asks for the empty rule set at once instead of waiting for a
 // state that never leaves pending.
 func TestAccInstanceFirewallResource_AChangeStuckInPendingEndsAtTheDeadlineAndCanBeDestroyed(t *testing.T) {
-	shortTimeouts(t, time.Second, 5*time.Second)
+	shortTimeouts(t, 2*time.Second, 10*time.Second)
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	fake.StickFirewallPending(firstVm)
 	resource.Test(t, resource.TestCase{
@@ -534,9 +539,9 @@ func TestAccInstanceFirewallResource_AChangeStuckInPendingEndsAtTheDeadlineAndCa
 // A change that is still being applied when the destroy comes (the create's wait ran out) makes the clearing PUT a 409
 // operation_in_flight: the destroy asks again until the operation is through, then clears the rules.
 func TestAccInstanceFirewallResource_ADestroyWaitsOutAChangeThatIsStillBeingApplied(t *testing.T) {
-	shortTimeouts(t, 500*time.Millisecond, 20*time.Second)
+	shortTimeouts(t, time.Second, 30*time.Second)
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
-	fake.SlowFirewallApply(firstVm, 120) // more reads than the create's 500 ms of polling can make
+	fake.SlowFirewallApply(firstVm, 300) // far more reads than the create's second of polling (every 10 ms) can make
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
@@ -574,4 +579,106 @@ func TestAccInstanceFirewallResource_ADestroyThatEndsInErrorIsReported(t *testin
 			},
 		},
 	})
+}
+
+// A change that stays in flight past the destroy's deadline is an error that says so, and the clearing PUT is asked again
+// once per poll (not in a busy loop). Once the change is through, the destroy goes on.
+func TestAccInstanceFirewallResource_ADestroyGivesUpWhenAChangeStaysInFlight(t *testing.T) {
+	shortTimeouts(t, 5*time.Second, time.Second)
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var putsBefore int
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: firewallConfig(fake, ruleSSH)},
+			{ // someone else's change is put and stays in flight
+				PreConfig: func() {
+					fake.SlowFirewallApply(firstVm, 1_000_000)
+					status, _, body := fakeHTTP(t, fake, "test-api-key", http.MethodPut, firewallPath(firstVm),
+						`{"rules":[{"direction":"ingress","protocol":"icmp","remote_cidr":"0.0.0.0/0"}]}`)
+					if status != http.StatusAccepted {
+						t.Fatalf("out-of-band PUT: %d %s", status, body)
+					}
+					putsBefore = fake.CallCount("PUT compute/instances/{vm_id}/firewall")
+				},
+				Config:      testAccProviderBlock(fake) + testAccInstanceBlock("fw-vm"),
+				ExpectError: wrapSafeInOrder("Unable to Clear Firewall", "still being applied", "409 operation_in_flight"),
+			},
+			{ // it is through now: the destroy goes on
+				PreConfig: func() {
+					// one second of asking at the poll interval of 10 ms is about 100 requests; a busy loop makes thousands
+					if n := fake.CallCount("PUT compute/instances/{vm_id}/firewall") - putsBefore; n > 300 {
+						t.Errorf("the destroy sent %d PUTs in its second, want about 100 (one per poll)", n)
+					}
+					fake.FinishFirewallApply(firstVm)
+				},
+				Config: testAccProviderBlock(fake) + testAccInstanceBlock("fw-vm"),
+				Check: func(*terraform.State) error {
+					if rules := fake.FirewallRules(firstVm); len(rules) != 0 {
+						return fmt.Errorf("the API still holds %q", rules)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// The wait for the empty set to be applied ends at the destroy's deadline too: the clearing PUT is taken, but the state
+// never leaves pending (the worker gave up again). The next destroy goes through.
+func TestAccInstanceFirewallResource_ADestroyWhoseClearNeverAppliesEndsAtTheDeadline(t *testing.T) {
+	shortTimeouts(t, 5*time.Second, time.Second)
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: firewallConfig(fake, ruleSSH)},
+			{
+				PreConfig:   func() { fake.StickFirewallPending(firstVm) }, // the clearing PUT is the next one taken
+				Config:      testAccProviderBlock(fake) + testAccInstanceBlock("fw-vm"),
+				ExpectError: wrapSafeInOrder("Unable to Clear Firewall", "last seen: state pending"),
+			},
+			{ // the resource is still in state; this destroy is taken and applied
+				Config: testAccProviderBlock(fake) + testAccInstanceBlock("fw-vm"),
+				Check: func(*terraform.State) error {
+					if rules := fake.FirewallRules(firstVm); len(rules) != 0 {
+						return fmt.Errorf("the API still holds %q", rules)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// A 404 about the organization is not a 404 about the instance: Delete says so instead of calling the firewall gone. (The
+// refresh of a destroy would fail first in an acceptance test, so Delete is called on its own.)
+func TestInstanceFirewallResource_DeleteInTheWrongOrganizationIsAnError(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	c, err := liveClient(fake.URL(), "test-api-key", testOtherOrg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := &InstanceFirewallResource{}
+	r.client = c
+	var sch frameworkresource.SchemaResponse
+	r.Schema(ctx, frameworkresource.SchemaRequest{}, &sch)
+	state := tfsdk.State{Schema: sch.Schema, Raw: tftypes.NewValue(sch.Schema.Type().TerraformType(ctx), nil)}
+	if diags := state.Set(ctx, &instanceFirewallModel{
+		ID: types.StringValue(firstVm), InstanceID: types.StringValue(firstVm), State: types.StringValue("applied"), Rules: types.SetNull(firewallRuleType),
+	}); diags.HasError() {
+		t.Fatalf("building the state: %v", diags)
+	}
+	var resp frameworkresource.DeleteResponse
+	r.Delete(ctx, frameworkresource.DeleteRequest{State: state}, &resp)
+	if !resp.Diagnostics.HasError() {
+		t.Fatal("Delete treated the organization's 404 as an instance that is gone")
+	}
+	got := fmt.Sprint(resp.Diagnostics)
+	if !strings.Contains(got, "Unable to Clear Firewall") || !strings.Contains(got, "no organization matching") {
+		t.Errorf("diagnostics = %s, want the summary and the API's sentence", got)
+	}
 }
