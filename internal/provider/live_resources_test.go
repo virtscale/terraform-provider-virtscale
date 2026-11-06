@@ -476,6 +476,11 @@ func TestAccS3Resources_LiveProofAgainstTheFake(t *testing.T) {
 
 func TestLiveS3Resources_LifecycleProof(t *testing.T) {
 	endpoint, apiKey, org := liveSshKeyEnv(t)
+	// The bucket this creates is soft-deleted afterwards and, while the platform's purge worker is off, never purged: it keeps
+	// its name and one of the organization's retention rows for good. Staging has no object store behind the API either.
+	if os.Getenv("VIRTSCALE_LIVE_S3") != "1" {
+		t.Skip("the live S3 proof needs an object store behind the API and leaves a soft-deleted bucket that may never be purged: set VIRTSCALE_LIVE_S3=1 to run it")
+	}
 	c, err := liveClient(endpoint, apiKey, org)
 	if err != nil {
 		t.Fatalf("build the API client: %v", err)

@@ -21,9 +21,10 @@
 #   5. run the live tests one after another, each in its own `go test` process with the key in that process's
 #      environment and the Go module proxy switched off (SSH keys, the catalogue data sources, projects, VPCs, an
 #      instance with its firewall, S3): apply, an empty second plan, an update, import, destroy,
-#   6. withhold the test log if it contains the key, require `--- PASS` for every test (a failed test does not stop
-#      the others, so one run shows which families work), and count the tf-live-* objects the org holds before and
-#      after (the run must leave none behind).
+#   6. withhold a test's log if it contains the key (checked after every test; the artifact is updated every time),
+#      require `--- PASS` for every test (a failed test does not stop the others, so one run shows which families work),
+#      and count the tf-live-* objects the org holds before (the run refuses to start if there are any) and after (the
+#      run must leave none behind). The S3 test runs only with PROVIDER_STAGING_LIVE_S3=1.
 #
 # Not coverable here: the id_token is also in the environment of the runner's own shell, which any process of the
 # job can read. The role limits what it opens (this project, protected main, API pipelines, the staging document).
@@ -41,6 +42,7 @@ if [ "${1:-}" != "--clean-env" ]; then
     CI_COMMIT_REF_NAME="${CI_COMMIT_REF_NAME:-}" \
     CI_PIPELINE_SOURCE="${CI_PIPELINE_SOURCE:-}" \
     PROVIDER_STAGING_LIVE="${PROVIDER_STAGING_LIVE:-}" \
+    PROVIDER_STAGING_LIVE_S3="${PROVIDER_STAGING_LIVE_S3:-}" \
     /bin/sh "$0" --clean-env
 fi
 
@@ -56,7 +58,17 @@ BAO_ROLE="provider-staging-live"
 KEYS_PATH="kv/data/platform/s3-staging/test-keys"
 ENDPOINT="http://s3-staging-customer-api.s3-staging.svc.cluster.local"
 # The live tests, in the order they run. An instance is the heaviest and the staging host is small: it runs last, alone.
-TESTS="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof TestLiveS3Resources_LifecycleProof TestLiveInstanceFirewallResource_LifecycleProof"
+# The S3 test needs an object store behind the API, which staging has not, and every bucket it creates is soft-deleted and,
+# while the platform's purge worker is off, never purged (it keeps its name and a retention row for good): it runs only when
+# the pipeline is started with PROVIDER_STAGING_LIVE_S3=1.
+TESTS_FIRST="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof"
+TESTS_LAST="TestLiveInstanceFirewallResource_LifecycleProof"
+TESTS="$TESTS_FIRST $TESTS_LAST"
+live_s3=""
+if [ "${PROVIDER_STAGING_LIVE_S3:-}" = 1 ]; then
+  TESTS="$TESTS_FIRST TestLiveS3Resources_LifecycleProof $TESTS_LAST"
+  live_s3=1
+fi
 # OpenTofu release archive, pinned: the version and the SHA-256 of tofu_<version>_linux_amd64.zip from the release's
 # own tofu_<version>_SHA256SUMS.
 TOFU_VERSION_PINNED=1.12.5
@@ -150,8 +162,9 @@ esac
 
 # GET path (below the API root) into a file; the key goes to curl on stdin. Prints the HTTP status only.
 api_get() {
-  printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
-    curl_safe -sS --max-time 60 -K - -o "$2" -w '%{http_code}' "$ENDPOINT$1" || echo 000
+  code=$(printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
+    curl_safe -sS --max-time 60 -K - -o "$2" -w '%{http_code}' "$ENDPOINT$1") || code=000
+  printf '%s' "$code"
 }
 
 # How many objects named tf-live-* a list holds (a count, never names or keys). 503 means the feature is switched off, so
@@ -164,8 +177,9 @@ count_named() { # count_named PATH
   rm -f "$work/list.json"
 }
 
-# One line with what the org holds now: SSH keys, projects, instances and buckets that are named tf-live-* and not
-# deleted, VPCs of every project named tf-live-*, and access keys that are not revoked (all of the org's).
+# One line with what the org holds now: SSH keys, projects, instances and buckets that are named tf-live-* (a soft-deleted
+# bucket is history and not counted) and VPCs of every project named tf-live-*. Access keys have no name, so they are not
+# counted here; the live S3 test checks its own key is revoked.
 leftovers() {
   ssh=$(count_named "/v1/orgs/$org/compute/ssh-keys")
   projects=$(count_named "/v1/orgs/$org/projects")
@@ -174,25 +188,25 @@ leftovers() {
   if [ "$c" = 200 ]; then
     buckets=$(jq -r '[.items[]? | select((.name | startswith("tf-live-")) and (.state | IN("deleting_soft", "purging", "purged", "deleted") | not))] | length' "$work/list.json")
   elif [ "$c" = 503 ]; then buckets=0; else fail "listing the buckets answered HTTP $c"; fi
-  c=$(api_get "/v1/orgs/$org/s3/access-keys" "$work/list.json")
-  if [ "$c" = 200 ]; then
-    keys=$(jq -r '[.items[]? | select(.state != "revoked")] | length' "$work/list.json")
-  elif [ "$c" = 503 ]; then keys=0; else fail "listing the access keys answered HTTP $c"; fi
-  c=$(api_get "/v1/orgs/$org/projects" "$work/projects.json")
-  [ "$c" = 200 ] || fail "listing the projects answered HTTP $c"
   vpcs=0
-  for project in $(jq -r '.items[]?.id' "$work/projects.json"); do
-    c=$(api_get "/v1/projects/$project/vpcs" "$work/list.json")
-    if [ "$c" = 200 ]; then
-      n=$(jq -r '[.items[]? | select(.name | startswith("tf-live-"))] | length' "$work/list.json")
-      vpcs=$((vpcs + n))
-    elif [ "$c" != 503 ]; then fail "listing the VPCs of a project answered HTTP $c"; fi
-  done
+  c=$(api_get "/v1/orgs/$org/projects" "$work/projects.json")
+  if [ "$c" = 200 ]; then
+    for project in $(jq -r '.items[]?.id' "$work/projects.json"); do
+      c=$(api_get "/v1/projects/$project/vpcs" "$work/list.json")
+      if [ "$c" = 200 ]; then
+        n=$(jq -r '[.items[]? | select(.name | startswith("tf-live-"))] | length' "$work/list.json")
+        vpcs=$((vpcs + n))
+      elif [ "$c" != 503 ]; then fail "listing the VPCs of a project answered HTTP $c"; fi
+    done
+  elif [ "$c" != 503 ]; then fail "listing the projects answered HTTP $c"; fi
   rm -f "$work/list.json" "$work/projects.json"
-  echo "ssh_keys=$ssh projects=$projects instances=$instances buckets=$buckets vpcs=$vpcs access_keys=$keys"
+  echo "ssh_keys=$ssh projects=$projects instances=$instances buckets=$buckets vpcs=$vpcs"
 }
 before=$(leftovers)
 echo "the staging org before the run: $before"
+# A leak of an earlier run must not become this run's baseline: the host is small and a forgotten server costs the next run.
+[ "$before" = "ssh_keys=0 projects=0 instances=0 buckets=0 vpcs=0" ] ||
+  fail "the staging org already holds tf-live-* objects from an earlier run: remove them first (before: $before)"
 
 # 5. The tests, one `go test` process each. A prefix assignment gives the key to this one command and its children only,
 # and GOPROXY=off keeps the Go toolchain off the network while the key is in the environment (the modules were fetched
@@ -207,12 +221,22 @@ for name in $TESTS; do
     TF_ACC_PROVIDER_NAMESPACE=virtscale \
     TF_ACC_PROVIDER_HOST=registry.terraform.io \
     VIRTSCALE_LIVE=1 \
+    VIRTSCALE_LIVE_S3="$live_s3" \
     VIRTSCALE_ENDPOINT="$ENDPOINT" \
     VIRTSCALE_ORGANIZATION="$org" \
     VIRTSCALE_API_KEY="$api_key" \
     GOPROXY=off \
-    go test ./internal/provider -run "^${name}\$" -count=1 -v -timeout 25m >"$work/test.log" 2>&1 || trc=$?
+    go test ./internal/provider -run "^${name}\$" -count=1 -v -timeout 30m >"$work/test.log" 2>&1 || trc=$?
+  # 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
+  # it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
+  # It is done after every test, and the artifact is updated every time, so that a job that is killed by its timeout
+  # still leaves the log of the tests that ran.
+  if printf '%s' "$api_key" | grep -qF -f - "$work/test.log"; then
+    fail "the API key appears in the output of $name: the log is withheld"
+  fi
+  cat "$work/test.log"
   cat "$work/test.log" >>"$work/go-test.log"
+  cp "$work/go-test.log" provider-staging-live.log
   if [ "$trc" -eq 0 ] && grep -q -- "--- PASS: ${name}" "$work/test.log" && ! grep -q -- "--- SKIP: ${name}" "$work/test.log"; then
     results="$results $name=PASS"
   else
@@ -220,14 +244,6 @@ for name in $TESTS; do
     rc=1
   fi
 done
-
-# 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
-# it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
-if printf '%s' "$api_key" | grep -qF -f - "$work/go-test.log"; then
-  fail "the API key appears in the test output: the log is withheld"
-fi
-cat "$work/go-test.log"
-cp "$work/go-test.log" provider-staging-live.log
 
 after=$(leftovers)
 echo "the staging org after the run: $after"

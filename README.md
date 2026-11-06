@@ -484,7 +484,7 @@ them. One test per family:
 | `TestLiveCatalogueProof` | `virtscale_caller` (its organization is the configured one), `virtscale_regions` (lists the live region), `virtscale_instance_types`, `virtscale_plans`, `virtscale_project` |
 | `TestLiveProjectResource_LifecycleProof` | `virtscale_project`: create, an empty second plan, description and labels in place, import |
 | `TestLiveVpcResource_LifecycleProof` | `virtscale_vpc` in the default project: waits for `active`, empty second plan, import as `<project>/<vpc>`, destroy waits until it is gone |
-| `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes) |
+| `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
 | `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
 
 Each has a twin against the fake (`...LiveProofAgainstTheFake`) that proves the test code in CI. A test is skipped
@@ -493,8 +493,10 @@ set. It creates only objects named `tf-live-<random>` and deletes them again. Th
 (projects), `network:write` and `compute:write` (VPCs, instances, firewalls) and `storage:write` or `write` (S3). The
 place defaults to staging's (`VIRTSCALE_LIVE_REGION=stg`, `VIRTSCALE_LIVE_STORAGE_POOL=stg-local`,
 `VIRTSCALE_LIVE_NETWORK_PROFILE=stg-tenant`; set them to run elsewhere). The staging API is cluster-internal, so run
-it from somewhere that reaches the endpoint. Staging has room for one small server at a time, and a soft-deleted bucket
-keeps one of the organization's bucket slots for 7 days, so do not loop the S3 test.
+it from somewhere that reaches the endpoint. Staging has room for one small server at a time. A soft-deleted bucket is
+not purged while the platform's purge worker is off: it keeps its name and one of the organization's retention rows
+(twice its bucket limit in all), so do not loop the S3 test. Allow a long run: the waits for a server and a firewall are
+minutes (`-timeout 60m` below).
 
 ```bash
 TF_ACC=1 \
@@ -502,7 +504,7 @@ TF_ACC_TERRAFORM_PATH=$(command -v tofu) \
 TF_ACC_PROVIDER_NAMESPACE=virtscale \
 TF_ACC_PROVIDER_HOST=registry.terraform.io \
 VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDPOINT=... \
-go test ./internal/provider -run TestLive -count=1 -v
+go test ./internal/provider -run TestLive -count=1 -v -timeout 60m
 ```
 
 A run counts only when `-v` shows `--- PASS` for the test (a skip prints `ok` too). The tests refuse the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fails at once, instead of skipping,
@@ -511,12 +513,14 @@ when a live run is requested and `tofu` cannot be found.
 In CI the job `provider-staging-live` does this for you, without anyone holding the key. It exists only in a pipeline
 started through the GitLab API on `main` with the variable `PROVIDER_STAGING_LIVE=1`; a push, a merge request or a web
 click never runs it. The job logs in to OpenBao with the JWT role `provider-staging-live` (this project, protected
-`main`, API pipelines), reads the staging test org's key, runs the tests above one after another (a failed one does
-not stop the next, so a run shows which families work) against
-`http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the token. It fails unless the log shows
-`--- PASS` for every test, withholds the log if it contains the key, and counts what the org holds before and after
-(`tf-live-*` SSH keys, projects, instances, buckets that are not soft-deleted and VPCs, and access keys that are not
-revoked): the run must leave nothing behind. The script re-executes itself under `env -i` with a short allowlist of
+`main`, API pipelines), reads the staging test org's key, and runs the tests above one after another (a failed one does
+not stop the next, so a run shows which families work; the S3 one only when the pipeline is started with
+`PROVIDER_STAGING_LIVE_S3=1`) against `http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the
+token. It refuses to start if the org already holds `tf-live-*` objects (SSH keys, projects, instances, buckets that are
+not soft-deleted, VPCs), withholds a test's log if it contains the key (checked after every test, with the artifact
+updated each time), fails unless the log shows `--- PASS` for every test, and counts again afterwards: the run must leave
+nothing behind. The part of the script that counts is tested in CI against a local API
+(`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of
 variables, so nothing a trigger sets (proxy, Go, curl, apt, `PATH`, ...) reaches it; it uses its own pinned and
 checksum-verified `tofu`, the public OpenBao CA in `ci/bao-ca.pem`, and runs without a cache. Only users with the
 Maintainer role can start a pipeline with variables in this project.
