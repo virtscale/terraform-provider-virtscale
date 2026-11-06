@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -250,20 +251,192 @@ func TestAccInstanceFirewallResource_WrongOrganizationKeepsTheResourceInState(t 
 	})
 }
 
-// An API whose state change reaches the row a moment after the PUT answers shows the old set as applied first: the
-// resource keeps reading until the set it sent is the set confirmed, and does not take the old one for the answer.
-func TestAccInstanceFirewallResource_WaitsForTheSetItSentNotJustForApplied(t *testing.T) {
+func firewallPath(id string) string { return vmsPath(testOrgID) + "/" + id + "/firewall" }
+
+// Rules added or removed outside Terraform show up as a difference, and the next apply puts the configured set back.
+func TestAccInstanceFirewallResource_DriftIsDetectedAndRepaired(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
-	fake.SetFirewallLag(firstVm, 4)
+	config := firewallConfig(fake, ruleSSH+ruleHTTPS)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: config},
+			{ // someone sets another rule set in the panel
+				PreConfig: func() {
+					status, _, body := fakeHTTP(t, fake, "test-api-key", http.MethodPut, firewallPath(firstVm),
+						`{"rules":[{"direction":"ingress","protocol":"icmp","remote_cidr":"0.0.0.0/0"}]}`)
+					if status != http.StatusAccepted {
+						t.Fatalf("out-of-band PUT: %d %s", status, body)
+					}
+				},
+				Config:             config,
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: config,
+				Check: func(*terraform.State) error {
+					if got := len(fake.FirewallRules(firstVm)); got != 2 {
+						return fmt.Errorf("the API holds %d rules after the repair, want 2", got)
+					}
+					return nil
+				},
+			},
+		},
+	})
+}
+
+// When the API fails to apply a change, the rules it holds are not in force: the next plan differs from the
+// configuration, and the next apply sets them again.
+func TestAccInstanceFirewallResource_AFailedUpdateShowsInTheNextPlan(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: firewallConfig(fake, ruleSSH)},
+			{
+				PreConfig:   func() { fake.FailFirewallApply(firstVm) },
+				Config:      firewallConfig(fake, ruleSSH+rulePing),
+				ExpectError: wrapSafeInOrder("Firewall Failed to Apply", "the rules could not be applied to the network"),
+			},
+			{Config: firewallConfig(fake, ruleSSH+rulePing), PlanOnly: true, ExpectNonEmptyPlan: true},
+			{
+				Config: firewallConfig(fake, ruleSSH+rulePing),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "state", "applied"),
+					resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "rule.#", "2"),
+				),
+			},
+		},
+	})
+}
+
+func TestAccInstanceFirewallResource_MoreRulesThanTheAPITakesAreRefusedAtPlanTime(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	var rules strings.Builder
+	for port := 1000; port < 1051; port++ { // 51 rules
+		fmt.Fprintf(&rules, "  rule {\n    direction   = \"ingress\"\n    protocol    = \"tcp\"\n    port_min    = %d\n    port_max    = %d\n    remote_cidr = \"10.0.0.0/8\"\n  }\n", port, port)
+	}
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 		Steps: []resource.TestStep{{
-			Config: firewallConfig(fake, ruleSSH+rulePing),
-			Check: resource.ComposeAggregateTestCheckFunc(
-				resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "state", "applied"),
-				resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "rule.#", "2"),
-			),
+			Config:      firewallConfig(fake, rules.String()),
+			PlanOnly:    true,
+			ExpectError: wrapSafeInOrder("Too many firewall rules", "at most 50"),
 		}},
+	})
+	if n := fake.FirewallPuts(); n != 0 {
+		t.Errorf("%d PUTs reached the API; the refusal is plan-time", n)
+	}
+}
+
+// The description of a rule is 1 to 80 characters (COMPUTE_FIREWALL_DESCRIPTION_MAX_LENGTH); 80 is accepted, 81 is refused
+// before anything is sent.
+func TestAccInstanceFirewallResource_ADescriptionOfEightyCharactersIsTheLimit(t *testing.T) {
+	rule := func(description string) string {
+		return fmt.Sprintf("  rule {\n    direction   = \"ingress\"\n    protocol    = \"icmp\"\n    remote_cidr = \"0.0.0.0/0\"\n    description = %q\n  }\n", description)
+	}
+	t.Run("80", func(t *testing.T) {
+		fake := newFakeAPI(t, "test-api-key", testOrgID)
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+			Steps:                    []resource.TestStep{{Config: firewallConfig(fake, rule(strings.Repeat("d", 80)))}},
+		})
+	})
+	t.Run("81", func(t *testing.T) {
+		fake := newFakeAPI(t, "test-api-key", testOrgID)
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+			Steps: []resource.TestStep{{
+				Config: firewallConfig(fake, rule(strings.Repeat("d", 81))), PlanOnly: true,
+				ExpectError: wrapSafe("description must be at most 80 characters"),
+			}},
+		})
+		if n := fake.FirewallPuts(); n != 0 {
+			t.Errorf("%d PUTs reached the API; the refusal is plan-time", n)
+		}
+	})
+	t.Run("empty", func(t *testing.T) {
+		fake := newFakeAPI(t, "test-api-key", testOrgID)
+		resource.Test(t, resource.TestCase{
+			PreCheck:                 func() { testAccPreCheck(t) },
+			ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+			Steps: []resource.TestStep{{
+				Config: firewallConfig(fake, rule("")), PlanOnly: true,
+				ExpectError: wrapSafe("description must be at most 80 characters (and not empty when given)"),
+			}},
+		})
+	})
+}
+
+// A value that is not known at plan time (an id of a resource still to be made) cannot be judged yet; it is judged when
+// it is known, and the rule is applied.
+func TestAccInstanceFirewallResource_AValueThatIsKnownOnlyAfterApplyIsJudgedLater(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	rule := "  rule {\n    direction   = \"ingress\"\n    protocol    = \"icmp\"\n    remote_cidr = \"0.0.0.0/0\"\n    description = \"vm ${virtscale_instance.test.id}\"\n  }\n"
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config: firewallConfig(fake, rule),
+			Check: resource.TestMatchTypeSetElemNestedAttrs("virtscale_instance_firewall.test", "rule.*",
+				map[string]*regexp.Regexp{"description": regexp.MustCompile(`^vm [0-9a-f-]{36}$`)}),
+		}},
+	})
+}
+
+// The PUT is accepted, so the rules are in place whatever happens to the wait: the state keeps the resource, and the
+// destroy that follows clears them with a key of its own.
+func TestAccInstanceFirewallResource_AFailedWaitKeepsTheResourceInStateAndEveryWriteCarriesAKey(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.FailNext(1, matchRoute(http.MethodGet, "/firewall"), func(rc *reqCtx) {
+		rc.problem(http.StatusForbidden, "permission_denied", "Forbidden", "this credential does not carry the 'network.read' permission")
+	})
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy: func(*terraform.State) error {
+			if n := fake.FirewallPuts(); n != 2 { // the set, and the clear on destroy
+				return fmt.Errorf("%d PUTs reached the API, want 2: the failed create must be cleared on destroy", n)
+			}
+			if n := len(fake.ProjectIdempotencyKeys()); n != 2 {
+				return fmt.Errorf("the PUTs sent %d Idempotency-Keys, want 2", n)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{{
+			Config:      firewallConfig(fake, ruleSSH),
+			ExpectError: wrapSafeInOrder("Unable to Wait for the Firewall to Be Applied", "403 permission_denied"),
+		}},
+	})
+}
+
+// instance_id names the instance whose rules these are: another instance is another resource.
+func TestAccInstanceFirewallResource_AnotherInstanceReplacesTheResource(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	config := func(target string) string {
+		instance := func(label string) string {
+			return strings.Replace(strings.Replace(testAccInstanceBlock("fw-"+label), `"virtscale_instance" "test"`, `"virtscale_instance" "`+label+`"`, 1), `"fw-`+label+`"`, `"fw-`+label+`"`, 1)
+		}
+		return testAccProviderBlock(fake) + instance("a") + instance("b") +
+			fmt.Sprintf("\nresource \"virtscale_instance_firewall\" \"test\" {\n  instance_id = virtscale_instance.%s.id\n%s}\n", target, ruleSSH)
+	}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{
+			{Config: config("a")},
+			{
+				Config: config("b"),
+				ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+					plancheck.ExpectResourceAction("virtscale_instance_firewall.test", plancheck.ResourceActionDestroyBeforeCreate),
+				}},
+			},
+		},
 	})
 }
