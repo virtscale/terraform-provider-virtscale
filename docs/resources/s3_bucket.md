@@ -31,7 +31,7 @@ resource "virtscale_s3_bucket" "logs" {
 - `force_destroy` (Boolean) Acknowledge, when the bucket is destroyed, that it may still hold objects (the API refuses a non-empty bucket with 409 bucket_not_empty otherwise). The provider's own: not stored by the API, so import leaves it false.
 - `max_objects` (Number) The most objects this bucket may hold. Leave it out for no per-bucket cap. Changes in place.
 - `max_size_bytes` (Number) The most bytes this bucket may hold, inside the organization's ceiling. Leave it out for no per-bucket cap (the organization's ceiling still applies). Changes in place.
-- `versioning` (Boolean) Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it replaces the bucket. **Forces replacement.**
+- `versioning` (Boolean) Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken for the retention window.
 
 ### Read-Only
 
