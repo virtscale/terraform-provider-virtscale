@@ -45,6 +45,7 @@ type fakeFirewall struct {
 	err              *string
 	stepsLeft        int
 	fail             bool
+	lag              int // reads after a PUT that still show the old set as applied, before the state flips to pending
 }
 
 type firewallState struct {
@@ -64,6 +65,14 @@ func (f *fakeAPI) fw(id string) *fakeFirewall {
 		f.fws.byVm[id] = fw
 	}
 	return fw
+}
+
+// SetFirewallLag makes the next PUT of the instance show the old rule set as applied for n reads before the state flips
+// to pending: an API whose state change is asynchronous. A client that stops at the first applied reads the old rules.
+func (f *fakeAPI) SetFirewallLag(vmID string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fw(vmID).lag = n
 }
 
 // FailFirewallApply makes the next firewall.apply of the instance end in state error.
@@ -102,6 +111,10 @@ func (f *fakeAPI) advanceFirewall(fw *fakeFirewall) {
 	if fw.state != "pending" {
 		return
 	}
+	if fw.lag > 0 {
+		fw.lag--
+		return
+	}
 	if fw.stepsLeft--; fw.stepsLeft > 0 {
 		return
 	}
@@ -127,7 +140,11 @@ func (f *fakeAPI) getFirewall(rc *reqCtx, id string) {
 	if rules == nil {
 		rules = []wireFirewallRuleOut{}
 	}
-	rc.json(http.StatusOK, wireFirewallOut{VmID: id, State: fw.state, Error: fw.err, Rules: rules})
+	state := fw.state
+	if state == "pending" && fw.lag > 0 {
+		state = "applied" // the change has not shown yet
+	}
+	rc.json(http.StatusOK, wireFirewallOut{VmID: id, State: state, Error: fw.err, Rules: rules})
 }
 
 // putFirewall replaces the rule set: the whole body is validated first and every rule that fails is named
