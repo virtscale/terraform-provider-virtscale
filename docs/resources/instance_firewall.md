@@ -70,7 +70,7 @@ variable "instance_id" {
 
 #### Optional
 
-- `description` (String) Free text, 1 to 255 characters; leave it out for none.
+- `description` (String) Free text, 1 to 80 characters; leave it out for none.
 - `port_max` (Number) The last port, 1 to 65535, not below port_min. Required for tcp and udp, not allowed for icmp and any.
 - `port_min` (Number) The first port, 1 to 65535. Required for tcp and udp, not allowed for icmp and any.
 
