@@ -12,7 +12,6 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
@@ -25,6 +24,7 @@ var (
 	_ resource.Resource                = &S3BucketResource{}
 	_ resource.ResourceWithConfigure   = &S3BucketResource{}
 	_ resource.ResourceWithImportState = &S3BucketResource{}
+	_ resource.ResourceWithModifyPlan  = &S3BucketResource{}
 )
 
 var errBucketBuildFailed = errors.New("bucket entered a failed state")
@@ -129,8 +129,8 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			},
 			"versioning": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				Description:   "Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it replaces the bucket.",
-				PlanModifiers: []planmodifier.Bool{boolplanmodifier.RequiresReplace()},
+				Description: "Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it is " +
+					"refused at plan time, because replacing the bucket would soft-delete it and its name stays taken for the retention window.",
 			},
 			"force_destroy": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
@@ -205,6 +205,24 @@ func quotaChange(haveSize, haveObjects, wantSize, wantObjects types.Int64) (clie
 		}
 	}
 	return change, change.SizeSet || change.ObjectsSet
+}
+
+// ModifyPlan refuses a change of versioning: the API cannot change it, and the replacement a plan would otherwise make
+// soft-deletes the bucket (cutting access to it) while its name stays taken for the retention window, so the new bucket
+// could not be created under the same name.
+func (r *S3BucketResource) ModifyPlan(ctx context.Context, req resource.ModifyPlanRequest, resp *resource.ModifyPlanResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	var plan, state s3BucketModel
+	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
+	if resp.Diagnostics.HasError() || plan.Versioning.IsUnknown() || plan.Versioning.Equal(state.Versioning) {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(path.Root("versioning"), "Versioning cannot be changed",
+		"versioning is fixed when a bucket is created. Replacing the bucket would soft-delete it, and its name stays taken until it is "+
+			"purged, so a bucket of the same name could not be created. Create a bucket under another name (and move the objects) instead.")
 }
 
 // Create asks for the bucket with a fresh Idempotency-Key, keeps what it knows in the state at once so that a failed

@@ -203,12 +203,14 @@ func (f *fakeAPI) createBucket(rc *reqCtx) {
 	}
 	live := 0
 	for _, x := range s.buckets {
-		if x.State != "deleting_soft" && x.State != "deleted" {
+		// uq_buckets_org_id_name_live: only a purged or deleted bucket gives its name up; a soft-deleted one keeps it
+		// for the retention window. A soft-deleted bucket no longer holds one of the organization's slots.
+		if x.State != "purged" && x.State != "deleted" && x.Name == name {
+			rc.conflict("name_taken", fmt.Sprintf("a bucket named '%s' already exists in this organization", name))
+			return
+		}
+		if x.State != "deleting_soft" && x.State != "purging" && x.State != "purged" && x.State != "deleted" {
 			live++
-			if x.Name == name {
-				rc.conflict("name_taken", fmt.Sprintf("a bucket named '%s' already exists in this organization", name))
-				return
-			}
 		}
 	}
 	if live >= limit {
