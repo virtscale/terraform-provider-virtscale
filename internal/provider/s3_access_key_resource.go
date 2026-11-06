@@ -207,9 +207,14 @@ func (r *S3AccessKeyResource) Delete(ctx context.Context, req resource.DeleteReq
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
-	if _, err := r.client.WaitAccessKey(waitCtx, id, pollInterval, func(k *client.AccessKey) (bool, error) {
+	if final, err := r.client.WaitAccessKey(waitCtx, id, pollInterval, func(k *client.AccessKey) (bool, error) {
+		if k != nil && k.State == "degraded" {
+			return true, errAccessKeyFailed
+		}
 		return k == nil || k.State == "revoked", nil
-	}); err != nil {
+	}); errors.Is(err, errAccessKeyFailed) && final != nil {
+		resp.Diagnostics.AddError("Access Key Not Revoked", "revoking the access key failed: it ended in state degraded, so it may still work. Revoke it again in the panel or with the API")
+	} else if err != nil {
 		resp.Diagnostics.AddError("Unable to Wait for the Access Key to Be Revoked", err.Error())
 	}
 }
