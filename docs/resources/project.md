@@ -26,12 +26,12 @@ resource "virtscale_project" "web" {
 
 ### Required
 
-- `name` (String) 1 to 63 lower-case letters, digits or hyphens, not starting or ending with a hyphen. Unique among the organization's projects. Changing it renames the project in place.
+- `name` (String) 1 to 63 lower-case letters, digits or hyphens, not starting or ending with a hyphen. Unique among the organization's projects. Changing it renames the project in place. Validation: use 1 to 63 lower-case letters, digits or hyphens, not starting or ending with a hyphen.
 
 ### Optional
 
-- `description` (String) Free text, at most 255 characters. Empty by default.
-- `labels` (Map of String) Free key-value labels, at most 64. Setting them replaces the whole set.
+- `description` (String) Free text, at most 255 characters. Empty by default. Validation: at most 255 characters.
+- `labels` (Map of String) Free key-value labels, at most 64. Setting them replaces the whole set. Validation: at most 64 labels; keys of 1 to 63 characters from letters, digits and _ . : / - starting with a letter or digit; values of at most 255 characters.
 
 ### Read-Only
 

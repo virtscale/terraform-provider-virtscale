@@ -13,6 +13,8 @@ import (
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 
 	vsprovider "gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/provider"
 )
@@ -94,9 +96,10 @@ func TestEveryResourceAndDataSourceHasAnExample(t *testing.T) {
 	}
 }
 
-// The examples hold no literal credential: variables, the environment, or a sensitive variable.
+// The examples hold no literal credential: variables, the environment, or a sensitive variable. A quoted value for an
+// attribute that is called api_key, secret, secret_access_key, token or password is one, whatever it looks like.
 func TestExamplesHoldNoSecrets(t *testing.T) {
-	secret := regexp.MustCompile(`vsk_|PRIVATE KEY|api_key\s*=\s*"|secret_access_key\s*=\s*"|password\s*=\s*"`)
+	secret := regexp.MustCompile(`vsk_|PRIVATE KEY|\b(api_key|secret_access_key|secret|token|password)\s*=\s*"[^"$]`)
 	_ = filepath.WalkDir(filepath.Join(repoRoot, "examples"), func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
@@ -116,6 +119,9 @@ func openTofu(t *testing.T) string {
 	}
 	p, err := exec.LookPath("tofu")
 	if err != nil {
+		if os.Getenv("CI") != "" { // the CI image has tofu: a missing one must not turn the validation off unseen
+			t.Fatal("tofu is not on PATH in CI; the examples would go unvalidated")
+		}
 		t.Skip("tofu is not on PATH; the examples are validated in CI")
 	}
 	return p
@@ -192,8 +198,9 @@ func TestExamplesValidate(t *testing.T) {
 		}
 		return nil
 	})
-	if len(groups) < 15 {
-		t.Fatalf("found %d example directories, want one per resource and data source and more", len(groups))
+	resources, dataSources := typeNames(t)
+	if want := len(resources) + len(dataSources) + 2; len(groups) != want { // + the provider block and the complete example
+		t.Fatalf("found %d example directories, want %d: one per resource and data source, the provider and complete", len(groups), want)
 	}
 	preamble := "terraform {\n  required_providers {\n    virtscale = {\n      source = \"virtscale/virtscale\"\n    }\n  }\n}\n"
 	prepare := func(files []string, name string) string {
@@ -246,12 +253,123 @@ func TestTheGuideListsTheSensitiveAttributesOfTheSchemas(t *testing.T) {
 		t.Fatal(err)
 	}
 	guide := pages["docs/guides/state-secrets-and-import.md"]
-	for _, want := range []string{"virtscale_s3_access_key.secret_access_key", "provider.api_key", "encrypted backend"} {
+	// the generated list, one bullet each (the prose names the secret too, so a bullet is what proves the schema says so)
+	for _, want := range []string{"\n- `virtscale_s3_access_key.secret_access_key`\n", "\n- `provider.api_key`\n"} {
+		if !strings.Contains(guide, want) {
+			t.Errorf("the list of sensitive attributes does not hold %q", strings.TrimSpace(want))
+		}
+	}
+	for _, want := range []string{"encrypted backend", "tofu plan -out", "tofu show -json", "no `user_data` attribute"} {
 		if !strings.Contains(guide, want) {
 			t.Errorf("the guide does not mention %q", want)
 		}
 	}
 	if strings.Contains(guide, "virtscale_ssh_key.public_key") {
 		t.Error("the guide lists a public key as sensitive")
+	}
+	if strings.Contains(guide, "`id>`") {
+		t.Error("an import id of the guide was cut at its first space")
+	}
+}
+
+// The markers of a page line (forces replacement, sensitive) and the rules the validators state are in the page.
+func TestALineSaysWhatTheSchemaSays(t *testing.T) {
+	got := line(field{name: "x", typ: "String", desc: "An x.", replaces: true, secret: true, validation: []string{"a rule", "another rule"}})
+	for _, want := range []string{"`x` (String) An x.", "**Forces replacement.**", "**Sensitive.**", "Validation: a rule; another rule."} {
+		if !strings.Contains(got, want) {
+			t.Errorf("line = %q, want it to contain %q", got, want)
+		}
+	}
+	if plain := line(field{name: "y", typ: "Number", desc: "A y."}); strings.Contains(plain, "Forces") || strings.Contains(plain, "Sensitive") || strings.Contains(plain, "Validation") {
+		t.Errorf("a plain attribute carries a marker: %q", plain)
+	}
+}
+
+func TestThePagesStateWhatTheValidatorsEnforce(t *testing.T) {
+	pages, err := Generate(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page, wants := range map[string][]string{
+		"docs/resources/s3_bucket.md":     {"no consecutive hyphens", "at least 1", "**Forces replacement.**"},
+		"docs/resources/project.md":       {"at most 64 labels"},
+		"docs/resources/s3_access_key.md": {"**Sensitive.**"},
+		"docs/resources/vpc.md":           {"a prefix length from 20 to 24"},
+		"docs/resources/instance.md":      {"Validation:"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(pages[page], want) {
+				t.Errorf("%s does not say %q", page, want)
+			}
+		}
+	}
+}
+
+// The index lists every resource and data source page with a link that points at it.
+func TestTheIndexLinksEveryPage(t *testing.T) {
+	pages, err := Generate(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := pages["docs/index.md"]
+	resources, dataSources := typeNames(t)
+	for _, r := range resources {
+		link := "(resources/" + strings.TrimPrefix(r, "virtscale_") + ".md)"
+		if !strings.Contains(index, "[`"+r+"`]"+link) {
+			t.Errorf("the index does not link %s as %s", r, link)
+		}
+		if _, ok := pages["docs/"+strings.Trim(link, "()")]; !ok {
+			t.Errorf("the index links %s, which is not a page", link)
+		}
+	}
+	for _, d := range dataSources {
+		link := "(data-sources/" + strings.TrimPrefix(d, "virtscale_") + ".md)"
+		if !strings.Contains(index, "[`"+d+"`]"+link) {
+			t.Errorf("the index does not link %s as %s", d, link)
+		}
+		if _, ok := pages["docs/"+strings.Trim(link, "()")]; !ok {
+			t.Errorf("the index links %s, which is not a page", link)
+		}
+	}
+}
+
+// The id an import.sh shows is the shape the resource's ImportState takes: a bare id is refused by exactly the resources
+// whose example shows an id of two parts, and those take "a/b".
+func TestTheImportIDsOfTheExamplesAreWhatImportStateTakes(t *testing.T) {
+	ctx := context.Background()
+	p := vsprovider.New("dev")()
+	n := 0
+	for _, newResource := range p.Resources(ctx) {
+		r := newResource()
+		var meta resource.MetadataResponse
+		r.Metadata(ctx, resource.MetadataRequest{ProviderTypeName: "virtscale"}, &meta)
+		var rs resource.SchemaResponse
+		r.Schema(ctx, resource.SchemaRequest{}, &rs)
+		importer, ok := r.(resource.ResourceWithImportState)
+		if !ok {
+			t.Errorf("%s cannot be imported", meta.TypeName)
+			continue
+		}
+		takes := func(id string) bool {
+			resp := resource.ImportStateResponse{State: tfsdk.State{Schema: rs.Schema, Raw: tftypes.NewValue(rs.Schema.Type().TerraformType(ctx), nil)}}
+			importer.ImportState(ctx, resource.ImportStateRequest{ID: id}, &resp)
+			return !resp.Diagnostics.HasError()
+		}
+		shown := importID(read(repoRoot, "examples/resources/"+meta.TypeName+"/import.sh"))
+		if !strings.HasPrefix(shown, "<") || !strings.HasSuffix(shown, ">") {
+			t.Errorf("%s: the import.sh shows %q, want an id in <angle brackets>", meta.TypeName, shown)
+			continue
+		}
+		twoParts := strings.Contains(shown, "/")
+		if got := !takes("one-part-id"); got != twoParts {
+			t.Errorf("%s: the import.sh shows %q, but a one-part id is refused by ImportState: %v", meta.TypeName, shown, got)
+		}
+		if twoParts && !takes("parent-id/own-id") {
+			t.Errorf("%s: the import.sh shows %q, but ImportState refuses \"parent-id/own-id\"", meta.TypeName, shown)
+		}
+		n++
+	}
+	if n < 8 {
+		t.Errorf("checked %d resources, want all 8", n)
 	}
 }

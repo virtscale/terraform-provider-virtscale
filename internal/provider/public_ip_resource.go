@@ -61,7 +61,7 @@ func (r *PublicIpResource) Metadata(_ context.Context, req resource.MetadataRequ
 // replacement; instance_id associates or disassociates the IP in place.
 func (r *PublicIpResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "A VirtScale public IP address. A customer organization's quota is one public IP per region.",
+		Description: "A VirtScale public IP address. By default a customer organization may hold one public IP per region (its quota decides).",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,
@@ -90,10 +90,8 @@ func (r *PublicIpResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			},
 			"state": schema.StringAttribute{
 				Computed: true,
-				Description: "The public IP's current lifecycle state, as reported by the API. Not " +
-					"stabilized with UseStateForUnknown: unlike the other computed attributes, " +
-					"it changes as a side effect of instance_id (e.g. associated -> allocated on " +
-					"disassociation), so it must be free to differ from its prior value on every plan.",
+				Description: "The public IP's current lifecycle state, as reported by the API. It changes with " +
+					"instance_id (for example from associated to allocated when the address is disassociated).",
 			},
 		},
 	}

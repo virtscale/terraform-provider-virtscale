@@ -14,8 +14,9 @@ The Managed VPS plans of the price book, cheapest first.
 ```terraform
 data "virtscale_plans" "all" {}
 
-output "cheapest_plan" {
-  value = data.virtscale_plans.all.plans[0].id
+# The plans come cheapest first; a retired plan is still listed but cannot be ordered.
+output "cheapest_active_plan" {
+  value = [for p in data.virtscale_plans.all.plans : p.id if p.status == "active"][0]
 }
 ```
 

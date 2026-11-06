@@ -40,5 +40,5 @@ output "s3_secret_access_key" {
 Import is supported using the following syntax:
 
 ```shell
-tofu import virtscale_s3_access_key.app <access key id>
+tofu import virtscale_s3_access_key.app <access key uuid>
 ```

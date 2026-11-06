@@ -127,8 +127,8 @@ output "s3_secret_access_key" {
   sensitive = true
 }
 
-# A customer organization's public IP quota is one per region. Uncomment to allocate one and associate it with the
-# instance above.
+# A customer organization may hold one public IP per region by default (its quota decides). Uncomment to allocate one
+# and associate it with the instance above; the resource is validated on its own in examples/resources/virtscale_public_ip.
 #
 # resource "virtscale_public_ip" "example" {
 #   region      = var.region

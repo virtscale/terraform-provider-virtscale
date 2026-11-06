@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 
 	vsprovider "gitlab.virtscale.nl/virtscale/virtscale-platform/terraform-provider-virtscale/internal/provider"
@@ -30,6 +31,7 @@ type field struct {
 	typ, desc                            string
 	required, optional, computed, secret bool
 	replaces                             bool
+	validation                           []string // what the validators of the attribute say they accept
 	nestedTitle                          string
 	nested                               []field
 }
@@ -97,9 +99,51 @@ func forcesReplacement(a any) bool {
 	return false
 }
 
+// validatorTexts is what the validators of an attribute or block say they accept, in the order they are declared.
+func validatorTexts(a any) []string {
+	ctx := context.Background()
+	var out []string
+	add := func(d string) {
+		if d = oneLine(d); d != "" {
+			out = append(out, d)
+		}
+	}
+	if x, ok := a.(interface{ StringValidators() []validator.String }); ok {
+		for _, v := range x.StringValidators() {
+			add(v.Description(ctx))
+		}
+	}
+	if x, ok := a.(interface{ Int64Validators() []validator.Int64 }); ok {
+		for _, v := range x.Int64Validators() {
+			add(v.Description(ctx))
+		}
+	}
+	if x, ok := a.(interface{ BoolValidators() []validator.Bool }); ok {
+		for _, v := range x.BoolValidators() {
+			add(v.Description(ctx))
+		}
+	}
+	if x, ok := a.(interface{ MapValidators() []validator.Map }); ok {
+		for _, v := range x.MapValidators() {
+			add(v.Description(ctx))
+		}
+	}
+	if x, ok := a.(interface{ ListValidators() []validator.List }); ok {
+		for _, v := range x.ListValidators() {
+			add(v.Description(ctx))
+		}
+	}
+	if x, ok := a.(interface{ SetValidators() []validator.Set }); ok {
+		for _, v := range x.SetValidators() {
+			add(v.Description(ctx))
+		}
+	}
+	return out
+}
+
 func toField(name string, a attribute) field {
 	f := field{name: name, typ: typeName(a.GetType()), desc: a.GetDescription(), required: a.IsRequired(), optional: a.IsOptional(),
-		computed: a.IsComputed(), secret: a.IsSensitive(), replaces: forcesReplacement(a)}
+		computed: a.IsComputed(), secret: a.IsSensitive(), replaces: forcesReplacement(a), validation: validatorTexts(a)}
 	return f
 }
 
@@ -128,10 +172,10 @@ func resourceFields(attrs map[string]rschema.Attribute, blocks map[string]rschem
 		switch b := blocks[name].(type) {
 		case rschema.SetNestedBlock:
 			out = append(out, field{name: name, typ: "Block Set", desc: b.Description, optional: true, nestedTitle: name,
-				nested: resourceFields(b.NestedObject.Attributes, nil)})
+				validation: validatorTexts(b), nested: resourceFields(b.NestedObject.Attributes, nil)})
 		case rschema.ListNestedBlock:
 			out = append(out, field{name: name, typ: "Block List", desc: b.Description, optional: true, nestedTitle: name,
-				nested: resourceFields(b.NestedObject.Attributes, nil)})
+				validation: validatorTexts(b), nested: resourceFields(b.NestedObject.Attributes, nil)})
 		}
 	}
 	return out
@@ -167,6 +211,9 @@ func line(f field) string {
 	}
 	if f.secret {
 		s += " **Sensitive.**"
+	}
+	if len(f.validation) > 0 {
+		s += " Validation: " + strings.Join(f.validation, "; ") + "."
 	}
 	return s
 }
@@ -228,15 +275,15 @@ func Generate(root string) (map[string]string, error) {
 	p := vsprovider.New("dev")()
 	pages := map[string]string{}
 
-	// the provider page
+	// the provider page (index.md); the lists of resources and data sources are added when they are known
 	var ps provider.SchemaResponse
 	p.Schema(ctx, provider.SchemaRequest{}, &ps)
-	var b strings.Builder
-	b.WriteString(front("Provider: virtscale", ps.Schema.Description))
-	b.WriteString("# virtscale Provider\n\n" + ps.Schema.Description + "\n\n## Example Usage\n\n```terraform\n" + read(root, "examples/provider/provider.tf") + "```\n\n## Schema\n\n")
-	renderFields(&b, providerFields(ps.Schema.Attributes), 0)
-	b.WriteString("See the [guide on state, secrets and import](guides/state-secrets-and-import.md).\n")
-	pages["docs/index.md"] = b.String()
+	var index strings.Builder
+	index.WriteString(front("Provider: virtscale", ps.Schema.Description))
+	index.WriteString("# virtscale Provider\n\n" + ps.Schema.Description + "\n\n## Example Usage\n\n```terraform\n" + read(root, "examples/provider/provider.tf") + "```\n\n## Schema\n\n")
+	renderFields(&index, providerFields(ps.Schema.Attributes), 0)
+	type entry struct{ name, link, summary string }
+	var resourceEntries, dataSourceEntries []entry
 
 	var secrets []string
 	for _, a := range providerFields(ps.Schema.Attributes) {
@@ -260,13 +307,11 @@ func Generate(root string) (map[string]string, error) {
 		renderFields(&b, fields, 0)
 		importSh := read(root, "examples/resources/"+name+"/import.sh")
 		fmt.Fprintf(&b, "## Import\n\nImport is supported using the following syntax:\n\n```shell\n%s```\n", importSh)
-		pages["docs/resources/"+strings.TrimPrefix(name, "virtscale_")+".md"] = b.String()
-		for _, l := range strings.Split(importSh, "\n") {
-			if strings.HasPrefix(l, "tofu import ") {
-				if f := strings.Fields(l); len(f) >= 4 {
-					imports[name] = f[len(f)-1]
-				}
-			}
+		link := "resources/" + strings.TrimPrefix(name, "virtscale_") + ".md"
+		pages["docs/"+link] = b.String()
+		resourceEntries = append(resourceEntries, entry{name, link, firstSentence(rs.Schema.Description)})
+		if id := importID(importSh); id != "" {
+			imports[name] = id
 		}
 		for _, f := range fields {
 			if f.secret {
@@ -287,7 +332,9 @@ func Generate(root string) (map[string]string, error) {
 		fmt.Fprintf(&b, "# %s (Data Source)\n\n%s\n\n## Example Usage\n\n```terraform\n%s```\n\n## Schema\n\n", name, ds.Schema.Description, read(root, "examples/data-sources/"+name+"/data-source.tf"))
 		fields := dataSourceFields(ds.Schema.Attributes)
 		renderFields(&b, fields, 0)
-		pages["docs/data-sources/"+strings.TrimPrefix(name, "virtscale_")+".md"] = b.String()
+		link := "data-sources/" + strings.TrimPrefix(name, "virtscale_") + ".md"
+		pages["docs/"+link] = b.String()
+		dataSourceEntries = append(dataSourceEntries, entry{name, link, firstSentence(ds.Schema.Description)})
 		for _, f := range fields {
 			if f.secret {
 				secrets = append(secrets, name+"."+f.name)
@@ -295,8 +342,45 @@ func Generate(root string) (map[string]string, error) {
 		}
 	}
 
+	byName := func(es []entry) {
+		sort.Slice(es, func(i, j int) bool { return es[i].name < es[j].name })
+	}
+	byName(resourceEntries)
+	byName(dataSourceEntries)
+	index.WriteString("## Resources\n\n")
+	for _, e := range resourceEntries {
+		fmt.Fprintf(&index, "- [`%s`](%s): %s\n", e.name, e.link, e.summary)
+	}
+	index.WriteString("\n## Data Sources\n\n")
+	for _, e := range dataSourceEntries {
+		fmt.Fprintf(&index, "- [`%s`](%s): %s\n", e.name, e.link, e.summary)
+	}
+	index.WriteString("\nSee the [guide on state, secrets and import](guides/state-secrets-and-import.md).\n")
+	pages["docs/index.md"] = index.String()
+
 	pages["docs/guides/state-secrets-and-import.md"] = guide(secrets, imports)
 	return pages, nil
+}
+
+// firstSentence is the description up to its first full stop, on one line.
+func firstSentence(desc string) string {
+	d := oneLine(desc)
+	if i := strings.Index(d, ". "); i >= 0 {
+		return d[:i+1]
+	}
+	return d
+}
+
+// importID is the id placeholder of the `tofu import <address> <id>` line of an import.sh: everything after the address.
+func importID(script string) string {
+	for _, l := range strings.Split(script, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(l), "tofu import "); ok {
+			if _, id, ok := strings.Cut(rest, " "); ok {
+				return strings.TrimSpace(id)
+			}
+		}
+	}
+	return ""
 }
 
 func guide(secrets []string, imports map[string]string) string {
@@ -304,21 +388,27 @@ func guide(secrets []string, imports map[string]string) string {
 	var b strings.Builder
 	b.WriteString(front("State, secrets and import - terraform-provider-virtscale", "What the state of the virtscale provider holds, which attributes are sensitive, and how to import each resource."))
 	b.WriteString("# State, secrets and import\n\n")
-	b.WriteString("## Versions\n\nThe provider speaks protocol 6 and runs with OpenTofu 1.x and Terraform 1.x; it is tested with OpenTofu 1.12.5. " +
-		"No attribute is write-only, so no feature of a recent minimum version is needed.\n\n")
-	b.WriteString("## The state holds credentials\n\n" +
-		"A sensitive attribute is hidden in plan and apply output, but it is stored in the state in plain text, as every provider " +
-		"does. Keep the state in an encrypted backend (or use OpenTofu's state encryption) and do not print a sensitive value in an " +
-		"output.\n\nThe sensitive attributes of this provider are:\n\n")
+	b.WriteString("## Versions\n\nThe provider speaks protocol 6 and is built and tested with OpenTofu 1.12.5. Terraform 1.x speaks the same " +
+		"protocol but is not tested. No attribute is write-only, so no feature of a recent minimum version is needed.\n\n")
+	b.WriteString("## Sensitive attributes\n\nA sensitive attribute is hidden in plan and apply output. The sensitive attributes of this provider are:\n\n")
 	for _, s := range secrets {
 		fmt.Fprintf(&b, "- `%s`\n", s)
 	}
-	b.WriteString("\nThe provider's `api_key` is better kept out of configuration files: set `VIRTSCALE_API_KEY` in the environment. " +
-		"`virtscale_s3_access_key.secret_access_key` is returned by the API exactly once, by the request that creates the key, so " +
-		"it is in the state and nowhere else; an imported key has none. `user_data` is not supported by the API, so no instance " +
-		"data is stored. The provider has no resource for IAM: members, invitations and API keys are managed by people, because no " +
+	b.WriteString("\n## Where a secret ends up\n\n" +
+		"- **The state.** The sensitive attributes of a resource are stored in the state in plain text, as every provider does. " +
+		"Keep the state in an encrypted backend (or use OpenTofu's state encryption, OpenTofu 1.7 or newer) and do not print a " +
+		"sensitive value in an output without `sensitive = true`. `virtscale_s3_access_key.secret_access_key` is returned by the " +
+		"API exactly once, by the request that creates the key, so it is in the state and nowhere else; an imported key has none.\n" +
+		"- **Plans and JSON output.** A saved plan (`tofu plan -out`) holds every planned value and the values of the input " +
+		"variables in plain text, and `tofu output -json` and `tofu show -json` print sensitive values in clear text: keep them as " +
+		"safe as the state.\n" +
+		"- **The provider configuration.** `api_key` is not stored in the state, but it is better kept out of configuration files " +
+		"and variables: set `VIRTSCALE_API_KEY` in the environment.\n" +
+		"- **Instance data.** The provider has no `user_data` attribute, so no instance data is stored.\n" +
+		"- **IAM.** The provider has no resource for IAM: members, invitations and API keys are managed by people, because no " +
 		"API key scope holds `iam.*` (a key cannot mint keys, so a leaked key cannot widen its reach).\n\n")
-	b.WriteString("## Import\n\nEvery resource is imported by an id. Attributes the API cannot return are left empty; the resource page says which.\n\n| Resource | Import id |\n| --- | --- |\n")
+	b.WriteString("## Import\n\nEvery resource is imported by the id shown below; a VPC is addressed through its project, so its id has two parts. " +
+		"Attributes the API cannot return are left empty; the resource page says which.\n\n| Resource | Import id |\n| --- | --- |\n")
 	names := sorted(imports)
 	for _, n := range names {
 		fmt.Fprintf(&b, "| `%s` | `%s` |\n", n, imports[n])

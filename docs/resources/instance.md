@@ -37,7 +37,7 @@ resource "virtscale_instance" "web" {
 - `disk_gb` (Number) Boot disk size, in gigabytes. **Forces replacement.**
 - `image` (String) The image id to boot from, as listed by the images catalogue. A create-time input only: neither Create nor Read ever overwrites it from the API, so it always reflects what was configured (import is the one exception, seeding it once from the observed value since there is no prior state to preserve). There is no image-drift detection in v0 -- see image_name for what the instance is actually running. **Forces replacement.**
 - `memory_mb` (Number) Memory, in megabytes. **Forces replacement.**
-- `name` (String) 1-63 lowercase letters, digits or hyphens; must start and end alphanumeric. Unique among live instances in the same region -- a deleted instance's name is reusable. **Forces replacement.**
+- `name` (String) 1-63 lowercase letters, digits or hyphens; must start and end alphanumeric. Unique among live instances in the same region -- a deleted instance's name is reusable. **Forces replacement.** Validation: 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit.
 - `network_profile` (String) The network profile id to attach the instance to. **Forces replacement.**
 - `region` (String) The region id to create the instance in. **Forces replacement.**
 - `storage_pool` (String) The storage pool id to place the instance's disk on. **Forces replacement.**
@@ -45,8 +45,8 @@ resource "virtscale_instance" "web" {
 
 ### Optional
 
-- `hostname` (String) The lower-case FQDN the instance is known by in your organization; unique among the organization's live instances (a duplicate is 409 hostname_taken). It is a handle only: no DNS record is created. Changing it updates the instance in place; it is read back from the API on every refresh, so a change made elsewhere shows as a difference. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). Import fills it.
-- `ssh_keys` (List of String) Names of SSH keys imported into the organization (see virtscale_ssh_key), at most 10, each listed once; no key material is stored here. cloud-init installs them for the image's default user (for example debian or ubuntu) at first boot, and the instance keeps them if a key is deleted or replaced later. The API refuses a name that was never imported with 422 ssh_key_not_found, and a 503 not_ready means SSH keys are not switched on for this API yet. Changing the list replaces the instance. Importing an instance reads its key names back from the API. **Forces replacement.**
+- `hostname` (String) The lower-case FQDN the instance is known by in your organization; unique among the organization's live instances (a duplicate is 409 hostname_taken). It is a handle only: no DNS record is created. Changing it updates the instance in place; it is read back from the API on every refresh, so a change made elsewhere shows as a difference. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). Import fills it. Validation: a lower-case fully qualified name such as web.example.com, at most 253 characters.
+- `ssh_keys` (List of String) Names of SSH keys imported into the organization (see virtscale_ssh_key), at most 10, each listed once; no key material is stored here. cloud-init installs them for the image's default user (for example debian or ubuntu) at first boot, and the instance keeps them if a key is deleted or replaced later. The API refuses a name that was never imported with 422 ssh_key_not_found, and a 503 not_ready means SSH keys are not switched on for this API yet. Changing the list replaces the instance. Importing an instance reads its key names back from the API. **Forces replacement.** Validation: at most 10 SSH keys; no SSH key name listed more than once.
 
 ### Read-Only
 

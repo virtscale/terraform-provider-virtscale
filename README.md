@@ -37,7 +37,10 @@ import](docs/guides/state-secrets-and-import.md). The pages are **generated** fr
 difference. `examples/` holds one example per resource and data source (`examples/resources/<name>/resource.tf` with
 its `import.sh`, `examples/data-sources/<name>/data-source.tf`), the provider block and a complete configuration. The
 tests `tofu validate` every one of them against the provider built from the tree (so an example that does not match a
-schema fails CI), check that a broken example is refused, and check that no example holds a literal credential.
+schema fails CI), check that a broken example is refused, and check that no example sets `api_key`, `secret`, `token` or
+`password` to a literal or holds a `vsk_` key or a private key (a heuristic, not a scanner: gitleaks runs in CI as well).
+The import ids on the pages are checked against what each resource's `ImportState` takes. The pages also say what the
+validators of an attribute accept.
 
 ## Build
 

@@ -2,12 +2,12 @@
 page_title: "virtscale_vpc Resource - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope.
+  A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source).
 ---
 
 # virtscale_vpc (Resource)
 
-A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope.
+A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source).
 
 ## Example Usage
 
@@ -26,14 +26,14 @@ resource "virtscale_vpc" "net" {
 
 ### Required
 
-- `name` (String) 1 to 63 lower-case letters, digits or hyphens. Unique among the project's VPCs in one region. **Forces replacement.**
+- `name` (String) 1 to 63 lower-case letters, digits or hyphens. Unique among the project's VPCs in one region. **Forces replacement.** Validation: use 1 to 63 lower-case letters, digits or hyphens, not starting or ending with a hyphen.
 - `project_id` (String) The id of the project the VPC lives in (a virtscale_project, or the default project). **Forces replacement.**
 - `region` (String) The region id, from virtscale_regions. **Forces replacement.**
 
 ### Optional
 
-- `description` (String) Free text, at most 255 characters. **Forces replacement.**
-- `prefix_length` (Number) How large the private address block is, as a prefix length from 20 to 24; read back from the block the platform gave it. Leave it out for the address plan's default. **Forces replacement.**
+- `description` (String) Free text, at most 255 characters. **Forces replacement.** Validation: at most 255 characters.
+- `prefix_length` (Number) How large the private address block is, as a prefix length from 20 to 24; read back from the block the platform gave it. Leave it out for the address plan's default. **Forces replacement.** Validation: a prefix length from 20 to 24.
 
 ### Read-Only
 

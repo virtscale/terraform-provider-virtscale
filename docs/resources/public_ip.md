@@ -2,12 +2,12 @@
 page_title: "virtscale_public_ip Resource - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  A VirtScale public IP address. A customer organization's quota is one public IP per region.
+  A VirtScale public IP address. By default a customer organization may hold one public IP per region (its quota decides).
 ---
 
 # virtscale_public_ip (Resource)
 
-A VirtScale public IP address. A customer organization's quota is one public IP per region.
+A VirtScale public IP address. By default a customer organization may hold one public IP per region (its quota decides).
 
 ## Example Usage
 
@@ -37,7 +37,7 @@ variable "instance_id" {
 
 - `address` (String) The allocated public IPv4 address. Unset until the allocation converges.
 - `id` (String) The public IP's id (a UUID), assigned by the API.
-- `state` (String) The public IP's current lifecycle state, as reported by the API. Not stabilized with UseStateForUnknown: unlike the other computed attributes, it changes as a side effect of instance_id (e.g. associated -> allocated on disassociation), so it must be free to differ from its prior value on every plan.
+- `state` (String) The public IP's current lifecycle state, as reported by the API. It changes with instance_id (for example from associated to allocated when the address is disassociated).
 
 ## Import
 

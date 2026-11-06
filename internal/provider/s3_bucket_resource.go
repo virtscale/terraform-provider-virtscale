@@ -127,7 +127,8 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 	resp.Schema = schema.Schema{
 		Description: "An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the " +
 			"bucket is active. Deleting a bucket is a soft delete: it is cut off at once, its data is kept for a retention " +
-			"window (7 days) and then purged, and the organization's bucket slot is freed. Needs an API key with the " +
+			"window (7 days), and the organization's bucket slot is freed. Its name stays taken until the platform purges it; " +
+			"the platform's purge worker may be switched off, and then it is never purged. Needs an API key with the " +
 			"storage:write (or write) scope.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -143,7 +144,7 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"versioning": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				Description: "Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it is " +
-					"refused at plan time, because replacing the bucket would soft-delete it and its name stays taken for the retention window.",
+					"refused at plan time, because replacing the bucket would soft-delete it and its name stays taken until it is purged.",
 			},
 			"force_destroy": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
