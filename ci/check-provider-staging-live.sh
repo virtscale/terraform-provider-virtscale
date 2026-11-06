@@ -61,29 +61,38 @@ scan_line=$(line_of 'grep -qF -f - "$work/test.log"')
 cat_line=$(line_of 'cat "$work/test.log"')
 append_line=$(line_of 'cat "$work/test.log" >>"$work/go-test.log"')
 cp_line=$(line_of 'cp "$work/go-test.log" provider-staging-live.log')
-if [ -n "$scan_line" ] && [ -n "$cat_line" ] && [ -n "$append_line" ] && [ -n "$cp_line" ]; then
+esac_line=""
+[ -z "$scan_line" ] || esac_line=$(awk -v s="$scan_line" 'NR > s && /^[[:space:]]*esac$/ { print NR; exit }' "$script")
+if [ -n "$scan_line" ] && [ -n "$esac_line" ] && [ -n "$cat_line" ] && [ -n "$append_line" ] && [ -n "$cp_line" ]; then
+  [ "$esac_line" -lt "$cat_line" ] || bad "the whole key check (up to its esac) must come before the log goes to the job log"
   [ "$scan_line" -lt "$cat_line" ] || bad "the key scan must come before the log goes to the job log"
   [ "$cat_line" -lt "$append_line" ] || bad "the log must go to the job log before it is appended to the artifact copy"
   [ "$append_line" -lt "$cp_line" ] || bad "the artifact copy must be updated after the log is appended"
 else
   bad "the per-test key scan, the job log, the append and the artifact copy must all be there"
 fi
+# The status handling is compared as whole lines: a match stops the run, no match goes on, anything else stops the run.
+for exact in '  scan=0' '  0) fail "the API key appears in the output of $name: the log is withheld" ;;' '  1) ;;' \
+  '  *) fail "scanning the output of $name for the API key failed (grep status $scan): the log is withheld" ;;'; do
+  grep -qxF -- "$exact" "$script" || bad "the key check lost the line: $exact"
+done
 need "a grep that fails to scan is a failure" '*) fail "scanning the output of $name for the API key failed'
 need "the key scan found the key" '0) fail "the API key appears in the output of $name'
 # A run starts only on a clean org, so that a leak of an earlier run is never the baseline.
 need "the clean-start guard" '[ "$before" = "ssh_keys=0 projects=0 instances=0 buckets=0 vpcs=0" ]'
 need "the after-run guard" '[ "$after" = "$before" ]'
 # S3 is opt-in, and only for exactly 1.
-need "the S3 opt-in for exactly 1" '[ "${PROVIDER_STAGING_LIVE_S3:-}" = 1 ]'
+grep -qxF 'if [ "${PROVIDER_STAGING_LIVE_S3:-}" = 1 ]; then' "$script" || bad "the S3 opt-in must be exactly: if [ \"\${PROVIDER_STAGING_LIVE_S3:-}\" = 1 ]; then"
 need "S3 off by default" 'live_s3=""'
 need "the S3 variable crosses the allowlist" 'PROVIDER_STAGING_LIVE_S3="${PROVIDER_STAGING_LIVE_S3:-}"'
-# The key stays on curl's stdin, in the one test command's environment and on grep's stdin: no other line may use it
-# (whole lines are compared, so an allowed use cannot carry a second one).
-other_key_use=$(grep -vE '^[[:space:]]*#' "$script" | grep -F '$api_key' | sed 's/^[[:space:]]*//' |
-  grep -vxF -e 'code=$(printf '"'"'header = "Authorization: Bearer %s"\n'"'"' "$api_key" |' \
+# The key stays on curl's stdin, in the one test command's environment and on grep's stdin: no other line may mention
+# the variable, braces or not (whole lines are compared, so an allowed use cannot carry a second one).
+other_key_use=$(grep -vE '^[[:space:]]*#' "$script" | grep -F 'api_key' | sed 's/^[[:space:]]*//' |
+  grep -vxF -e 'api_key=$(jq -r '"'"'.data.data.S3CP_STAGING_ORG_A_KEY // empty'"'"' "$work/keys.json")' \
+    -e 'case "$api_key" in' \
+    -e 'code=$(printf '"'"'header = "Authorization: Bearer %s"\n'"'"' "$api_key" |' \
     -e 'VIRTSCALE_API_KEY="$api_key" \' \
-    -e 'printf '"'"'%s'"'"' "$api_key" | grep -qF -f - "$work/test.log" || scan=$?' \
-    -e 'case "$api_key" in' || true)
+    -e 'printf '"'"'%s'"'"' "$api_key" | grep -qF -f - "$work/test.log" || scan=$?' || true)
 [ -z "$other_key_use" ] || bad "the API key is used where it must not be: $other_key_use"
 # The CA is a committed public certificate, not a variable.
 grep -qF "BAO_CA_PEM" "$script" && bad "the script must not read the CA from a variable (BAO_CA_PEM)"

@@ -40,7 +40,7 @@ test:
     - test -z "$(gofmt -l $(git ls-files '*.go'))"   # tracked files only: the restored GOMODCACHE lives under .cache/
     - go vet ./...
     - go build ./...
-    - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v
+    - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v -timeout 30m   # the suite takes ~10 minutes on the runner: the default timeout is 10
 
 # Live acceptance of the provider's resources against the staging customer API (PROV-001 criterion 6; TF-002). Started by an
 # orchestrator through the GitLab API on main, never by a push, a schedule or a merge request:

@@ -93,6 +93,13 @@ func (f *fakeAPI) SlowFirewallApply(vmID string, reads int) {
 	f.fw(vmID).slow = reads
 }
 
+// FinishFirewallApply lets the apply that is pending end at the next read (or refused PUT).
+func (f *fakeAPI) FinishFirewallApply(vmID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fw(vmID).stepsLeft = 1
+}
+
 // FirewallRules is the rule set the API holds for an instance (the rows of the last PUT, whatever the state of applying
 // them), as "direction protocol min-max cidr" lines.
 func (f *fakeAPI) FirewallRules(vmID string) []string {
