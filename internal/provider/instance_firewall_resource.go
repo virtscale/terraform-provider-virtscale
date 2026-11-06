@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -348,34 +349,43 @@ func (r *InstanceFirewallResource) Read(ctx context.Context, req resource.ReadRe
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
-// Delete clears the instance's rules. An instance that is gone has no rules to clear.
+// Delete clears the instance's rules. An instance that is gone has no rules to clear. A change that is still being
+// applied makes the PUT a 409 operation_in_flight: Delete asks again until the operation is through. A change that is
+// stuck in pending because the worker gave up has no operation any more, so the PUT is taken at once; waiting for it to
+// leave pending first would never end.
 func (r *InstanceFirewallResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state instanceFirewallModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
 	if resp.Diagnostics.HasError() {
 		return
 	}
-	key, err := newIdempotencyKey()
-	if err != nil {
-		resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
-		return
-	}
 	id := state.InstanceID.ValueString()
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
-	// A change that is still being applied (a create whose wait failed, an interrupted apply) makes the PUT a 409
-	// operation_in_flight: let it finish first.
-	if _, err := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
-		return f == nil || f.State != "pending", nil
-	}); err != nil {
-		resp.Diagnostics.AddError("Unable to Clear Firewall", err.Error())
-		return
-	}
-	if _, err := r.client.SetFirewall(ctx, id, nil, key); err != nil {
-		if !client.IsNotFound(err, client.ResourceVm) {
-			resp.Diagnostics.AddError("Unable to Clear Firewall", apiErrorDetail(err))
+	for {
+		key, err := newIdempotencyKey() // a refused attempt changed nothing, so every attempt has a key of its own
+		if err != nil {
+			resp.Diagnostics.AddError("Unable to Generate Idempotency Key", err.Error())
+			return
 		}
-		return
+		_, err = r.client.SetFirewall(waitCtx, id, nil, key)
+		if err == nil {
+			break
+		}
+		if client.IsNotFound(err, client.ResourceVm) {
+			return
+		}
+		if !operationInFlight(err) {
+			resp.Diagnostics.AddError("Unable to Clear Firewall", apiErrorDetail(err))
+			return
+		}
+		select {
+		case <-waitCtx.Done():
+			resp.Diagnostics.AddError("Unable to Clear Firewall",
+				"another change of the firewall was still being applied when the wait ended: "+apiErrorDetail(err))
+			return
+		case <-time.After(pollInterval):
+		}
 	}
 	if _, err := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
 		if f == nil || f.State == "applied" {

@@ -313,11 +313,18 @@ needs the same `description` in the configuration, or the plan replaces it. Impo
 
 The whole firewall rule set of one instance. The API replaces the set as one and applies it asynchronously, so the
 resource owns all of it: a rule added in the panel shows up as a difference and is removed by the next apply. Apply
-waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. A set that
-ended in `error` is not in force, so the resource then reports no confirmed rules: the next plan shows the difference
-and the next apply sets the rules again. Destroying the resource waits for a change that is still being applied and then
-clears the rules this API lets you set (an empty set); the platform's own base rules are not part of the set. An
-instance that is gone has no rules to clear.
+waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. The first
+`error` it sees ends the wait, although the platform retries a few times and may succeed later, so a failure can be a
+transient one: the next plan reads the state as it is. A set that ended in `error` may not be fully in force, so the
+resource then reports no confirmed rules: the next plan shows the difference, and the next apply of an update sets the
+rules again (a create that failed is tainted and replaced). A change the platform's worker gave up on (a precondition
+such as a missing network binding) can stay `pending` for good: apply then ends at the 20 minutes with `last seen: state
+pending`, and a later apply or the destroy sets the rules again, because the API only refuses a new change while an
+operation really runs. Destroying the resource asks for the empty rule set (the rules this API lets you set; the
+platform's own base rules are not part of the set) at once, asks again while another change is still being applied
+(`409 operation_in_flight`, up to 10 minutes), and then waits until the empty set is applied. An instance that is gone
+has no rules to clear. An instance the platform does not let you change rules for (a region policy) is refused with
+`409 vm_action_not_allowed`.
 
 **The first apply replaces whatever rules the instance already holds** (set in the panel or at creation), without a
 preview of them. To see them first, import the instance's firewall (`tofu import`, below) and run `tofu plan`: the

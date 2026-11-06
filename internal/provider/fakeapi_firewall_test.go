@@ -47,6 +47,9 @@ type fakeFirewall struct {
 	err       *string
 	stepsLeft int
 	fail      bool
+	slow      int  // the next apply takes this many reads to finish (0: two)
+	stick     bool // the next apply never finishes ...
+	stuck     bool // ... because the worker gave up: no operation runs any more, so a new PUT is taken
 }
 
 type firewallState struct {
@@ -75,7 +78,23 @@ func (f *fakeAPI) FailFirewallApply(vmID string) {
 	f.fw(vmID).fail = true
 }
 
-// FirewallRules is the applied rule set of an instance, as "direction protocol min-max cidr" lines.
+// StickFirewallPending makes the next firewall.apply of the instance stay in state pending for good: the worker gave up
+// on a precondition without touching the row, and no operation runs any more (so the next PUT is taken, not a 409).
+func (f *fakeAPI) StickFirewallPending(vmID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fw(vmID).stick = true
+}
+
+// SlowFirewallApply makes the next firewall.apply of the instance take that many reads (or refused PUTs) to finish.
+func (f *fakeAPI) SlowFirewallApply(vmID string, reads int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.fw(vmID).slow = reads
+}
+
+// FirewallRules is the rule set the API holds for an instance (the rows of the last PUT, whatever the state of applying
+// them), as "direction protocol min-max cidr" lines.
 func (f *fakeAPI) FirewallRules(vmID string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -101,7 +120,7 @@ func intOrDash(p *int) string {
 }
 
 func (f *fakeAPI) advanceFirewall(fw *fakeFirewall) {
-	if fw.state != "pending" {
+	if fw.state != "pending" || fw.stuck {
 		return
 	}
 	if fw.stepsLeft--; fw.stepsLeft > 0 {
@@ -212,12 +231,17 @@ func (f *fakeAPI) putFirewall(rc *reqCtx, id string) {
 		return
 	}
 	fw := f.fw(id)
-	if fw.state == "pending" {
+	if fw.state == "pending" && !fw.stuck {
+		f.advanceFirewall(fw) // the operation goes on while the caller waits to ask again
 		rc.conflict("operation_in_flight", "another operation is already running for this instance")
 		return
 	}
 	f.fws.puts = append(f.fws.puts, string(payload))
 	fw.rules, fw.state, fw.err, fw.stepsLeft = rules, "pending", nil, 2
+	if fw.slow > 0 {
+		fw.stepsLeft, fw.slow = fw.slow, 0
+	}
+	fw.stuck, fw.stick = fw.stick, false
 	op := f.newOperation("firewall.apply", "vm", id+":firewall", time.Now().UTC())
 	accepted := vmAccepted{Vm: f.vms[id].wireVmOut, Operation: op}
 	f.idemKeep(storeKey, digest, http.StatusAccepted, accepted, f.operationLocation(op), "")
