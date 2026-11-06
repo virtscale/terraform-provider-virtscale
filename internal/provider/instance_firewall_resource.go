@@ -26,7 +26,43 @@ var (
 	_ resource.ResourceWithValidateConfig = &InstanceFirewallResource{}
 )
 
-var errFirewallApplyFailed = errors.New("firewall entered error state")
+var (
+	errFirewallApplyFailed = errors.New("firewall entered error state")
+	errFirewallDiffers     = errors.New("firewall confirmed another rule set")
+)
+
+// firewallGracePolls is how many reads may show "applied" with a rule set other than the one sent before it is believed:
+// the API's state change may reach the row a moment after the PUT answers, and the old set reads applied until then.
+const firewallGracePolls = 12
+
+// ruleKey is a rule as one comparable string.
+func ruleKey(direction, protocol string, portMin, portMax *int, cidr, description string) string {
+	return fmt.Sprintf("%s|%s|%s|%s|%s|%s", direction, protocol, intText(portMin), intText(portMax), cidr, description)
+}
+
+func intText(p *int) string {
+	if p == nil {
+		return "-"
+	}
+	return fmt.Sprint(*p)
+}
+
+// sameRules reports whether the confirmed rules are the rules that were sent, as sets of rules.
+func sameRules(sent []client.FirewallRuleIn, confirmed []client.FirewallRule) bool {
+	counts := map[string]int{}
+	for _, r := range sent {
+		counts[ruleKey(r.Direction, r.Protocol, r.PortMin, r.PortMax, r.RemoteCIDR, r.Description)]++
+	}
+	for _, r := range confirmed {
+		counts[ruleKey(r.Direction, r.Protocol, r.PortMin, r.PortMax, r.RemoteCIDR, r.Description)]--
+	}
+	for _, n := range counts {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
+}
 
 // maxFirewallRules is how many rules the API takes for one instance.
 const maxFirewallRules = 50
@@ -247,18 +283,30 @@ func (r *InstanceFirewallResource) apply(ctx context.Context, model *instanceFir
 
 	waitCtx, cancel := context.WithTimeout(ctx, createTimeout)
 	defer cancel()
+	differs := 0
 	final, waitErr := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
 		if f == nil {
 			return false, errors.New("the instance disappeared while its firewall was being changed")
 		}
 		switch f.State {
 		case "applied":
-			return true, nil
+			if sameRules(rules, f.Rules) {
+				return true, nil
+			}
+			if differs++; differs > firewallGracePolls {
+				return true, errFirewallDiffers
+			}
 		case "error":
 			return true, errFirewallApplyFailed
 		}
 		return false, nil
 	})
+	if errors.Is(waitErr, errFirewallDiffers) && final != nil {
+		state.diags.AddError("Firewall Rules Differ", fmt.Sprintf(
+			"the API says the rule set is applied, but it holds %d rules and %d were sent; run apply again, and tell support if it repeats",
+			len(final.Rules), len(rules)))
+		return
+	}
 	if errors.Is(waitErr, errFirewallApplyFailed) && final != nil {
 		model.State = types.StringValue(final.State)
 		state.save()
@@ -360,7 +408,7 @@ func (r *InstanceFirewallResource) Delete(ctx context.Context, req resource.Dele
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()
 	if _, err := r.client.WaitFirewall(waitCtx, id, pollInterval, func(f *client.Firewall) (bool, error) {
-		if f == nil || f.State == "applied" {
+		if f == nil || (f.State == "applied" && len(f.Rules) == 0) {
 			return true, nil
 		}
 		if f.State == "error" {
