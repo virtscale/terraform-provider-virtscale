@@ -249,3 +249,21 @@ func TestAccInstanceFirewallResource_WrongOrganizationKeepsTheResourceInState(t 
 		},
 	})
 }
+
+// An API whose state change reaches the row a moment after the PUT answers shows the old set as applied first: the
+// resource keeps reading until the set it sent is the set confirmed, and does not take the old one for the answer.
+func TestAccInstanceFirewallResource_WaitsForTheSetItSentNotJustForApplied(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetFirewallLag(firstVm, 4)
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		Steps: []resource.TestStep{{
+			Config: firewallConfig(fake, ruleSSH+rulePing),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "state", "applied"),
+				resource.TestCheckResourceAttr("virtscale_instance_firewall.test", "rule.#", "2"),
+			),
+		}},
+	})
+}
