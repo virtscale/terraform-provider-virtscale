@@ -97,7 +97,7 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_instance` (create, destroy, refresh) | `compute:write` |
 | `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
-| `virtscale_vpc` (create, destroy, refresh) | `network:write` |
+| `virtscale_vpc` (create, destroy, refresh) | `network:write`, and `compute:read` to find its project with the `virtscale_project` data source |
 | `virtscale_instance_firewall` (set, clear, refresh) | `network:write` |
 | `virtscale_s3_bucket`, `virtscale_s3_access_key` (create, change, destroy, refresh) | `storage:write` (or the older `write`) |
 | `virtscale_project` (create, rename, destroy) | `write`: `compute:write` only reads projects |
@@ -277,7 +277,8 @@ destroying it is refused with `409 default_project`).
 
 A change is one `PATCH` under the generation of a fresh read (`If-Match`): a change made at the same moment by someone
 else is refused with `412 generation_mismatch` and the next run picks it up. A project that still holds a server, a
-public IP or a network cannot be deleted (`409 project_not_empty`). The organization has a quota of 100 projects
+public IP or an address allocation cannot be deleted (`409 project_not_empty`); a VPC is not counted, so delete a
+project's VPCs before the project (Terraform does, when the VPC refers to the project). The organization has a quota of 100 projects
 (`422 quota_exceeded`). Import by id: `tofu import virtscale_project.web <id>`.
 
 The data source `virtscale_project` takes an optional `name` and returns `id`, `vrn`, `description`, `labels`,
@@ -304,7 +305,9 @@ deployment: where they are not, every call is `503 not_ready` and the error says
 | `created_at`      | string | Computed | RFC 3339. |
 
 The organization has a quota of VPCs (`422 quota_exceeded`). A VPC that still has subnets cannot be deleted
-(`409 vpc_not_empty`). Import by `<project id>/<vpc id>`: `tofu import virtscale_vpc.net <project id>/<vpc id>`.
+(`409 vpc_not_empty`). A delete that the platform cannot carry out ends the VPC in status `error`; destroy says so with the
+platform's reason. `internet_egress` is true only for the project's default VPC. An imported VPC that has a description
+needs the same `description` in the configuration, or the plan replaces it. Import by `<project id>/<vpc id>`: `tofu import virtscale_vpc.net <project id>/<vpc id>`.
 
 ### `virtscale_instance_firewall`
 

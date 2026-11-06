@@ -184,7 +184,7 @@ const lostCreateHint = "the first request may still have created the resource: "
 	"if the next apply reports name_taken, find it in the panel or with the API " +
 	"and bring it under management with tofu import"
 
-// lostPatchHint is what the error of a keyed PATCH that gave up adds
+// lostPatchHint is what the error of a keyed PATCH or DELETE that gave up adds
 // instead: nothing was created, so the create hint would send the user looking
 // for a resource that does not exist. Another plan reads the current state,
 // which is what the change may have set.
