@@ -33,6 +33,9 @@ func runCounting(t *testing.T, answers map[string]any) (stdout, stderr string, o
 	t.Helper()
 	for _, tool := range []string{"sh", "jq", "curl"} {
 		if _, err := exec.LookPath(tool); err != nil {
+			if os.Getenv("CI") != "" { // the pipeline installs jq: a missing tool must not turn these tests off unseen
+				t.Fatalf("%s is not on PATH in CI; the counting of the live script would go untested", tool)
+			}
 			t.Skipf("%s is not on PATH; the counting of the live script is tested where it is", tool)
 		}
 	}
@@ -57,7 +60,7 @@ curl_safe() { curl -q --noproxy '*' "$@"; }
 ENDPOINT=` + srv.URL + `
 org=o1
 api_key=vsk_test
-work=$(mktemp -d)
+work=` + "'" + t.TempDir() + "'" + `
 ` + scriptCounting(t) + `
 leftovers
 `

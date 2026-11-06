@@ -517,7 +517,7 @@ them. One test per family:
 | `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
 | `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
 
-Each has a twin against the fake (`...LiveProofAgainstTheFake`) that proves the test code in CI. A test is skipped
+Each has a twin against the fake (`TestAcc...AgainstTheFake`) that proves the test code in CI. A test is skipped
 unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`, `VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all
 set. It creates only objects named `tf-live-<random>` and deletes them again. The API key needs the `write` scope
 (projects), `network:write` and `compute:write` (VPCs, instances, firewalls) and `storage:write` or `write` (S3). The
@@ -537,8 +537,8 @@ VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDP
 go test ./internal/provider -run TestLive -count=1 -v -timeout 60m
 ```
 
-A run counts only when `-v` shows `--- PASS` for the test (a skip prints `ok` too). The tests refuse the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fails at once, instead of skipping,
-when a live run is requested and `tofu` cannot be found.
+A run counts only when `-v` shows `--- PASS` for the test (a skip prints `ok` too). The tests refuse the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fail at once, instead of
+skipping, when a live run is requested and `tofu` cannot be found.
 
 In CI the job `provider-staging-live` does this for you, without anyone holding the key. It exists only in a pipeline
 started through the GitLab API on `main` with the variable `PROVIDER_STAGING_LIVE=1`; a push, a merge request or a web
@@ -549,8 +549,12 @@ not stop the next, so a run shows which families work; the S3 one only when the 
 token. It refuses to start if the org already holds `tf-live-*` objects (SSH keys, projects, instances, buckets that are
 not soft-deleted, VPCs), withholds a test's log if it contains the key (checked after every test, with the artifact
 updated each time), fails unless the log shows `--- PASS` for every test, and counts again afterwards: the run must leave
-nothing behind. The part of the script that counts is tested in CI against a local API
-(`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of
+nothing behind. Each test has 30 minutes (`-timeout 30m`) and the job 90 (the sum of the ceilings is larger, but a run
+that needs more than 90 minutes in all is stuck). A job that is killed can leave `tf-live-*` objects behind: the next run
+then refuses to start and says how many of which kind; delete them (instances and VPCs first, then projects, then SSH
+keys; buckets are only soft-deleted) before running again. The lists are read as one page (50 to 100 objects), which is
+plenty for a test org that holds nothing else of that name. The part of the script that counts is tested in CI against a
+local API (`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of
 variables, so nothing a trigger sets (proxy, Go, curl, apt, `PATH`, ...) reaches it; it uses its own pinned and
 checksum-verified `tofu`, the public OpenBao CA in `ci/bao-ca.pem`, and runs without a cache. Only users with the
 Maintainer role can start a pipeline with variables in this project.

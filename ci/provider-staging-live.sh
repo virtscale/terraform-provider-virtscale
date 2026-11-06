@@ -231,9 +231,14 @@ for name in $TESTS; do
   # it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
   # It is done after every test, and the artifact is updated every time, so that a job that is killed by its timeout
   # still leaves the log of the tests that ran.
-  if printf '%s' "$api_key" | grep -qF -f - "$work/test.log"; then
-    fail "the API key appears in the output of $name: the log is withheld"
-  fi
+  # grep says 0 for a match and 1 for none; anything else (2: it could not read) is as bad as a match.
+  scan=0
+  printf '%s' "$api_key" | grep -qF -f - "$work/test.log" || scan=$?
+  case "$scan" in
+  0) fail "the API key appears in the output of $name: the log is withheld" ;;
+  1) ;;
+  *) fail "scanning the output of $name for the API key failed (grep status $scan): the log is withheld" ;;
+  esac
   cat "$work/test.log"
   cat "$work/test.log" >>"$work/go-test.log"
   cp "$work/go-test.log" provider-staging-live.log
@@ -251,6 +256,6 @@ echo "provider-staging-live: results:$results"
 
 [ "$rc" -eq 0 ] || fail "at least one live test failed or was skipped (results:$results)"
 # Soft-deleted buckets and revoked keys stay on the API as history, which is why they are not counted; everything else
-# the run made must be gone. The org's access keys are counted as a whole: the run must not leave one active.
+# the run made must be gone.
 [ "$after" = "$before" ] || fail "the run left objects behind (before: $before; after: $after)"
 echo "provider-staging-live: PASS (every live test passed; no object left behind)"
