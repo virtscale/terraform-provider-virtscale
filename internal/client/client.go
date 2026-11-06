@@ -184,7 +184,7 @@ const lostCreateHint = "the first request may still have created the resource: "
 	"if the next apply reports name_taken, find it in the panel or with the API " +
 	"and bring it under management with tofu import"
 
-// lostPatchHint is what the error of a keyed PATCH that gave up adds
+// lostPatchHint is what the error of a keyed PATCH or DELETE that gave up adds
 // instead: nothing was created, so the create hint would send the user looking
 // for a resource that does not exist. Another plan reads the current state,
 // which is what the change may have set.
@@ -551,13 +551,15 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 // carries its own count) how many sends it took, and, for a request that
 // carried an Idempotency-Key, how to recover when the failure leaves open that
 // the API processed it anyway. The recovery sentence depends on the method: a
-// POST creates a resource (see lostCreateHint), while a PATCH changes one
-// (see lostPatchHint).
+// POST creates a resource (see lostCreateHint), while a PATCH or a DELETE changes or
+// removes one (see lostPatchHint).
 func giveUp(err error, attempts int, idempotencyKey, method string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
-	hint := lostCreateHint
-	if method == http.MethodPatch {
-		hint = lostPatchHint
+	// Only a POST creates something to look for; a keyed PATCH or DELETE changed or removed a resource that is in the
+	// state already, so another plan shows where it stands.
+	hint := lostPatchHint
+	if method == http.MethodPost {
+		hint = lostCreateHint
 	}
 
 	var apiErr *APIError

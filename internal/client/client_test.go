@@ -1604,3 +1604,19 @@ func TestRecoveryHint_AlsoWhenTheWaitCannotBeAfforded(t *testing.T) {
 		}
 	})
 }
+
+// A keyed DELETE that gives up changed nothing worth importing: the hint sends the user to another plan, not to look
+// for a resource the request may have created.
+func TestGiveUp_AKeyedDeleteDoesNotSendYouLookingForACreate(t *testing.T) {
+	c := failWith(t, 502, "bad_gateway", "the upstream is down")
+	c.retry.sleep = func(context.Context, time.Duration) error { return nil }
+	err := c.DeleteProject(context.Background(), "p-1", "key-1")
+	apiErr := asAPIError(t, err)
+	if !apiErr.MayHaveBeenApplied {
+		t.Fatal("a keyed DELETE that gave up after 502s may have been applied")
+	}
+	text := apiErr.Error()
+	if strings.Contains(text, "tofu import") || !strings.Contains(text, "run another plan to see the current state") {
+		t.Errorf("Error() = %q, want the plan hint and no import hint", text)
+	}
+}
