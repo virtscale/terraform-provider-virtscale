@@ -145,7 +145,7 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"versioning": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				Description: "Keep previous versions of overwritten and deleted objects. Fixed when the bucket is created: changing it is " +
-					"refused at plan time, because replacing the bucket would soft-delete it and its name stays taken for the retention window.",
+					"refused at plan time, because replacing the bucket would soft-delete it and its name stays taken until it is purged.",
 			},
 			"force_destroy": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
