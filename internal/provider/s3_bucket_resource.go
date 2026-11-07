@@ -127,9 +127,10 @@ func (atLeastOneValidator) ValidateInt64(_ context.Context, req validator.Int64R
 func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the " +
-			"bucket is active. Deleting a bucket is a soft delete: it is cut off at once, its data is kept for a retention " +
-			"window (7 days) and then purged, and the organization's bucket slot is freed. Needs an API key with the " +
-			"storage:write (or write) scope.",
+			"bucket is active. Deleting a bucket is a soft delete: it is marked deleting_soft at once, and a worker cuts off " +
+			"access to it afterwards (not instantly, and not guaranteed), its data is kept for a retention window (7 days) and " +
+			"then purged (production's purge worker is on), and the organization's bucket slot is freed. Its name stays taken " +
+			"until it is purged. Needs an API key with the storage:write (or write) scope.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed: true, Description: "The bucket's id (a UUID), assigned by the API.",

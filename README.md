@@ -377,14 +377,21 @@ service switched on (the panel does it), and has a limit of buckets (`422 bucket
 | `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
 | `id`, `state`, `created_at` | string | Computed | |
 
-Deleting is a **soft delete**: the bucket is cut off at once, its data is kept for a retention window, and the plan's
-bucket slot is freed. A bucket in that state reads as gone, but **its name stays taken** until it is purged
-(`409 bucket_already_exists` for a new bucket of that name; the panel can restore a soft-deleted bucket). **The
-platform's purge worker ships switched off** (`S3CP_BUCKET_PURGE_ENABLED=false`); until it is on, a soft-deleted bucket is
-never purged, its name stays taken, and it keeps a retention row: the API limits the buckets an organization holds, live
-and soft-deleted, to twice its bucket limit (`422 bucket_retention_limit_reached`), so do not create and destroy buckets
-in a loop. The ceilings are applied by the object store after the API accepts them, and a change right after another
-operation of the bucket can meet `409 operation_in_flight`, which the provider repeats for about a minute.
+Deleting is a **soft delete**: the API marks the bucket `deleting_soft` and answers `202` at once, its data is kept for
+a retention window (7 days), and the plan's bucket slot is freed. Access to the bucket is cut **afterwards, by a worker**:
+the cut is not instant and not guaranteed (the worker retries and can give up, and an access key of the organization can
+undo it until the platform's reconciler writes it again), so a bucket that was just destroyed can stay reachable over S3
+for a while. A bucket in that state reads as gone, but **its name stays taken** until it is purged (`409
+bucket_already_exists` for a new bucket of that name; the panel can restore a soft-deleted bucket). **The platform's
+purge worker is on in production** (since 2026-10-27, `S3CP_BUCKET_PURGE_ENABLED=true`, not a dry run), so a soft-deleted
+bucket is erased when its 7 days are up and its name is free again; a deployment that ships the worker off (the API's
+default) never erases one. Until then the bucket keeps a retention row: the API limits the buckets an organization holds,
+live and soft-deleted, to twice its bucket limit (`422 bucket_retention_limit_reached`, which names the oldest erasure
+date), so do not create and destroy buckets in a loop. A destroy of a bucket that is already being deleted (`409
+bucket_already_deleting`) is done; one in a state that cannot be deleted (`409 bucket_not_deletable`, while it is still
+being built or erased) is an error with the API's sentence. The ceilings are applied by the object store after the API
+accepts them, and a change right after another operation of the bucket can meet `409 operation_in_flight`, which the
+provider repeats for about a minute.
 
 If a create fails after the bucket was made (the API refuses a ceiling, `422 bucket_quota_exceeds_plan`; the bucket ends
 in `provision_failed`), the bucket is in the state, tainted by the error, and the next apply would replace it, which
@@ -399,7 +406,9 @@ An S3 access key for the organization's storage. There is nothing to configure. 
 by the request that creates the key**, so the provider keeps `secret_access_key` in the state, marked sensitive. That
 means the state holds a credential: use an encrypted backend (or OpenTofu's state encryption), and do not print the
 attribute in an output. A key's secret cannot be read back, so an imported key has none (`secret_access_key` is null).
-Destroying the resource revokes the key and waits until it reads revoked. To rotate, replace the resource
+Destroying the resource revokes the key and waits until it reads revoked (a key that is already revoked, `409
+access_key_already_revoked`, is done, and one that is being revoked, `409 access_key_already_revoking`, is waited for;
+a key that cannot be revoked yet, `409 access_key_not_revocable`, is an error with the API's sentence). To rotate, replace the resource
 (`tofu apply -replace=virtscale_s3_access_key.app`, or `replace_triggered_by`). The key is a key on the organization's
 own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete
 window.
@@ -484,7 +493,8 @@ Managed VPS plans with `id`, `name`, `vcpus`, `ram_mb`, `disk_gb`, `monthly_pric
 Unit tests (client package) run with plain `go test`. Provider and resource tests are Terraform acceptance
 tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
 `TF_ACC=1` and `tofu` on `PATH`. The fake is written from the deployed API's spec and handlers
-(s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
+(s3-control-plane `94f5021f`, and `87607618` for the S3 buckets and access keys: wire shapes, error envelope, state
+machines, the codes, sentences and order of the refusals, key scopes), not from the client's
 own types, so a wrong field name or status in the client fails a test instead of being mirrored back. On top of
 that, every request the client sends the fake and every answer it gets back is checked against the OpenAPI document
 the provider was written against, `internal/contract/customer-v1.json` (s3-control-plane `87607618`; `SOURCE` says
