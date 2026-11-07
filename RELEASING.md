@@ -39,14 +39,15 @@ direction Push). The backup of the private key and its passphrase belongs in Ope
    delete the exported file.
 4. Register the public key (`gpg --armor --export <fingerprint>`) and the provider with both registries, following their
    current docs: registry.terraform.io (Publish > Provider, signed in as an owner of the GitHub organization, plus the
-   key under the namespace's signing keys) and registry.opentofu.org (a request on github.com/opentofu/registry).
+   key under the namespace's signing keys) and registry.opentofu.org (a request on github.com/opentofu/registry; its GPG
+   key goes in through the separate `provider_key` issue form, not the provider form).
 
 ## Rotate the GPG key
 
 Do it before the key expires, or at once if it leaked.
 
-1. Generate the new key as in the setup. Add its public key to **both** registries; leave the old one listed, so releases
-   signed with it keep verifying.
+1. Generate the new key as in the setup. Add its public key to **both** registries (OpenTofu: a new `provider_key` issue);
+   leave the old one listed, so releases signed with it keep verifying.
 2. Replace `GPG_PRIVATE_KEY` and `PASSPHRASE` in the `release` environment, delete the exported file, back the new key up in OpenBao.
 3. Cut a patch release. Download its `_SHA256SUMS` and `.sig` and run `gpg --verify` with only the new public key imported.
 4. Retire the old key once nothing needs it. If it leaked: revoke it (`gpg --gen-revoke`), remove it from the registries
@@ -54,8 +55,10 @@ Do it before the key expires, or at once if it leaked.
 
 ## Maintenance
 
-- GoReleaser's version lives in `.gitlab-ci.yml` (`GORELEASER_VERSION` and `GORELEASER_SHA256`, the line for
-  `goreleaser_Linux_x86_64.tar.gz` in that release's `checksums.txt`) and in the workflow (`version:`). Change them together.
+- GoReleaser's version and sha256 live in `.gitlab-ci.yml` (`GORELEASER_VERSION`, `GORELEASER_SHA256`) and in the workflow's
+  "Install GoReleaser" step (the same two names). The hash is the line for `goreleaser_Linux_x86_64.tar.gz` in that
+  release's `checksums.txt`; the workflow downloads the tarball itself and stops on a mismatch, before the key is
+  imported. Change both files together.
 - The workflow's actions are pinned to commit SHAs; the comment names the tag. To update one, take the commit of the
   new tag (`git ls-remote https://github.com/<owner>/<repo> 'refs/tags/<tag>*'`: for an annotated tag use the `^{}` line)
   and change the comment with it.

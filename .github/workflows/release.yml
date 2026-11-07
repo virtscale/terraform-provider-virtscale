@@ -33,6 +33,17 @@ jobs:
           go-version-file: go.mod
           # A tag build that restores a cache could ship what an earlier job left in it.
           cache: false
+      - name: Install GoReleaser
+        # Not goreleaser-action: it fetches goreleaser by tag without a checksum, and this job holds the signing key.
+        # Same version and sha256 as the GitLab job (.gitlab-ci.yml, GORELEASER_VERSION and GORELEASER_SHA256); change both.
+        env:
+          GORELEASER_VERSION: '2.20.0'
+          GORELEASER_SHA256: d2483159e6007f814132cb56635ad30a70013dbeb813d6033a7e01adf6ae108c
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/goreleaser.tar.gz" "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz"
+          echo "${GORELEASER_SHA256}  $RUNNER_TEMP/goreleaser.tar.gz" | sha256sum -c -
+          mkdir "$RUNNER_TEMP/goreleaser"
+          tar -xzf "$RUNNER_TEMP/goreleaser.tar.gz" -C "$RUNNER_TEMP/goreleaser" goreleaser
       - name: Import GPG key
         id: import_gpg
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
@@ -40,12 +51,8 @@ jobs:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.PASSPHRASE }}
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@ec59f474b9834571250b370d4735c50f8e2d1e29 # v7.0.0
-        with:
-          distribution: goreleaser
-          # Same version as the GitLab job (.gitlab-ci.yml, GORELEASER_VERSION).
-          version: v2.20.0
-          args: release --clean
+        run: |
+          "$RUNNER_TEMP/goreleaser/goreleaser" release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
