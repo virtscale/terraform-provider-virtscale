@@ -73,8 +73,8 @@ const lostBucketHint = "the first request may still have created the bucket: if 
 // lostAccessKeyHint is what the error of a keyed access key create that gave up adds. A key has no name to collide on, and
 // its secret was in the answer that was lost, so an imported key would be useless: the key that may exist must be revoked.
 const lostAccessKeyHint = "the first request may still have created an access key whose secret was lost with the answer: " +
-	"list the organization's access keys in the panel or with the API and revoke any you did not receive " +
-	"(an organization holds at most 5), then apply again"
+	"list the organization's access keys in the panel or with the API (GET /v1/orgs/{org}/s3/access-keys) and revoke any you " +
+	"did not receive (DELETE /v1/orgs/{org}/s3/access-keys/{id} revokes one by its id; an organization holds at most 5), then apply again"
 
 // CreateBucket sends POST /v1/orgs/{org}/s3/buckets, which answers 202 with the bucket as it stands.
 func (c *Client) CreateBucket(ctx context.Context, req BucketCreateRequest, idempotencyKey string) (*Bucket, error) {

@@ -387,7 +387,7 @@ service switched on (the panel does it), and has a limit of buckets (`422 bucket
 | `versioning`     | bool   | Optional, default `false` | Keep previous versions of overwritten and deleted objects. Fixed at creation: a change is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken (below). |
 | `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
 | `max_objects`    | number | Optional | The most objects. Same rules. |
-| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
+| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it, a bucket whose last metering sample saw objects or bytes is `409 bucket_not_empty` (what the API calls empty is below). The provider's own: the API does not store it, so import leaves it `false`. |
 | `id`, `state`, `created_at` | string | Computed | |
 
 Deleting is a **soft delete**: the API marks the bucket `deleting_soft` and answers `202` at once, its data is kept for
@@ -405,6 +405,17 @@ bucket_already_deleting`) is done; one in a state that cannot be deleted (`409 b
 being built or erased) is an error with the API's sentence. The ceilings are applied by the object store after the API
 accepts them, and a change right after another operation of the bucket can meet `409 operation_in_flight`, which the
 provider repeats for about a minute.
+
+What counts as empty is the API's judgement from the **last metering sample**, not a fresh look at the object store: the
+sampler records every bucket's object and byte count every 10 minutes (the API's default), so the judgement can be that
+old in both directions, and it has no age limit. A bucket whose last sample saw objects or bytes (bytes alone count:
+incomplete multipart uploads) is `409 bucket_not_empty` unless `force_destroy` is set; the refusal quotes the sample's time
+and counts, and on a versioned bucket it says that the sample counts previous versions a plain object listing does not
+show, so deleting every object you can see does not make it empty. **When there is no sample the API lets the delete
+through** without `force_destroy`: none for the organization, none for this bucket, or only one older than the bucket
+(a bucket filled or created since the last sample is let through the same way). A bucket you have just emptied can still
+be refused until the next sample; set `force_destroy = true`, apply, and destroy again. Nothing is erased either way and
+the retention window is unchanged.
 
 If a create fails after the bucket was made (the API refuses a ceiling, `422 bucket_quota_exceeds_plan`; the bucket ends
 in `provision_failed`), the bucket is in the state, tainted by the error, and the next apply would replace it, which
@@ -429,8 +440,9 @@ window.
 If a create is repeated after a lost answer (a gateway error), the API answers the repeat with the stored result, which
 never holds the secret. The key exists then, so the provider keeps it in the state and fails with "Access Key Secret Not
 Returned": run `tofu destroy` (or apply again, which replaces it) to revoke it and get a new one. If the provider gives up
-before it gets any answer, the key may exist with its secret lost: look at the organization's access keys (at most 5) in the
-panel or with the API, and revoke any you did not receive. Destroying the resource revokes the key; a revoke that fails
+before it gets any answer, or the answer to the create cannot be read (a 201 whose body is not valid JSON), the key may
+exist with its secret lost: look at the organization's access keys (at most 5) in the panel or with the API
+(`GET /v1/orgs/{org}/s3/access-keys`), and revoke any you did not receive (`DELETE /v1/orgs/{org}/s3/access-keys/{id}`). Destroying the resource revokes the key; a revoke that fails
 leaves it `degraded`, which the destroy reports at once.
 
 | Attribute           | Type   | Required/Computed | Notes |

@@ -57,11 +57,20 @@ func TestAccS3AccessKeyResource_Lifecycle(t *testing.T) {
 				Config: accessKeyConfig(fake, "storage"),
 				Check:  resource.TestCheckResourceAttr("virtscale_s3_access_key.test", "secret_access_key", canarySecret),
 			},
-			{ // Import fills what the API still knows; the secret is not among it.
+			{ // Import fills what the API still knows; the secret is not among it: it is null, not "".
 				ResourceName:            "virtscale_s3_access_key.test",
 				ImportState:             true,
 				ImportStateVerify:       true,
 				ImportStateVerifyIgnore: []string{"secret_access_key"},
+				ImportStateCheck: func(states []*terraform.InstanceState) error {
+					if len(states) != 1 {
+						return fmt.Errorf("imported %d resources, want 1", len(states))
+					}
+					if v, ok := states[0].Attributes["secret_access_key"]; ok {
+						return fmt.Errorf("an imported key has secret_access_key %q, want null", v)
+					}
+					return nil
+				},
 			},
 			{ // Without the resource the key is revoked, and the destroy waited until it was.
 				Config: testAccProviderBlockWith(fake, "storage", testOrgID),
@@ -86,10 +95,20 @@ func TestAccS3AccessKeyResource_ALostAnswerLeavesNoSecretAndSaysSo(t *testing.T)
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 		CheckDestroy:             checkAccessKeysRevoked(fake),
-		Steps: []resource.TestStep{{
-			Config:      accessKeyConfig(fake, "storage"),
-			ExpectError: wrapSafeInOrder("Access Key Secret Not Returned", "was created but its secret was not returned", "destroy"),
-		}},
+		Steps: []resource.TestStep{
+			{
+				Config:      accessKeyConfig(fake, "storage"),
+				ExpectError: wrapSafeInOrder("Access Key Secret Not Returned", "was created but its secret was not returned", "destroy"),
+			},
+			{ // The key is in the state (tainted by the error) and its secret is null, not "".
+				RefreshState:       true,
+				ExpectNonEmptyPlan: true,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttrSet("virtscale_s3_access_key.test", "id"),
+					resource.TestCheckNoResourceAttr("virtscale_s3_access_key.test", "secret_access_key"),
+				),
+			},
+		},
 	})
 }
 

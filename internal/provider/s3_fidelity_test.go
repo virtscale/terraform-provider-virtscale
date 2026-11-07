@@ -140,6 +140,56 @@ func TestFakeS3_ADeleteThatIsRepeatedOrIllTimedIsRefusedLikeTheAPI(t *testing.T)
 	}
 }
 
+// delete_bucket refuses a non-empty bucket from the last metering sample, and the 409 quotes it: when, how many objects and
+// bytes, why a bytes-only sample is not an empty bucket, and what a versioned (or never observed) bucket's count means.
+// Sentences as in domain/buckets.py of 87607618 (the same on main, 40707934). The fake has one sample time, 2026-11-01T12:00:00+00:00.
+func TestFakeS3_ANonEmptyBucketIsRefusedWithTheAPIsSentence(t *testing.T) {
+	fake, _ := s3Fake(t)
+	const ack = "; pass ?force=true to acknowledge and soft-delete it anyway -- that erases nothing and the retention window is unchanged"
+	measured := func(found string) string {
+		return "the last measurement of this bucket (2026-11-01T12:00:00+00:00) found " + found
+	}
+	refused := func(what, id, want string) {
+		t.Helper()
+		status, m := s3HTTP(t, fake, http.MethodDelete, "buckets/"+id, "")
+		wantS3Problem(t, what, status, m, http.StatusConflict, "bucket_not_empty", want)
+	}
+	versioned := func(name string) string {
+		status, m := s3HTTP(t, fake, http.MethodPost, "buckets", fmt.Sprintf(`{"name":%q,"versioning":true}`, name))
+		if status != http.StatusAccepted {
+			t.Fatalf("create %s: status %d: %v", name, status, m)
+		}
+		return m["bucket"].(map[string]any)["id"].(string)
+	}
+
+	id := newBucket(t, fake, "tf-fid-ne")
+	activate(t, fake, id)
+	fake.MakeBucketNonEmpty(id, true)
+	refused("a bucket holding objects", id, measured("3 object(s) and 1536 byte(s)")+ack)
+
+	fake.SetBucketSample(id, 0, 512) // incomplete multipart uploads: bytes without objects
+	refused("a bucket holding bytes only", id, measured("0 object(s) and 512 byte(s) -- incomplete multipart uploads occupy storage without appearing as objects")+ack)
+
+	vid := versioned("tf-fid-ver")
+	activate(t, fake, vid)
+	fake.MakeBucketNonEmpty(vid, true)
+	refused("a versioned bucket", vid, measured("3 object(s) and 1536 byte(s) -- this bucket keeps previous versions, which the measurement counts "+
+		"and a plain object listing does not show, so deleting every object you can see does not make it empty")+ack)
+
+	nid := versioned("tf-fid-never") // versioning was asked for and never observed
+	fake.ForceBucketState(nid, "active")
+	fake.MakeBucketNonEmpty(nid, true)
+	refused("a versioned bucket never observed", nid, measured("3 object(s) and 1536 byte(s) -- this bucket was created with versioning requested "+
+		"and the object store has not been asked since; if versioning is on, the measurement counts previous versions that a plain object listing does not show")+ack)
+
+	// No sample, or one that saw nothing, is no refusal; force=true clears one.
+	fake.MakeBucketNonEmpty(id, false)
+	status, _ := s3HTTP(t, fake, http.MethodDelete, "buckets/"+id, "")
+	wantHTTPStatus(t, "the delete of a bucket with no sample", status, http.StatusAccepted)
+	status, _ = s3HTTP(t, fake, http.MethodDelete, "buckets/"+vid+"?force=true", "")
+	wantHTTPStatus(t, "the forced delete of a non-empty bucket", status, http.StatusAccepted)
+}
+
 // create_bucket checks in this order: the slot limit, the retention ceiling, the name rules, and last the name being taken.
 func TestFakeS3_ACreateIsRefusedInTheAPIsOrderWithItsSentences(t *testing.T) {
 	fake, _ := s3Fake(t)

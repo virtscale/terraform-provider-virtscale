@@ -201,6 +201,14 @@ func withLostCreateHint(ctx context.Context, hint string) context.Context {
 	return context.WithValue(ctx, hintKey{}, hint)
 }
 
+// createRecoveryHint is the sentence for a keyed create that may have made its resource: the create's own, or the generic one.
+func createRecoveryHint(createHint string) string {
+	if createHint != "" {
+		return createHint
+	}
+	return lostCreateHint
+}
+
 // FieldError is one entry of a problem body's errors[]: which request field
 // the API refused and why.
 type FieldError struct {
@@ -528,7 +536,12 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 				return nil
 			}
 			if err := json.Unmarshal(ex.body, out); err != nil {
-				return fmt.Errorf("client: decode response body: %w", err)
+				err = fmt.Errorf("client: decode response body: %w", err)
+				if method == http.MethodPost && idempotencyKey != "" {
+					// The API answered 2xx, so it made the resource, but nothing here knows what: say how to find it.
+					err = fmt.Errorf("%w; %s", err, createRecoveryHint(createHint))
+				}
+				return err
 			}
 			return nil
 		default:
@@ -570,10 +583,7 @@ func giveUp(err error, attempts int, idempotencyKey, method, createHint string) 
 	// the state already, so another plan shows where it stands.
 	hint := lostPatchHint
 	if method == http.MethodPost {
-		hint = lostCreateHint
-		if createHint != "" {
-			hint = createHint
-		}
+		hint = createRecoveryHint(createHint)
 	}
 
 	var apiErr *APIError
