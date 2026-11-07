@@ -32,7 +32,9 @@ See [examples/complete/main.tf](examples/complete/main.tf) for a complete, runna
 
 ## Documentation
 
-`docs/` has a page per resource and data source, a provider page and a guide on [state, secrets and
+`docs/` has a page per resource and data source, a provider page and four guides: [installation](docs/guides/installation.md),
+[authentication](docs/guides/authentication.md) (create an API key, scopes, where a key works), [getting
+started](docs/guides/getting-started.md) (a first VM end to end) and [state, secrets and
 import](docs/guides/state-secrets-and-import.md). The pages are **generated** from the schemas and from
 `examples/` (`go generate ./...` rewrites them), so they cannot drift: a test regenerates them in memory and fails on a
 difference. `examples/` holds one example per resource and data source (`examples/resources/<name>/resource.tf` with
