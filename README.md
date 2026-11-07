@@ -4,10 +4,11 @@ Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virts
 
 ## Status
 
-Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`)
-and is used via `dev_overrides` only -- it is not yet published to a Terraform registry. It will mirror to
-`github.com/virtscale` once that organization exists; registry publication (goreleaser, GPG signing) follows
-from there.
+Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is
+the source of truth. Until the first release it is used via `dev_overrides` only; nothing is on a Terraform registry
+yet. GitLab push-mirrors to `github.com/virtscale/terraform-provider-virtscale`, where GitHub Actions builds, signs and
+publishes a release to registry.terraform.io and registry.opentofu.org when a `v*` tag arrives; see
+[RELEASING.md](RELEASING.md).
 
 ## What it provides
 
@@ -41,6 +42,25 @@ schema fails CI), check that a broken example is refused, and check that no exam
 `password` to a literal or holds a `vsk_` key or a private key (a heuristic, not a scanner: gitleaks runs in CI as well).
 The import ids on the pages are checked against what each resource's `ImportState` takes. The pages also say what the
 validators of an attribute accept.
+
+## Install from the registry (available from the first release)
+
+No version is released yet, so `init` finds nothing today; use `dev_overrides` (below) until the first release. From
+then on a configuration needs only the source address, and Terraform and OpenTofu each fetch the provider from their own
+registry:
+
+```hcl
+terraform {
+  required_providers {
+    virtscale = {
+      source = "virtscale/virtscale"
+    }
+  }
+}
+```
+
+Pin a release with `version = "..."` (the registry page lists them). Both CLIs verify the release's checksums and their
+GPG signature against the key the registry holds. `dev_overrides` stays the way to run a local build while developing.
 
 ## Build
 
@@ -605,3 +625,4 @@ printf 'header = "PRIVATE-TOKEN: %s"\n' "$GITLAB_TOKEN" | curl -sS -K - -X POST 
 ## Links
 
 - API reference: <https://learn.virtscale.nl>
+- Releasing: [RELEASING.md](RELEASING.md)
