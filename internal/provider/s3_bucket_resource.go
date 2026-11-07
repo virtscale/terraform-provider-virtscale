@@ -149,8 +149,10 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			},
 			"force_destroy": schema.BoolAttribute{
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
-				Description: "Acknowledge, when the bucket is destroyed, that it may still hold objects (the API refuses a non-empty " +
-					"bucket with 409 bucket_not_empty otherwise). The provider's own: not stored by the API, so import leaves it false.",
+				Description: "Acknowledge, when the bucket is destroyed, that it may still hold objects. The API judges that from the " +
+					"bucket's last metering sample, not from a fresh look: it refuses the delete with 409 bucket_not_empty when that " +
+					"sample saw objects or bytes, and lets it through when there is no sample. The provider's own: not stored by the " +
+					"API, so import leaves it false.",
 			},
 			"max_size_bytes": schema.Int64Attribute{
 				Optional: true, Description: "The most bytes this bucket may hold, inside the organization's ceiling. Leave it out for " +

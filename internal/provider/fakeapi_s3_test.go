@@ -72,8 +72,8 @@ type wireAccessKeyAccepted struct {
 
 type fakeBucket struct {
 	wireBucketOut
-	nonEmpty  bool
-	stepsLeft int
+	objects, bytes int64 // what the last metering sample saw in it; the API judges emptiness from that, and a bucket with no sample is let through
+	stepsLeft      int
 }
 
 type fakeAccessKey struct {
@@ -114,11 +114,21 @@ func (f *fakeAPI) FailBucketBuilds() {
 	f.s3().failBucket = true
 }
 
+// MakeBucketNonEmpty makes the last metering sample of the bucket see 3 objects and 1536 bytes, or nothing.
 func (f *fakeAPI) MakeBucketNonEmpty(id string, on bool) {
+	if on {
+		f.SetBucketSample(id, 3, 1536)
+	} else {
+		f.SetBucketSample(id, 0, 0)
+	}
+}
+
+// SetBucketSample is what the last metering sample saw in the bucket.
+func (f *fakeAPI) SetBucketSample(id string, objects, bytes int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if b, ok := f.s3().buckets[id]; ok {
-		b.nonEmpty = on
+		b.objects, b.bytes = objects, bytes
 	}
 }
 
@@ -400,7 +410,7 @@ func (f *fakeAPI) putBucketQuota(rc *reqCtx, id string) {
 
 // deleteBucket is a soft delete: the bucket enters deleting_soft with a retention window and stays readable. One that is
 // already deleting_soft is 409 bucket_already_deleting, one that is still being built or is being erased is 409
-// bucket_not_deletable, and a non-empty one is 409 bucket_not_empty unless force=true.
+// bucket_not_deletable, and one whose last metering sample saw objects or bytes is 409 bucket_not_empty unless force=true.
 func (f *fakeAPI) deleteBucket(rc *reqCtx, id string) {
 	force := rc.r.URL.Query().Get("force") == "true"
 	f.mu.Lock()
@@ -425,8 +435,8 @@ func (f *fakeAPI) deleteBucket(rc *reqCtx, id string) {
 		rc.conflict("bucket_not_deletable", fmt.Sprintf("a bucket in state '%s' cannot be deleted", b.State))
 		return
 	}
-	if b.nonEmpty && !force {
-		rc.conflict("bucket_not_empty", "the bucket holds objects: pass force=true to soft-delete it anyway")
+	if !force && (b.objects > 0 || b.bytes > 0) {
+		rc.conflict("bucket_not_empty", bucketNotEmptyDetail(b))
 		return
 	}
 	now := time.Now().UTC()
@@ -436,6 +446,29 @@ func (f *fakeAPI) deleteBucket(rc *reqCtx, id string) {
 	location := f.operationLocation(accepted.Operation)
 	f.idemKeep(storeKey, digest, http.StatusAccepted, accepted, location, "")
 	rc.json(http.StatusAccepted, accepted, "Location", location)
+}
+
+// fakeSampledAt is when the fake's metering sample was taken, written as Python's datetime.isoformat() writes a UTC time.
+const fakeSampledAt = "2026-11-01T12:00:00+00:00"
+
+// bucketNotEmptyDetail is the sentence of the 409 bucket_not_empty, word for word as domain/buckets.py builds it: the
+// sample's time and counts, a note for a bytes-only sample, and one on versions (told as evidence for a bucket observed to
+// keep them, as what is known for one that asked for versioning and was never observed, and not at all otherwise).
+func bucketNotEmptyDetail(b *fakeBucket) string {
+	found := fmt.Sprintf("%d object(s) and %d byte(s)", b.objects, b.bytes)
+	if b.objects == 0 {
+		found += " -- incomplete multipart uploads occupy storage without appearing as objects"
+	}
+	switch {
+	case b.ObservedVersioning != nil && *b.ObservedVersioning:
+		found += " -- this bucket keeps previous versions, which the measurement counts and a plain object listing does not show, " +
+			"so deleting every object you can see does not make it empty"
+	case b.ObservedVersioning == nil && b.Versioning:
+		found += " -- this bucket was created with versioning requested and the object store has not been asked since; if versioning " +
+			"is on, the measurement counts previous versions that a plain object listing does not show"
+	}
+	return "the last measurement of this bucket (" + fakeSampledAt + ") found " + found +
+		"; pass ?force=true to acknowledge and soft-delete it anyway -- that erases nothing and the retention window is unchanged"
 }
 
 func (f *fakeAPI) createAccessKey(rc *reqCtx) {
