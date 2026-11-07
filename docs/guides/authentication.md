@@ -26,9 +26,9 @@ An API key is created for the organization, not for a person's login: it expires
 1. Sign in to the customer panel at [panel.virtscale.nl](https://panel.virtscale.nl). You need the owner or admin role; with another role the panel answers `This account's role cannot manage API keys.`
 2. Open **Settings**. On the **API keys** card, choose **Create API key**.
 3. **Name** the key after what will use it, for example `terraform-ci`. The description is optional.
-4. Under **Access**, choose what the key may do (see the scopes below).
+4. Under **Access**, choose what the key may do (see the scopes below). The dialog starts on **Read-only**: for Terraform that can create things, choose **Full access** or **Custom**.
 5. Under **Expiry**, keep **90 days**, the default, or choose **On a date**. **Never** is possible, but then you have to notice a leaked key yourself.
-6. Under **Source**, leave **Default**, or choose **Only these networks** and list one IPv4 or IPv6 CIDR per line. A request from another address is refused (see below).
+6. Under **Source**, choose where the key may be used from (see "Limit where a key works" below). **Default** is shown only for a key that can write, and it limits the key to the address you create it from. For CI or any other machine than the one you are on, choose **Only these networks** and list one IPv4 or IPv6 CIDR per line, or **Any address**.
 7. Choose **Create key**. The dialog **API key created** shows the secret once: copy it into your secret store now. It cannot be shown again; if it is lost, create a new key and revoke the old one.
 
 Creating a key can ask for a recent sign-in with a second factor (`Creating an API key needs a recent sign-in with a second factor.`); sign in again and repeat. A key can never create or revoke keys or manage members, so Terraform cannot mint keys: that stays with people.
@@ -135,7 +135,17 @@ provider "virtscale" {
 
 ## Limit where a key works
 
-A key limited to **Only these networks** is accepted only from those addresses. Terraform run from another address, for example a CI runner that is not on the list, stops with `403 source_address_not_allowed` and the hint that the key's network limits do not include this address. Run it from an allowed address, or create a key with the networks you need.
+A key can be limited to the addresses it is used from; a request from any other address is refused. Under **Source** the panel offers:
+
+| Choice | What it does |
+| --- | --- |
+| **Default** | Shown only for a key that can write (**Full access**, or **Custom** with any scope ending in `:write`). The key is pinned to the address you create it from: one address (`/32`), or a `/64` network for IPv6. It is the address the edge sees, so behind a NAT it is the NAT's public address. If VirtScale cannot tell the address, the panel asks you to choose networks or any address instead. |
+| **Only these networks** | One IPv4 or IPv6 CIDR per line, at most 20. |
+| **Any address** | No limit. For a key that can write, the panel warns that changes can be made from any address. |
+
+A key that only reads has no **Default**: it works from any address unless you list networks. The key's **Source** is shown once it is created, and in the list of keys.
+
+This matters for Terraform. A key that can write and was created with **Default** works only from the address you were on when you created it: run from a CI runner or another machine, Terraform stops with `403 source_address_not_allowed` and the hint that the key's network limits do not include this address. For CI or another machine, create the key with **Only these networks** and the addresses it runs from, or, if those are not fixed, with **Any address**. A key cannot be edited afterwards: to change its source, create a new key and revoke the old one (see below).
 
 ## Rotate a key
 
