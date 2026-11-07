@@ -33,6 +33,13 @@ provider "virtscale" {}
 - `endpoint` (String) The base URL of the VirtScale API. Defaults to the VIRTSCALE_ENDPOINT environment variable, or https://api.virtscale.nl when neither is set. A value set here takes precedence over the environment variable.
 - `organization` (String) The id (a UUID) of the organization to operate in. Defaults to the VIRTSCALE_ORGANIZATION environment variable. A value set here takes precedence over the environment variable.
 
+## Guides
+
+- [Authentication](guides/authentication.md): Create an organization API key in the customer panel, choose its scopes, give it to the provider through the environment, and rotate it.
+- [Getting started](guides/getting-started.md): Build a first VM end to end with the virtscale provider: an SSH key, an instance, a firewall and a public IP, then plan, apply, connect and destroy.
+- [Installation](guides/installation.md): Install the virtscale provider from the Terraform or OpenTofu registry, pin and lock its version, verify the release signature, or build it locally.
+- [State, secrets and import](guides/state-secrets-and-import.md): What the state of the virtscale provider holds, which attributes are sensitive, and how to import each resource.
+
 ## Resources
 
 - [`virtscale_instance`](resources/instance.md): A VirtScale compute instance (VM).
@@ -52,5 +59,3 @@ provider "virtscale" {}
 - [`virtscale_plans`](data-sources/plans.md): The Managed VPS plans of the price book, cheapest first.
 - [`virtscale_project`](data-sources/project.md): A project of the organization, by name; without a name, the organization's default project.
 - [`virtscale_regions`](data-sources/regions.md): The regions this organization may see, in the order the API lists them.
-
-See the [guide on state, secrets and import](guides/state-secrets-and-import.md).

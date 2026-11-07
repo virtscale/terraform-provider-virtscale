@@ -1,6 +1,7 @@
 // Package docgen writes the documentation of the provider (docs/) from its schemas and the examples/ directory. The
 // pages are what the schemas say, so they cannot drift from them: a test regenerates them and compares (`go generate
-// ./...` rewrites them). It is used by a test and by tools/gendocs only.
+// ./...` rewrites them). The guides in docs/guides that a person wrote are not generated: Generate only lists them in the
+// index, from the front matter of each. It is used by a test and by tools/gendocs only.
 package docgen
 
 import (
@@ -347,7 +348,15 @@ func Generate(root string) (map[string]string, error) {
 	}
 	byName(resourceEntries)
 	byName(dataSourceEntries)
-	index.WriteString("## Resources\n\n")
+	guides, err := guideEntries(root)
+	if err != nil {
+		return nil, err
+	}
+	index.WriteString("## Guides\n\n")
+	for _, g := range guides {
+		fmt.Fprintf(&index, "- [%s](guides/%s): %s\n", g.title, g.file, g.summary)
+	}
+	index.WriteString("\n## Resources\n\n")
 	for _, e := range resourceEntries {
 		fmt.Fprintf(&index, "- [`%s`](%s): %s\n", e.name, e.link, e.summary)
 	}
@@ -355,11 +364,70 @@ func Generate(root string) (map[string]string, error) {
 	for _, e := range dataSourceEntries {
 		fmt.Fprintf(&index, "- [`%s`](%s): %s\n", e.name, e.link, e.summary)
 	}
-	index.WriteString("\nSee the [guide on state, secrets and import](guides/state-secrets-and-import.md).\n")
 	pages["docs/index.md"] = index.String()
 
-	pages["docs/guides/state-secrets-and-import.md"] = guide(secrets, imports)
+	pages["docs/guides/"+secretsGuideFile] = guide(secrets, imports)
 	return pages, nil
+}
+
+// guideEntry is a guide as the index lists it.
+type guideEntry struct{ file, title, summary string }
+
+// frontMatter reads the page_title (without the provider suffix) and the description of a page's front matter, the two
+// things the index shows of a guide. ok is false when either is missing.
+func frontMatter(page string) (title, description string, ok bool) {
+	rest, found := strings.CutPrefix(page, "---\n")
+	if !found {
+		return "", "", false
+	}
+	head, _, found := strings.Cut(rest, "\n---\n")
+	if !found {
+		return "", "", false
+	}
+	lines := strings.Split(head, "\n")
+	for i, l := range lines {
+		switch {
+		case strings.HasPrefix(l, "page_title:"):
+			title = strings.TrimSuffix(strings.Trim(strings.TrimSpace(strings.TrimPrefix(l, "page_title:")), `"`), pageTitleSuffix)
+		case strings.TrimSpace(l) == "description: |-":
+			var text []string
+			for _, d := range lines[i+1:] {
+				if !strings.HasPrefix(d, "  ") { // the block ends at the first line that is not indented
+					break
+				}
+				text = append(text, strings.TrimSpace(d))
+			}
+			description = strings.Join(text, " ")
+		}
+	}
+	return title, description, title != "" && description != ""
+}
+
+// guideEntries lists the guides for the index: the generated one and every page a person wrote in docs/guides, by file
+// name. A hand-written page whose front matter lacks a title or a description is an error, because the registry needs both.
+func guideEntries(root string) ([]guideEntry, error) {
+	entries := []guideEntry{{secretsGuideFile, secretsGuideTitle, secretsGuideDescription}}
+	files, err := filepath.Glob(filepath.Join(root, "docs", "guides", "*.md"))
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range files {
+		file := filepath.Base(f)
+		if file == secretsGuideFile {
+			continue
+		}
+		b, err := os.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		title, description, ok := frontMatter(string(b))
+		if !ok {
+			return nil, fmt.Errorf("docs/guides/%s: the front matter needs a page_title and a description", file)
+		}
+		entries = append(entries, guideEntry{file, title, description})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].file < entries[j].file })
+	return entries, nil
 }
 
 // firstSentence is the description up to its first full stop, on one line.
@@ -383,10 +451,18 @@ func importID(script string) string {
 	return ""
 }
 
+// The generated guide: its file in docs/guides, and the title and description of its front matter (the index lists them too).
+const (
+	secretsGuideFile        = "state-secrets-and-import.md"
+	secretsGuideTitle       = "State, secrets and import"
+	secretsGuideDescription = "What the state of the virtscale provider holds, which attributes are sensitive, and how to import each resource."
+	pageTitleSuffix         = " - terraform-provider-virtscale"
+)
+
 func guide(secrets []string, imports map[string]string) string {
 	sort.Strings(secrets)
 	var b strings.Builder
-	b.WriteString(front("State, secrets and import - terraform-provider-virtscale", "What the state of the virtscale provider holds, which attributes are sensitive, and how to import each resource."))
+	b.WriteString(front(secretsGuideTitle+pageTitleSuffix, secretsGuideDescription))
 	b.WriteString("# State, secrets and import\n\n")
 	b.WriteString("## Versions\n\nThe provider speaks protocol 6 and is built and tested with OpenTofu 1.12.5. Terraform 1.x speaks the same " +
 		"protocol but is not tested. No attribute is write-only, so no feature of a recent minimum version is needed.\n\n")
