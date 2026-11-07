@@ -4,10 +4,11 @@ Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virts
 
 ## Status
 
-Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`)
-and is used via `dev_overrides` only -- it is not yet published to a Terraform registry. It will mirror to
-`github.com/virtscale` once that organization exists; registry publication (goreleaser, GPG signing) follows
-from there.
+Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is
+the source of truth. Until the first release it is used via `dev_overrides` only; nothing is on a Terraform registry
+yet. GitLab push-mirrors to `github.com/virtscale/terraform-provider-virtscale`, where GitHub Actions builds, signs and
+publishes a release to registry.terraform.io and registry.opentofu.org when a `v*` tag arrives; see
+[RELEASING.md](RELEASING.md).
 
 ## What it provides
 
@@ -41,6 +42,25 @@ schema fails CI), check that a broken example is refused, and check that no exam
 `password` to a literal or holds a `vsk_` key or a private key (a heuristic, not a scanner: gitleaks runs in CI as well).
 The import ids on the pages are checked against what each resource's `ImportState` takes. The pages also say what the
 validators of an attribute accept.
+
+## Install from the registry (available from the first release)
+
+No version is released yet, so `init` finds nothing today; use `dev_overrides` (below) until the first release. From
+then on a configuration needs only the source address, and Terraform and OpenTofu each fetch the provider from their own
+registry:
+
+```hcl
+terraform {
+  required_providers {
+    virtscale = {
+      source = "virtscale/virtscale"
+    }
+  }
+}
+```
+
+Pin a release with `version = "..."` (the registry page lists them). Both CLIs verify the release's checksums and their
+GPG signature against the key the registry holds. `dev_overrides` stays the way to run a local build while developing.
 
 ## Build
 
@@ -205,11 +225,12 @@ the API prints the request.
 | `name`            | string | Required, forces replacement | 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit; checked at plan time (the API lower-cases names and strips a trailing `.virtscale.nl`, so any other form would come back different). Unique among live instances in the same region; a deleted instance's name is reusable. |
 | `region`          | string | Required, forces replacement | |
 | `image`           | string | Required, forces replacement | Image id from `virtscale_images`. Set at creation only; the provider does not detect image drift in v0. |
-| `vcpus`           | number | Required, forces replacement | |
-| `memory_mb`       | number | Required, forces replacement | |
-| `disk_gb`         | number | Required, forces replacement | |
-| `storage_pool`    | string | Required, forces replacement | |
-| `network_profile` | string | Required, forces replacement | |
+| `instance_type`   | string | Optional, Computed, forces replacement when set to a different value | A catalogue type from `virtscale_instance_types`, for example `g1-small`. It sets the three sizes; name it **or** give `vcpus`, `memory_mb` and `disk_gb`, not both. The first VM needs only a type: no pool or profile id. Read back from the API (null for an instance it reports no type for). The platform may require a type, in which case raw sizes are refused with `422 instance_type_required`. |
+| `vcpus`           | number | Optional, Computed, forces replacement when set to a different value | Taken from `instance_type` when one is named; otherwise `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` are given together. |
+| `memory_mb`       | number | Optional, Computed, forces replacement when set to a different value | As `vcpus`. |
+| `disk_gb`         | number | Optional, Computed, forces replacement when set to a different value | As `vcpus`. |
+| `storage_pool`    | string | Optional, Computed, forces replacement when set to a different value | Left out with `instance_type`, the API uses the type's own pool; with raw sizes it is required. State holds the pool the instance is on. |
+| `network_profile` | string | Optional, Computed, forces replacement when set to a different value | Left out, the API picks the first profile your organization may use in the region on the hosts the instance is placed on. State holds the profile the instance is on. |
 | `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. The API refuses `user_data`, so the provider has no such attribute. |
 | `hostname`        | string | Optional, Computed | The lower-case fully qualified name the instance is known by in your organization (for example `web.example.com`); checked at plan time (labels of lowercase letters, digits and hyphens, at least two labels, at most 253 characters). Unique among the organization's live instances: a duplicate is `409 hostname_taken`; another organization may use the same name. It is a handle only: the platform creates no DNS record for it. Changing it is an in-place update, not a replacement. It is read back on every refresh, so a change made elsewhere shows as a difference, and `tofu import` fills it. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). |
 | `id`              | string | Computed | |
@@ -218,9 +239,14 @@ the API prints the request.
 | `fqdn`            | string | Computed | Null for a customer account. |
 | `private_ipv4`    | string | Computed | The instance's private IPv4 address as the platform reports it; empty until it is known. An associated public IP is not the private address. |
 | `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. |
-| `instance_type`   | string | Computed | The catalogue instance type the instance was created from; null when the API does not report one. |
 | `created_at`      | string | Computed | RFC 3339. |
 
+The optional attributes follow the API's own rules: a create names an `instance_type` or all of `vcpus`, `memory_mb`,
+`disk_gb` and `storage_pool`, and a mix, none of them, or a partial set is refused at plan time with the API's
+wording. What the API decides it still decides, and its answer is shown as it comes: `422 instance_type_unavailable` for
+a type it does not sell in the region, `422 storage_pool_unavailable`, `422 network_profile_unavailable`. A value
+left out of the configuration is the API's choice, read back into state: naming a different one later replaces the
+instance, and taking the line out again keeps what the instance has, so the next plan is empty.
 The API checks `vcpus`, `memory_mb` and `disk_gb` against the platform's size limits and the image's
 minimums (`min_disk_gb` and `min_ram_mb` in `virtscale_images`); a refusal lists every violation
 (`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute except `hostname` forces
@@ -605,3 +631,8 @@ printf 'header = "PRIVATE-TOKEN: %s"\n' "$GITLAB_TOKEN" | curl -sS -K - -X POST 
 ## Links
 
 - API reference: <https://learn.virtscale.nl>
+- Releasing: [RELEASING.md](RELEASING.md)
+
+## License
+
+License: MPL-2.0 (see [LICENSE](LICENSE)).

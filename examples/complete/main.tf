@@ -57,17 +57,14 @@ resource "virtscale_ssh_key" "example" {
   public_key = file(var.public_key_path)
 }
 
+# An instance type sets the sizes; the platform chooses the storage pool and the network profile.
 resource "virtscale_instance" "example" {
-  name            = "example"
-  hostname        = "example.example.com"
-  region          = var.region
-  image           = local.debian_12_image_id
-  vcpus           = 1
-  memory_mb       = 2048
-  disk_gb         = 40
-  storage_pool    = "gro-ceph"
-  network_profile = "gro-tenant-default"
-  ssh_keys        = [virtscale_ssh_key.example.name]
+  name          = "example"
+  hostname      = "example.example.com"
+  region        = var.region
+  image         = local.debian_12_image_id
+  instance_type = "g1-small"
+  ssh_keys      = [virtscale_ssh_key.example.name]
 }
 
 # The whole rule set of the instance; ssh from one network only.

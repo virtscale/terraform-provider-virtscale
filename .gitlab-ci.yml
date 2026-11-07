@@ -42,6 +42,34 @@ test:
     - go build ./...
     - TF_ACC=1 TF_ACC_TERRAFORM_PATH="$(go env GOPATH)/bin/tofu" TF_ACC_PROVIDER_NAMESPACE=virtscale TF_ACC_PROVIDER_HOST=registry.terraform.io go test ./... -count=1 -v -timeout 30m   # the suite takes ~10 minutes on the runner: the default timeout is 10
 
+# The release configuration (TF-003): `goreleaser check` and an unsigned snapshot build, so a mistake in .goreleaser.yml or
+# terraform-registry-manifest.json shows here and not on the first `v*` tag. The real release is built and signed by GitHub
+# Actions on the mirror (.github/workflows/release.yml, RELEASING.md); no key and no token is involved here.
+# GORELEASER_VERSION is the one the release workflow uses too; GORELEASER_SHA256 is the line for
+# goreleaser_Linux_x86_64.tar.gz in that release's checksums.txt. Bump both together.
+release-snapshot:
+  stage: test
+  image: golang:1.25-bookworm
+  rules:
+    - if: $CI_PIPELINE_SOURCE != "api" || $PROVIDER_STAGING_LIVE != "1"
+  variables:
+    GORELEASER_VERSION: "2.20.0"
+    GORELEASER_SHA256: "d2483159e6007f814132cb56635ad30a70013dbeb813d6033a7e01adf6ae108c"
+  cache:
+    key:
+      files:
+        - go.sum
+    paths:
+      - .cache/go-mod
+  script:
+    - curl -sSLo /tmp/goreleaser.tar.gz "https://github.com/goreleaser/goreleaser/releases/download/v${GORELEASER_VERSION}/goreleaser_Linux_x86_64.tar.gz"
+    - echo "${GORELEASER_SHA256}  /tmp/goreleaser.tar.gz" | sha256sum -c -
+    - mkdir /tmp/goreleaser && tar -xzf /tmp/goreleaser.tar.gz -C /tmp/goreleaser goreleaser
+    - /tmp/goreleaser/goreleaser check
+    - /tmp/goreleaser/goreleaser release --snapshot --skip=sign,publish --clean
+    - ls -1 dist
+    - grep -q '_manifest\.json$' dist/*_SHA256SUMS   # the registry manifest is covered by the signed checksum file
+
 # Live acceptance of the provider's resources against the staging customer API (PROV-001 criterion 6; TF-002). Started by an
 # orchestrator through the GitLab API on main, never by a push, a schedule or a merge request:
 #
