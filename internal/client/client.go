@@ -740,21 +740,28 @@ func (c *Client) orgPath(p string) string {
 
 // VmCreateRequest is the body of POST /v1/orgs/{org}/compute/instances.
 //
+// Name an InstanceType, or give VCPUs, MemoryMB, DiskGB and a StoragePool, not both: the API refuses a mix with 422
+// invalid_spec. Every field left at its zero value is left out of the body, which is what asks the API for its default:
+// the type's sizes, the type's storage pool (a type is created on its own pool unless one is named) and the first
+// network profile the organization may use in the region. An empty string would not do, since the API reads it as a pool
+// or profile that was named. No valid size is zero.
+//
 // Hostname, when set, is the lower-case FQDN the instance should carry; a nil
 // Hostname is left out of the body entirely, so the instance has no hostname.
 //
-// user_data and workload_type are intentionally not represented: the API
-// refuses any non-null user_data and any workload_type other than the
-// server-side default for a customer organization.
+// user_data, disk_type and workload_type are intentionally not represented: the API refuses any non-null user_data
+// and any workload_type other than the server-side default for a customer organization, and the provider names a
+// storage pool rather than a disk type.
 type VmCreateRequest struct {
 	Name           string   `json:"name"`
 	Image          string   `json:"image"`
-	VCPUs          int      `json:"vcpus"`
-	MemoryMB       int      `json:"memory_mb"`
-	DiskGB         int      `json:"disk_gb"`
-	StoragePool    string   `json:"storage_pool"`
+	InstanceType   string   `json:"instance_type,omitempty"`
+	VCPUs          int      `json:"vcpus,omitempty"`
+	MemoryMB       int      `json:"memory_mb,omitempty"`
+	DiskGB         int      `json:"disk_gb,omitempty"`
+	StoragePool    string   `json:"storage_pool,omitempty"`
 	Region         string   `json:"region"`
-	NetworkProfile string   `json:"network_profile"`
+	NetworkProfile string   `json:"network_profile,omitempty"`
 	Hostname       *string  `json:"hostname,omitempty"`
 	SSHKeys        []string `json:"ssh_keys,omitempty"`
 }

@@ -123,6 +123,31 @@ func TestCreateVm_SendsIdempotencyKeyAndParsesResponse(t *testing.T) {
 	}
 }
 
+// A create that names an instance type sends nothing for the sizes, the pool or the profile: the API treats an empty
+// string as a pool or profile that was named, so leaving them out of the body is what asks for its defaults.
+func TestCreateVm_LeavesOutWhatIsNotGiven(t *testing.T) {
+	var raw map[string]any
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"vm":{"id":"vm-1"},"operation":{"id":"op-1"}}`))
+	})
+	req := VmCreateRequest{Name: "web-01", Image: "img-1", Region: "gro", InstanceType: "g1-small"}
+	if _, _, err := c.CreateVm(context.Background(), req, ""); err != nil {
+		t.Fatalf("CreateVm() error = %v", err)
+	}
+	for _, key := range []string{"vcpus", "memory_mb", "disk_gb", "storage_pool", "network_profile", "hostname", "ssh_keys"} {
+		if v, ok := raw[key]; ok {
+			t.Errorf("body carries %s = %v, want it left out", key, v)
+		}
+	}
+	if raw["instance_type"] != "g1-small" {
+		t.Errorf("instance_type = %v, want g1-small", raw["instance_type"])
+	}
+}
+
 func TestCreateVm_NoIdempotencyKeyWhenEmpty(t *testing.T) {
 	var sawHeader bool
 	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {

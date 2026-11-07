@@ -25,9 +25,10 @@ import (
 
 // Ensure InstanceResource satisfies the expected resource interfaces.
 var (
-	_ resource.Resource                = &InstanceResource{}
-	_ resource.ResourceWithConfigure   = &InstanceResource{}
-	_ resource.ResourceWithImportState = &InstanceResource{}
+	_ resource.Resource                   = &InstanceResource{}
+	_ resource.ResourceWithConfigure      = &InstanceResource{}
+	_ resource.ResourceWithImportState    = &InstanceResource{}
+	_ resource.ResourceWithValidateConfig = &InstanceResource{}
 )
 
 // pollInterval is how often Create/Delete poll the API while waiting for a
@@ -223,6 +224,13 @@ func (r *InstanceResource) Metadata(_ context.Context, req resource.MetadataRequ
 // Schema declares the virtscale_instance attributes. Every required and
 // optional attribute forces replacement, except hostname: it is the one
 // in-place change the API offers.
+//
+// The sizes, storage_pool, network_profile and instance_type are optional because the API picks what a create leaves
+// out (customer API compute.py _check_create_shape, domain/compute/vms.py create_vm_request): an instance type fills the
+// three sizes and, unless a pool is named, the pool of its own; a profile left out is the first one the organization
+// may use in the region. They are computed too, so the chosen values are read back into state, and keep their value
+// across plans (UseStateForUnknown). They replace the instance only when the configuration sets a value that differs
+// (RequiresReplaceIfConfigured): a value left out of the configuration is the API's to choose, not a change.
 func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "A VirtScale compute instance (VM).",
@@ -268,39 +276,71 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"running, as reported by the API. Informational only -- it does not " +
 					"participate in planning and never forces a replacement.",
 			},
+			"instance_type": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "The catalogue instance type to create the instance from, for example g1-small (the " +
+					"virtscale_instance_types data source lists them). It sets vcpus, memory_mb and disk_gb: name it " +
+					"or give those three, not both. With a type, storage_pool and network_profile need not be set. " +
+					"Read back from the API, so it is null for an instance the API reports no type for; an " +
+					"instance that has one keeps it when the line is removed. A different type replaces the " +
+					"instance. The platform may require a type, in which case it refuses vcpus, memory_mb and " +
+					"disk_gb with 422 instance_type_required.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
 			"vcpus": schema.Int64Attribute{
-				Required:    true,
-				Description: "Number of virtual CPUs.",
+				Optional: true,
+				Computed: true,
+				Description: "Number of virtual CPUs. Taken from instance_type when one is named; otherwise give " +
+					"vcpus, memory_mb, disk_gb and storage_pool together.",
 				PlanModifiers: []planmodifier.Int64{
-					int64planmodifier.RequiresReplace(),
+					int64planmodifier.UseStateForUnknown(),
+					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"memory_mb": schema.Int64Attribute{
-				Required:    true,
-				Description: "Memory, in megabytes.",
+				Optional:    true,
+				Computed:    true,
+				Description: "Memory, in megabytes. Taken from instance_type when one is named.",
 				PlanModifiers: []planmodifier.Int64{
-					int64planmodifier.RequiresReplace(),
+					int64planmodifier.UseStateForUnknown(),
+					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"disk_gb": schema.Int64Attribute{
-				Required:    true,
-				Description: "Boot disk size, in gigabytes.",
+				Optional:    true,
+				Computed:    true,
+				Description: "Boot disk size, in gigabytes. Taken from instance_type when one is named.",
 				PlanModifiers: []planmodifier.Int64{
-					int64planmodifier.RequiresReplace(),
+					int64planmodifier.UseStateForUnknown(),
+					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"storage_pool": schema.StringAttribute{
-				Required:    true,
-				Description: "The storage pool id to place the instance's disk on.",
+				Optional: true,
+				Computed: true,
+				Description: "The storage pool id to place the instance's disk on. Left out with instance_type, the " +
+					"API uses the type's own pool; with vcpus, memory_mb and disk_gb it is required. State holds the " +
+					"pool the instance is on. Naming a different pool replaces the instance; removing the line keeps " +
+					"the pool.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"network_profile": schema.StringAttribute{
-				Required:    true,
-				Description: "The network profile id to attach the instance to.",
+				Optional: true,
+				Computed: true,
+				Description: "The network profile id to attach the instance to. Left out, the API picks the first " +
+					"profile your organization may use in the region on the hosts the instance is placed on. State " +
+					"holds the profile the instance is on. Naming a different profile replaces the instance; " +
+					"removing the line keeps the profile.",
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"ssh_keys": schema.ListAttribute{
@@ -343,11 +383,6 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"instance_type": schema.StringAttribute{
-				Computed: true,
-				Description: "The catalogue instance type the instance was created from; null when the API does " +
-					"not report one.",
-			},
 			"fqdn": schema.StringAttribute{
 				Computed:    true,
 				Description: "The instance's fully-qualified domain name. Null for a customer account.",
@@ -368,6 +403,41 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 		},
+	}
+}
+
+// ValidateConfig refuses, at plan time, the ways of sizing an instance the API refuses (compute.py
+// _check_create_shape): an instance type together with any of the three sizes, none of the four, or sizes that are not
+// all given with a storage pool. It judges only what is known: a value that is unknown now (a type taken from a data
+// source) is left to the API, which stays the authority and answers every other refusal itself.
+func (r *InstanceResource) ValidateConfig(ctx context.Context, req resource.ValidateConfigRequest, resp *resource.ValidateConfigResponse) {
+	var c instanceResourceModel
+	resp.Diagnostics.Append(req.Config.Get(ctx, &c)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	unknown := c.InstanceType.IsUnknown() || c.StoragePool.IsUnknown()
+	sizes := 0
+	for _, n := range []types.Int64{c.VCPUs, c.MemoryMB, c.DiskGB} {
+		unknown = unknown || n.IsUnknown()
+		if !n.IsNull() && !n.IsUnknown() {
+			sizes++
+		}
+	}
+	typed := !c.InstanceType.IsNull() && !c.InstanceType.IsUnknown()
+
+	switch {
+	case typed && sizes > 0:
+		resp.Diagnostics.AddAttributeError(path.Root("instance_type"), "Instance type and sizes together",
+			"name an instance type or give vcpus, memory_mb and disk_gb, not both: the type sets the three sizes")
+	case typed || unknown:
+	case sizes == 0:
+		resp.Diagnostics.AddAttributeError(path.Root("instance_type"), "No instance type or sizes",
+			"set instance_type (see the virtscale_instance_types data source), or vcpus, memory_mb, disk_gb and storage_pool")
+	case sizes < 3 || c.StoragePool.IsNull():
+		resp.Diagnostics.AddAttributeError(path.Root("vcpus"), "Incomplete sizes",
+			"vcpus, memory_mb, disk_gb and storage_pool are required together when no instance_type is set")
 	}
 }
 
@@ -421,9 +491,12 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		hostname = &h
 	}
 
+	// The optional attributes the configuration left out are unknown in the plan, and read as "" or 0 here: the client
+	// leaves those out of the body, and the API chooses them.
 	vm, _, err := r.client.CreateVm(ctx, client.VmCreateRequest{
 		Name:           plan.Name.ValueString(),
 		Image:          plan.Image.ValueString(),
+		InstanceType:   plan.InstanceType.ValueString(),
 		VCPUs:          int(plan.VCPUs.ValueInt64()),
 		MemoryMB:       int(plan.MemoryMB.ValueInt64()),
 		DiskGB:         int(plan.DiskGB.ValueInt64()),

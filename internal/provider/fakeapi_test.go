@@ -1350,9 +1350,10 @@ func (b *bodyCheck) finish() []wireFieldError {
 
 // --- VM handlers -----------------------------------------------------------
 
-// vmCreateIn holds the create body. Hostname and InstanceType are plain
-// strings -- empty meaning not given -- on purpose: the idempotency digest is
-// fmt.Sprintf("%+v", req), which would print a pointer as an address.
+// vmCreateIn holds the create body. The optional fields -- Hostname, InstanceType, StoragePool, NetworkProfile and the
+// three sizes -- are plain values, empty or zero meaning not given, on purpose: the idempotency digest is
+// fmt.Sprintf("%+v", req), which would print a pointer as an address. (The API reads an empty string as a pool that was
+// named; no test sends one, and the client leaves a zero value out of the body.)
 type vmCreateIn struct {
 	Name, Image, StoragePool, Region, NetworkProfile, WorkloadType string
 	Hostname, InstanceType                                         string
@@ -1366,12 +1367,12 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 	in := vmCreateIn{
 		Name:           b.str("name", true, 1, 80),
 		Image:          b.str("image", true, 0, 0),
-		VCPUs:          b.integer("vcpus", true, 1),
-		MemoryMB:       b.integer("memory_mb", true, 256),
-		DiskGB:         b.integer("disk_gb", true, 1),
-		StoragePool:    b.str("storage_pool", true, 0, 0),
+		VCPUs:          b.integer("vcpus", false, 1),
+		MemoryMB:       b.integer("memory_mb", false, 256),
+		DiskGB:         b.integer("disk_gb", false, 1),
+		StoragePool:    strOrEmpty(b.nullableStr("storage_pool")),
 		Region:         b.str("region", true, 0, 0),
-		NetworkProfile: b.str("network_profile", true, 0, 0),
+		NetworkProfile: strOrEmpty(b.nullableStr("network_profile")),
 		WorkloadType:   b.str("workload_type", false, 0, 0),
 		Hostname:       strOrEmpty(b.nullableStr("hostname")),
 		InstanceType:   strOrEmpty(b.nullableStr("instance_type")),
@@ -1433,7 +1434,8 @@ const (
 // createVm follows compute.py create_vm's gate order: body validation, then
 // user_data (before the key is claimed), then -- TF7 -- the SSH-key flag
 // (a non-empty ssh_keys while the keystore is off is 503 not_ready, also
-// before the key is claimed), then the Idempotency-Key claim, then
+// before the key is claimed), then the shape of the sizes (_check_create_shape,
+// also before the key), then the Idempotency-Key claim, then
 // create_vm_request's own checks, which resolve ssh_keys against the keystore.
 func (f *fakeAPI) createVm(rc *reqCtx) {
 	req, errs := decodeVmCreate(rc.r.Body)
@@ -1451,6 +1453,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 
 	if len(req.SSHKeys) > 0 && f.sshKeysOff {
 		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", detailSshKeysOff)
+		return
+	}
+
+	if !checkCreateShape(rc, req) {
 		return
 	}
 
@@ -1489,6 +1495,11 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			return
 		}
 		rc.unprocessable("workload_not_allowed", "a customer account cannot request infra workloads")
+		return
+	}
+	// What the type or the defaults fill in, decided before the name is judged like create_vm_request does.
+	sizes, ok := resolveCreateSizes(rc, req)
+	if !ok {
 		return
 	}
 	for _, existing := range f.vms {
@@ -1542,12 +1553,12 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			Hostname:         hostname,
 			InstanceType:     instanceType,
 			Image:            wireImageRef{ImageID: imageID, Name: req.Image},
-			VCPUs:            req.VCPUs,
-			MemoryMB:         req.MemoryMB,
-			DiskGB:           req.DiskGB,
-			StoragePoolID:    req.StoragePool,
+			VCPUs:            sizes.vcpus,
+			MemoryMB:         sizes.memoryMB,
+			DiskGB:           sizes.diskGB,
+			StoragePoolID:    sizes.pool,
 			WorkloadType:     "customer",
-			NetworkProfileID: req.NetworkProfile,
+			NetworkProfileID: sizes.profile,
 			State:            "pending",
 			Status:           "pending",
 			DesiredState:     "running",
@@ -1575,6 +1586,67 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		}
 	}
 	rc.json(http.StatusAccepted, payload, "Location", location, "ETag", generationETag(vm.Generation))
+}
+
+// createChoices is what a create ends up with after the API has applied its defaults.
+type createChoices struct {
+	vcpus, memoryMB, diskGB int
+	pool, profile           string
+}
+
+// The pool and the profile the real API picks when a create names none, as the fake's region gro has them: a type is
+// built on its own pool (the offering's storage pool), and the profile is the first one the organization may use.
+func fakeDefaultStoragePool(region string) string    { return region + "-ceph" }
+func fakeDefaultNetworkProfile(region string) string { return region + "-tenant-default" }
+
+// checkCreateShape is _check_create_shape of the customer API, which runs before the Idempotency-Key is claimed: the
+// one-of rule for how a create sizes the server. It answers the 422 itself and reports whether the create may go on.
+func checkCreateShape(rc *reqCtx, req vmCreateIn) bool {
+	given := 0
+	for _, size := range []int{req.VCPUs, req.MemoryMB, req.DiskGB} {
+		if size != 0 {
+			given++
+		}
+	}
+	switch {
+	case req.InstanceType != "" && given > 0:
+		rc.unprocessable("invalid_spec", "name an instance type or give vcpus, memory_mb and disk_gb, not both")
+	case req.InstanceType != "":
+		return true
+	case given == 0:
+		rc.unprocessable("instance_type_required", "name an instance type: see GET /v1/orgs/{org}/instance-types")
+	case given < 3 || req.StoragePool == "":
+		rc.unprocessable("invalid_spec", "vcpus, memory_mb, disk_gb and a disk_type or storage_pool are required together")
+	default:
+		return true
+	}
+	return false
+}
+
+// resolveCreateSizes is the part of create_vm_request that turns a type into its sizes and pool, and fills in the
+// profile. A type is available when it is active and sold in the region (instance_types.resolve_for_create).
+func resolveCreateSizes(rc *reqCtx, req vmCreateIn) (createChoices, bool) {
+	out := createChoices{req.VCPUs, req.MemoryMB, req.DiskGB, req.StoragePool, req.NetworkProfile}
+	if req.InstanceType != "" {
+		found := false
+		for _, it := range fakeInstanceTypes {
+			if it.ID == req.InstanceType && it.Status == "active" && containsString(it.Regions, req.Region) {
+				out.vcpus, out.memoryMB, out.diskGB, found = it.VCPUs, it.MemoryMB, it.DiskGB, true
+			}
+		}
+		if !found {
+			rc.unprocessable("instance_type_unavailable",
+				fmt.Sprintf("instance type '%s' is not available in %s", req.InstanceType, req.Region))
+			return out, false
+		}
+		if out.pool == "" {
+			out.pool = fakeDefaultStoragePool(req.Region)
+		}
+	}
+	if out.profile == "" {
+		out.profile = fakeDefaultNetworkProfile(req.Region)
+	}
+	return out, true
 }
 
 // hostnameTaken reports whether a live instance of f.org other than exceptID
@@ -3693,9 +3765,9 @@ func TestFakeAPI_NewVmFieldsMatchTheContract(t *testing.T) {
 	if typed["instance_type"] != "general.small" {
 		t.Errorf("typed- instance_type = %v, want general.small", typed["instance_type"])
 	}
-	given := strings.Replace(testValidVmJS, `"name":"web-01"`, `"name":"sized-web","instance_type":"general.large"`, 1)
-	if got := createVmVia(t, f, "good-key", given).get("vm")["instance_type"]; got != "general.large" {
-		t.Errorf("instance_type from the body = %v, want general.large", got)
+	given := `{"name":"sized-web","image":"image-1","region":"gro","instance_type":"g1-medium"}`
+	if got := createVmVia(t, f, "good-key", given).get("vm")["instance_type"]; got != "g1-medium" {
+		t.Errorf("instance_type from the body = %v, want g1-medium", got)
 	}
 }
 
