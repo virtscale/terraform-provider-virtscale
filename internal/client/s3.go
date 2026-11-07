@@ -128,8 +128,8 @@ func (c *Client) WaitBucket(ctx context.Context, id string, pollEvery time.Durat
 }
 
 // AccessKey is the AccessKeyOut representation: a key's metadata, never its secret. State is requested,
-// provisioning, active, revoking, revoked or degraded. RgwAccessKeyID is the public half of the credential; nil while it
-// is still being issued.
+// provisioning, active, revoking, revoked or degraded. RgwAccessKeyID is the public half of the credential: the API mints
+// the key before it answers, so a key is created active with it set.
 type AccessKey struct {
 	ID             string    `json:"id"`
 	State          string    `json:"state"`
