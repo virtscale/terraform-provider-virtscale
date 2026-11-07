@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -233,7 +234,11 @@ func (r *InstanceResource) Metadata(_ context.Context, req resource.MetadataRequ
 // (RequiresReplaceIfConfigured): a value left out of the configuration is the API's to choose, not a change.
 func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
-		Description: "A VirtScale compute instance (VM).",
+		Description: "A VirtScale compute instance (VM).\n\n" +
+			"An instance resized outside Terraform keeps its instance_type in the API. If the configuration names only " +
+			"instance_type, the next refresh shows the new vcpus and memory_mb in state but plans no change. To manage " +
+			"the sizes, set vcpus, memory_mb, disk_gb and storage_pool in the configuration instead of instance_type; a " +
+			"size that then differs from the configuration plans a replacement.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,
@@ -286,6 +291,8 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"instance that has one keeps it when the line is removed. A different type replaces the " +
 					"instance. The platform may require a type, in which case it refuses vcpus, memory_mb and " +
 					"disk_gb with 422 instance_type_required.",
+				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 					stringplanmodifier.RequiresReplaceIfConfigured(),
@@ -326,6 +333,8 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"API uses the type's own pool; with vcpus, memory_mb and disk_gb it is required. State holds the " +
 					"pool the instance is on. Naming a different pool replaces the instance; removing the line keeps " +
 					"the pool.",
+				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 					stringplanmodifier.RequiresReplaceIfConfigured(),
@@ -338,6 +347,8 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"profile your organization may use in the region on the hosts the instance is placed on. State " +
 					"holds the profile the instance is on. Naming a different profile replaces the instance; " +
 					"removing the line keeps the profile.",
+				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 					stringplanmodifier.RequiresReplaceIfConfigured(),
