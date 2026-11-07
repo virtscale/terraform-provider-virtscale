@@ -276,6 +276,32 @@ func TestAccInstanceDefaults_ImpossibleShapesAreRefusedAtPlanTime(t *testing.T) 
 	}
 }
 
+// An empty string is not a choice: it would plan a create and then fail with "inconsistent result after apply", because
+// the API answers with the value it picked. It is refused at plan time instead.
+func TestAccInstanceDefaults_AnEmptyTypePoolOrProfileIsRefusedAtPlanTime(t *testing.T) {
+	cases := []struct{ attr, lines string }{
+		{"instance_type", `instance_type = ""`},
+		{"storage_pool", "instance_type = \"g1-small\"\n  storage_pool  = \"\""},
+		{"network_profile", "instance_type = \"g1-small\"\n  network_profile = \"\""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.attr, func(t *testing.T) {
+			fake := newFakeAPI(t, "test-api-key", testOrgID)
+			resource.Test(t, resource.TestCase{
+				PreCheck:                 func() { testAccPreCheck(t) },
+				ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+				Steps: []resource.TestStep{{
+					Config:      testAccInstanceBare(fake, "empty-value", "gro", tc.lines),
+					ExpectError: wrapSafe("Attribute " + tc.attr + " string length must be at least 1, got: 0"),
+				}},
+			})
+			if n := fake.CallCount("POST compute/instances"); n != 0 {
+				t.Errorf("an empty %s sent %d create request(s), want 0", tc.attr, n)
+			}
+		})
+	}
+}
+
 // What the API decides stays the API's: a type it does not know, or does not sell in the region, is its 422.
 func TestAccInstanceDefaults_TheAPIsRefusalsAreShown(t *testing.T) {
 	cases := []struct{ name, region, instanceType, want string }{
