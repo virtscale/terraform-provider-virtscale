@@ -2,12 +2,12 @@
 page_title: "virtscale_s3_bucket Resource - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the bucket is active. Deleting a bucket is a soft delete: it is cut off at once, its data is kept for a retention window (7 days), and the organization's bucket slot is freed. Its name stays taken until the platform purges it; the platform's purge worker may be switched off, and then it is never purged. Needs an API key with the storage:write (or write) scope.
+  An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the bucket is active. Deleting a bucket is a soft delete: it is marked deleting_soft at once, and a worker cuts off access to it afterwards (not instantly, and not guaranteed), its data is kept for a retention window (7 days) and then purged (production's purge worker is on), and the organization's bucket slot is freed. Its name stays taken until it is purged. Needs an API key with the storage:write (or write) scope.
 ---
 
 # virtscale_s3_bucket (Resource)
 
-An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the bucket is active. Deleting a bucket is a soft delete: it is cut off at once, its data is kept for a retention window (7 days), and the organization's bucket slot is freed. Its name stays taken until the platform purges it; the platform's purge worker may be switched off, and then it is never purged. Needs an API key with the storage:write (or write) scope.
+An object-storage bucket. It is created, resized and deleted asynchronously: apply waits until the bucket is active. Deleting a bucket is a soft delete: it is marked deleting_soft at once, and a worker cuts off access to it afterwards (not instantly, and not guaranteed), its data is kept for a retention window (7 days) and then purged (production's purge worker is on), and the organization's bucket slot is freed. Its name stays taken until it is purged. Needs an API key with the storage:write (or write) scope.
 
 ## Example Usage
 
