@@ -626,3 +626,7 @@ printf 'header = "PRIVATE-TOKEN: %s"\n' "$GITLAB_TOKEN" | curl -sS -K - -X POST 
 
 - API reference: <https://learn.virtscale.nl>
 - Releasing: [RELEASING.md](RELEASING.md)
+
+## License
+
+License: MPL-2.0 (see [LICENSE](LICENSE)).
