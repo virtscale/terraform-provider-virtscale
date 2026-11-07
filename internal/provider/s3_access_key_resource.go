@@ -186,7 +186,8 @@ func (r *S3AccessKeyResource) Update(ctx context.Context, req resource.UpdateReq
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
-// Delete revokes the key and waits until it reads revoked. A key the API does not know any more is revoked already.
+// Delete revokes the key and waits until it reads revoked. A key the API does not know any more, or that is already
+// revoked, is done; a key somebody else is revoking (409 access_key_already_revoking) is waited for until it reads revoked.
 func (r *S3AccessKeyResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state s3AccessKeyModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -200,10 +201,16 @@ func (r *S3AccessKeyResource) Delete(ctx context.Context, req resource.DeleteReq
 	}
 	id := state.ID.ValueString()
 	if _, err := r.client.RevokeAccessKey(ctx, id, key); err != nil {
-		if !client.IsNotFound(err, client.ResourceAccessKey) {
+		switch {
+		case client.IsNotFound(err, client.ResourceAccessKey):
+			return // the key is not listed any more: revoked already
+		case apiConflict(err, "access_key_already_revoked"):
+			return // the key is revoked already
+		case !apiConflict(err, "access_key_already_revoking"):
 			resp.Diagnostics.AddError("Unable to Revoke Access Key", apiErrorDetail(err))
+			return
 		}
-		return
+		// someone else is revoking the key: wait until it reads revoked
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
 	defer cancel()

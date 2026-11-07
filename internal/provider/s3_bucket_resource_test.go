@@ -153,7 +153,7 @@ func TestAccS3BucketResource_NamesTheAPIWouldRefuseAreRefusedAtPlanTime(t *testi
 		"10.0.0.1":    "dots are not permitted",
 		"-lead":       "start and end",
 		"admin":       "reserved by the platform",
-		"vs-logs":     `starting with "vs-"`,
+		"vs-logs":     `starting with 'vs-'`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			resource.Test(t, resource.TestCase{
@@ -200,7 +200,7 @@ resource "virtscale_s3_bucket" "two" {
   depends_on = [virtscale_s3_bucket.one]
 }
 `,
-			ExpectError: wrapSafeInOrder("422 bucket_limit_reached", "already has 1 of its 1 buckets"),
+			ExpectError: wrapSafeInOrder("422 bucket_limit_reached", "already has 1 of its 1 bucket; delete one or upgrade the plan"),
 		}},
 	})
 }
@@ -259,7 +259,7 @@ func TestAccS3BucketResource_ASoftDeletedBucketKeepsItsNameForTheRetentionWindow
 			{
 				PreConfig:   func() { fake.ForceSoftDeleteBucket(id) },
 				Config:      config,
-				ExpectError: wrapSafeInOrder("409 bucket_already_exists", "already has a bucket named \"tf-bucket-h\""),
+				ExpectError: wrapSafeInOrder("409 bucket_already_exists", "already has a bucket named 'tf-bucket-h'"),
 			},
 		},
 	})

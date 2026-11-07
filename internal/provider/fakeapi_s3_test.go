@@ -15,8 +15,11 @@ import (
 
 // The S3 surface (routes/buckets.py, routes/access_keys.py of s3-control-plane 87607618): buckets are created, resized and
 // soft-deleted asynchronously (202 and an operation, the bucket row says where it stands), an access key is minted
-// synchronously (201) and its secret is in that one answer, never again. Shapes are BucketOut, BucketAccepted,
-// AccessKeyOut, AccessKeyCreated and AccessKeyAccepted of customer-v1.json.
+// synchronously (201, born active with its key id, and an operation that is already succeeded) and its secret is in that one
+// answer, never again. Shapes are BucketOut, BucketAccepted, AccessKeyOut, AccessKeyCreated and AccessKeyAccepted of
+// customer-v1.json. The refusals follow domain/buckets.py and domain/access_keys.py in code, sentence and order (the 409s of
+// a repeated or ill-timed delete and revoke, the slot and retention ceilings before the name rules); what is not modelled is
+// the operation_in_flight gate, the billing and enrollment gates, and the 24-hour replay of a stored refusal.
 
 type wireBucketQuota struct {
 	MaxObjects   *int64 `json:"max_objects"`
@@ -172,7 +175,8 @@ var (
 )
 
 // fakeBucketNameProblem is domain/naming.py validate_bucket_name for a name of 3 to 63 characters (the request model
-// has refused the others): the code and sentence of the first rule it breaks, or "".
+// has refused the others): the code and sentence of the first rule it breaks, or "". The API quotes with Python's repr, so
+// with single quotes.
 func fakeBucketNameProblem(name string) (code, detail string) {
 	switch {
 	case strings.Contains(name, "."):
@@ -184,12 +188,12 @@ func fakeBucketNameProblem(name string) (code, detail string) {
 	}
 	for _, reserved := range []string{"admin", "api", "www", "internal", "system", "backup", "billing", "metrics", "health"} {
 		if name == reserved {
-			return "bucket_name_reserved", fmt.Sprintf("the bucket name %q is reserved by the platform", name)
+			return "bucket_name_reserved", fmt.Sprintf("the bucket name '%s' is reserved by the platform", name)
 		}
 	}
 	for _, prefix := range []string{"virtscale-", "vs-", "s3-", "rgw-", "admin-", "internal-", "system-"} {
 		if strings.HasPrefix(name, prefix) {
-			return "bucket_name_reserved", fmt.Sprintf("bucket names starting with %q are reserved by the platform", prefix)
+			return "bucket_name_reserved", fmt.Sprintf("bucket names starting with '%s' are reserved by the platform", prefix)
 		}
 	}
 	return "", ""
@@ -222,29 +226,58 @@ func (f *fakeAPI) createBucket(rc *reqCtx) {
 	if replied {
 		return
 	}
-	if code, detail := fakeBucketNameProblem(name); code != "" {
-		rc.problem(http.StatusBadRequest, code, "Invalid request", detail)
-		return
-	}
+	// create_bucket checks in this order: the slot limit, the retention ceiling, the name rules, and last the name being
+	// taken (uq_buckets_org_id_name_live). A soft-deleted bucket holds no slot but still counts as a row, and keeps its
+	// name; a purged or deleted one gives all three up. A purging bucket holds a slot (its erasure sentence is not modelled).
 	limit := s.maxBuckets
 	if limit == 0 {
 		limit = 3
 	}
-	live := 0
+	slots, rows, soft := 0, 0, 0
+	var due *time.Time
 	for _, x := range s.buckets {
-		// uq_buckets_org_id_name_live: only a purged or deleted bucket gives its name up; a soft-deleted one keeps it
-		// for the retention window. A soft-deleted bucket no longer holds one of the organization's slots.
-		if x.State != "purged" && x.State != "deleted" && x.Name == name {
-			rc.conflict("bucket_already_exists", fmt.Sprintf("this organization already has a bucket named %q", name))
-			return
+		if x.State == "purged" || x.State == "deleted" {
+			continue
 		}
-		if x.State != "deleting_soft" && x.State != "purging" && x.State != "purged" && x.State != "deleted" {
-			live++
+		rows++
+		if x.State != "deleting_soft" {
+			slots++
+			continue
+		}
+		soft++
+		if x.PurgeAfter != nil && (due == nil || x.PurgeAfter.Before(*due)) {
+			due = x.PurgeAfter
 		}
 	}
-	if live >= limit {
-		rc.unprocessable("bucket_limit_reached", fmt.Sprintf("this organization already has %d of its %d buckets", live, limit))
+	if slots >= limit {
+		noun, deletes := "buckets", "one"
+		if limit == 1 {
+			noun = "bucket"
+		}
+		if over := slots - limit; over > 0 {
+			deletes = fmt.Sprintf("%d of them", over+1)
+		}
+		rc.unprocessable("bucket_limit_reached", fmt.Sprintf("this organization already has %d of its %d %s; delete %s or upgrade the plan", slots, limit, noun, deletes))
 		return
+	}
+	if ceiling := 2 * limit; rows >= ceiling { // the purge worker runs in production, so the sentence names the oldest erasure
+		erasure := " (none of them currently carries a purge date)"
+		if due != nil {
+			erasure = ", the oldest eligible for erasure from " + due.UTC().Format("2006-01-02T15:04:05.000000-07:00")
+		}
+		rc.unprocessable("bucket_retention_limit_reached", fmt.Sprintf("this organization holds %d buckets against a ceiling of %d (%d of them soft-deleted but not yet erased%s); "+
+			"restore one of those instead of creating a new bucket, or ask VirtScale support to raise this organization's bucket limit", rows, ceiling, soft, erasure))
+		return
+	}
+	if code, detail := fakeBucketNameProblem(name); code != "" {
+		rc.problem(http.StatusBadRequest, code, "Invalid request", detail)
+		return
+	}
+	for _, x := range s.buckets {
+		if x.State != "purged" && x.State != "deleted" && x.Name == name {
+			rc.conflict("bucket_already_exists", fmt.Sprintf("this organization already has a bucket named '%s'", name))
+			return
+		}
 	}
 	s.bucketSeq++
 	id := fakeUUID(8, s.bucketSeq)
@@ -302,7 +335,8 @@ func (f *fakeAPI) listBuckets(rc *reqCtx) {
 	rc.json(http.StatusOK, wireList[wireBucketOut]{Items: items})
 }
 
-// putBucketQuota is PUT .../quota: an omitted dimension is left alone, an explicit null clears it; the answer is 202.
+// putBucketQuota is PUT .../quota: an omitted dimension is left alone, an explicit null clears it; the answer is 202. Only
+// an active or degraded bucket can be resized.
 func (f *fakeAPI) putBucketQuota(rc *reqCtx, id string) {
 	raw, _ := io.ReadAll(rc.r.Body)
 	f.mu.Lock()
@@ -341,8 +375,12 @@ func (f *fakeAPI) putBucketQuota(rc *reqCtx, id string) {
 		rc.notFound("bucket")
 		return
 	}
+	if bk.State != "active" && bk.State != "degraded" { // RESIZABLE_STATES, checked before the ceiling
+		rc.conflict("bucket_not_resizable", fmt.Sprintf("a bucket in state '%s' cannot have its quota changed", bk.State))
+		return
+	}
 	if size != nil && *size > 1<<40 {
-		rc.unprocessable("bucket_quota_exceeds_plan", "that quota is above your plan's ceiling")
+		rc.unprocessable("bucket_quota_exceeds_plan", fmt.Sprintf("the requested max_size_bytes of %d is above this organization's ceiling of %d; upgrade the plan or request an override", *size, int64(1)<<40))
 		return
 	}
 	if sizeSet {
@@ -360,8 +398,9 @@ func (f *fakeAPI) putBucketQuota(rc *reqCtx, id string) {
 	rc.json(http.StatusAccepted, accepted, "Location", location)
 }
 
-// deleteBucket is a soft delete: the bucket enters deleting_soft with a retention window and stays readable; a
-// non-empty one is 409 bucket_not_empty unless force=true.
+// deleteBucket is a soft delete: the bucket enters deleting_soft with a retention window and stays readable. One that is
+// already deleting_soft is 409 bucket_already_deleting, one that is still being built or is being erased is 409
+// bucket_not_deletable, and a non-empty one is 409 bucket_not_empty unless force=true.
 func (f *fakeAPI) deleteBucket(rc *reqCtx, id string) {
 	force := rc.r.URL.Query().Get("force") == "true"
 	f.mu.Lock()
@@ -377,6 +416,15 @@ func (f *fakeAPI) deleteBucket(rc *reqCtx, id string) {
 		return
 	}
 	s.deletes = append(s.deletes, fmt.Sprintf("%s force=%t", b.Name, force))
+	switch b.State {
+	case "active", "suspended", "provision_failed", "degraded":
+	case "deleting_soft":
+		rc.conflict("bucket_already_deleting", "this bucket is already scheduled for deletion; use restore to cancel")
+		return
+	default:
+		rc.conflict("bucket_not_deletable", fmt.Sprintf("a bucket in state '%s' cannot be deleted", b.State))
+		return
+	}
 	if b.nonEmpty && !force {
 		rc.conflict("bucket_not_empty", "the bucket holds objects: pass force=true to soft-delete it anyway")
 		return
@@ -411,32 +459,28 @@ func (f *fakeAPI) createAccessKey(rc *reqCtx) {
 	s.keySeq++
 	id := fakeUUID(9, s.keySeq)
 	now := time.Now().UTC()
-	k := &fakeAccessKey{wireAccessKeyOut: wireAccessKeyOut{ID: id, State: "requested", CreatedAt: now, UpdatedAt: now}}
+	rgw := "AKIA" + id[len(id)-8:]
+	k := &fakeAccessKey{wireAccessKeyOut: wireAccessKeyOut{ID: id, State: "active", RgwAccessKeyID: &rgw, LastRotatedAt: &now, CreatedAt: now, UpdatedAt: now}}
 	s.keys[id] = k
 	op := f.newOperation("access_key.create", "access_key", id, now)
+	op.State, op.FinishedAt = "succeeded", &now
 	secret := s.secret
 	if secret == "" {
 		secret = fmt.Sprintf("fake-secret-%d", s.keySeq)
 	}
 	s.secret = ""
 	created := wireAccessKeyCreated{AccessKey: k.wireAccessKeyOut, Operation: op, SecretAccessKey: &secret}
-	location := f.operationLocation(op)
-	// The stored replay has the secret stripped (domain/access_keys.py).
+	// The stored replay has the secret stripped (domain/access_keys.py). The create sends no Location: its operation is done.
 	replay := created
 	replay.SecretAccessKey = nil
-	f.idemKeep(storeKey, digest, http.StatusCreated, replay, location, "")
-	rc.json(http.StatusCreated, created, "Location", location)
+	f.idemKeep(storeKey, digest, http.StatusCreated, replay, "", "")
+	rc.json(http.StatusCreated, created)
 }
 
+// advanceAccessKey moves a revoking key one step per read, to revoked (or degraded for a revoke that was made to fail). A
+// key is born active: there is no create lifecycle to walk through.
 func advanceAccessKey(k *fakeAccessKey) {
-	switch k.State {
-	case "requested":
-		k.State = "provisioning"
-	case "provisioning":
-		k.State = "active"
-		id := "AKIA" + k.ID[len(k.ID)-8:]
-		k.RgwAccessKeyID = &id
-	case "revoking":
+	if k.State == "revoking" {
 		if k.stepsLeft--; k.stepsLeft <= 0 {
 			k.State = "revoked"
 			if k.failRevoke {
@@ -471,9 +515,19 @@ func (f *fakeAPI) revokeAccessKey(rc *reqCtx, id string) {
 		rc.notFound("access key")
 		return
 	}
-	if k.State != "revoked" && k.State != "revoking" {
-		k.State, k.stepsLeft = "revoking", 2
+	switch k.State {
+	case "active", "degraded": // a failed revoke lands in degraded, and may be asked again
+	case "revoked":
+		rc.conflict("access_key_already_revoked", "this access key has already been revoked")
+		return
+	case "revoking":
+		rc.conflict("access_key_already_revoking", "this access key is already being revoked; poll its operation")
+		return
+	default:
+		rc.conflict("access_key_not_revocable", fmt.Sprintf("an access key in state '%s' cannot be revoked", k.State))
+		return
 	}
+	k.State, k.stepsLeft = "revoking", 2
 	op := f.newOperation("access_key.revoke", "access_key", id, time.Now().UTC())
 	accepted := wireAccessKeyAccepted{AccessKey: k.wireAccessKeyOut, Operation: op}
 	location := f.operationLocation(op)
@@ -530,6 +584,26 @@ func (f *fakeAPI) ForceSoftDeleteBucket(id string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if b, ok := f.s3().buckets[id]; ok {
-		b.State = "deleting_soft"
+		now := time.Now().UTC()
+		purge := now.Add(7 * 24 * time.Hour)
+		b.State, b.SoftDeletedAt, b.PurgeAfter = "deleting_soft", &now, &purge
+	}
+}
+
+// ForceBucketState puts the bucket in a state at once (the states the fake does not produce itself, such as purging).
+func (f *fakeAPI) ForceBucketState(id, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if b, ok := f.s3().buckets[id]; ok {
+		b.State = state
+	}
+}
+
+// StartRevokeElsewhere is a revoke another client began: the key is revoking, and reads revoked two list reads later.
+func (f *fakeAPI) StartRevokeElsewhere(id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if k, ok := f.s3().keys[id]; ok {
+		k.State, k.stepsLeft = "revoking", 2
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"regexp"
 	"strings"
 	"time"
@@ -90,11 +91,11 @@ func (bucketNameValidator) ValidateString(_ context.Context, req validator.Strin
 	case !bucketNameRE.MatchString(name):
 		problem = "bucket names may contain only lowercase letters, digits and hyphens, and must start and end with a letter or digit"
 	case reservedBucketNames[name]:
-		problem = fmt.Sprintf("the bucket name %q is reserved by the platform", name)
+		problem = fmt.Sprintf("the bucket name '%s' is reserved by the platform", name)
 	default:
 		for _, prefix := range reservedBucketPrefixes {
 			if strings.HasPrefix(name, prefix) {
-				problem = fmt.Sprintf("bucket names starting with %q are reserved by the platform", prefix)
+				problem = fmt.Sprintf("bucket names starting with '%s' are reserved by the platform", prefix)
 				break
 			}
 		}
@@ -198,6 +199,12 @@ func bucketGone(state string) bool {
 		return true
 	}
 	return false
+}
+
+// apiConflict reports whether err is a 409 with the given code.
+func apiConflict(err error, code string) bool {
+	var apiErr *client.APIError
+	return errors.As(err, &apiErr) && apiErr.Status == http.StatusConflict && apiErr.Code == code
 }
 
 // quotaChange is the PUT that takes the bucket from have to want; changed is false when they are the same.
@@ -395,7 +402,8 @@ func (r *S3BucketResource) Update(ctx context.Context, req resource.UpdateReques
 }
 
 // Delete soft-deletes the bucket. A bucket that holds objects is refused with 409 bucket_not_empty unless force_destroy
-// acknowledges it. The bucket 404 means it is gone already.
+// acknowledges it. A bucket the API does not know any more is gone already, and a 409 bucket_already_deleting says it is
+// already being deleted: the destroy waits until it reads gone.
 func (r *S3BucketResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
 	var state s3BucketModel
 	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
@@ -411,7 +419,19 @@ func (r *S3BucketResource) Delete(ctx context.Context, req resource.DeleteReques
 		_, e := r.client.DeleteBucket(ctx, state.ID.ValueString(), state.ForceDestroy.ValueBool(), key)
 		return e
 	})
-	if err != nil && !client.IsNotFound(err, client.ResourceBucket) {
+	switch {
+	case err == nil || client.IsNotFound(err, client.ResourceBucket):
+		// gone already
+	case apiConflict(err, "bucket_already_deleting"):
+		// someone else deleted the bucket: wait until it reads gone
+		waitCtx, cancel := context.WithTimeout(ctx, deleteTimeout)
+		defer cancel()
+		if _, waitErr := r.client.WaitBucket(waitCtx, state.ID.ValueString(), pollInterval, func(b *client.Bucket) (bool, error) {
+			return b == nil || bucketGone(b.State), nil
+		}); waitErr != nil {
+			resp.Diagnostics.AddError("Unable to Wait for the Bucket to Be Deleted", waitErr.Error())
+		}
+	default:
 		detail := apiErrorDetail(err)
 		var apiErr *client.APIError
 		if errors.As(err, &apiErr) && apiErr.Code == "bucket_not_empty" {

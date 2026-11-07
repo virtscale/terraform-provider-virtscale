@@ -34,7 +34,7 @@ func replaced(addr string) resource.ConfigPlanChecks {
 func TestAccS3BucketResource_ARefusedCeilingLeavesTheBucketInStateWithoutCeilings(t *testing.T) {
 	fake, cfg := s3Fake(t)
 	fake.FailNext(1, matchRoute(http.MethodPut, "/quota"), func(rc *reqCtx) {
-		rc.unprocessable("bucket_quota_exceeds_plan", "that quota is above your plan's ceiling")
+		rc.unprocessable("bucket_quota_exceeds_plan", "the requested max_objects of 10 is above this organization's ceiling of 5; upgrade the plan or request an override")
 	})
 	config := cfg(bucketBlock("tf-bucket-q", "  max_objects = 10\n"))
 	resource.Test(t, resource.TestCase{
@@ -174,7 +174,7 @@ func TestAccS3BucketResource_AFailedCeilingUpdateIsReported(t *testing.T) {
 			{
 				PreConfig: func() {
 					fake.FailNext(1, matchRoute(http.MethodPut, "/quota"), func(rc *reqCtx) {
-						rc.unprocessable("bucket_quota_exceeds_plan", "that quota is above your plan's ceiling")
+						rc.unprocessable("bucket_quota_exceeds_plan", "the requested max_objects of 6 is above this organization's ceiling of 5; upgrade the plan or request an override")
 					})
 				},
 				Config:      cfg(bucketBlock("tf-bucket-y", "  max_objects = 6\n")),
