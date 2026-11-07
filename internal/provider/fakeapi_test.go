@@ -45,6 +45,7 @@ type fakeAPI struct {
 	// ps is the projects and VPCs (fakeapi_projects_test.go), fws the firewalls (fakeapi_firewall_test.go).
 	ps  projectState
 	fws firewallState
+	s3s s3State
 
 	// contract checks every exchange with the provider's client against customer-v1.json (internal/contract);
 	// a mismatch fails t.
@@ -902,6 +903,14 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key = "compute/images"
 	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types", rest == "projects":
 		key = rest
+	case rest == "s3/buckets", rest == "s3/access-keys":
+		key = rest
+	case len(parts) == 3 && parts[0] == "s3" && parts[1] == "buckets":
+		key, param, id = "s3/buckets/{bucket_id}", "bucket_id", parts[2]
+	case len(parts) == 4 && parts[0] == "s3" && parts[1] == "buckets" && parts[3] == "quota":
+		key, param, id = "s3/buckets/{bucket_id}/quota", "bucket_id", parts[2]
+	case len(parts) == 3 && parts[0] == "s3" && parts[1] == "access-keys":
+		key, param, id = "s3/access-keys/{key_id}", "key_id", parts[2]
 	case len(parts) == 2 && parts[0] == "projects":
 		key, param, id = "projects/{project}", "project", parts[1]
 	case rest == "compute/public-ips":
@@ -922,6 +931,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
 		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
 		"GET compute/instances/{vm_id}/firewall", "PUT compute/instances/{vm_id}/firewall",
+		"GET s3/buckets", "POST s3/buckets", "GET s3/buckets/{bucket_id}", "DELETE s3/buckets/{bucket_id}", "PUT s3/buckets/{bucket_id}/quota",
+		"GET s3/access-keys", "POST s3/access-keys", "DELETE s3/access-keys/{key_id}",
 		"GET projects", "POST projects", "GET projects/{project}", "PATCH projects/{project}", "DELETE projects/{project}",
 		"GET compute/public-ips", "POST compute/public-ips", "DELETE compute/public-ips/{public_ip_id}",
 		"POST compute/public-ips/{public_ip_id}/associate", "POST compute/public-ips/{public_ip_id}/disassociate",
@@ -960,6 +971,14 @@ var routePermissions = map[string]string{
 	"GET instance-types":                                  "compute.instance_type.list",
 	"GET compute/instances/{vm_id}/firewall":              "network.read",
 	"PUT compute/instances/{vm_id}/firewall":              "network.firewall.update",
+	"GET s3/buckets":                                      "storage.bucket.list",
+	"POST s3/buckets":                                     "storage.bucket.create",
+	"GET s3/buckets/{bucket_id}":                          "storage.bucket.read",
+	"DELETE s3/buckets/{bucket_id}":                       "storage.bucket.delete",
+	"PUT s3/buckets/{bucket_id}/quota":                    "storage.quota.update",
+	"GET s3/access-keys":                                  "storage.access_key.list",
+	"POST s3/access-keys":                                 "storage.access_key.create",
+	"DELETE s3/access-keys/{key_id}":                      "storage.access_key.revoke",
 	"GET projects":                                        "project.list",
 	"POST projects":                                       "project.create",
 	"GET projects/{project}":                              "project.read",
@@ -992,7 +1011,7 @@ func scopeGrants(scope, perm string) bool {
 		return !strings.HasPrefix(perm, "iam.")
 	case "read":
 		return !strings.HasPrefix(perm, "iam.") && isRead
-	case "compute:read", "compute:write", "network:read", "network:write":
+	case "compute:read", "compute:write", "network:read", "network:write", "storage:read", "storage:write":
 		if perm == "org.read" {
 			return true
 		}
@@ -1002,8 +1021,11 @@ func scopeGrants(scope, perm string) bool {
 		}
 		family, half, _ := strings.Cut(scope, ":")
 		prefixes := []string{"compute.", "operation."}
-		if family == "network" {
+		switch family {
+		case "network":
 			prefixes = []string{"network.", "edge."}
+		case "storage":
+			prefixes = []string{"storage."}
 		}
 		for _, prefix := range prefixes {
 			if strings.HasPrefix(perm, prefix) {
@@ -1113,6 +1135,22 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.listPlans(rc)
 	case "GET instance-types":
 		f.listInstanceTypes(rc)
+	case "POST s3/buckets":
+		f.createBucket(rc)
+	case "GET s3/buckets":
+		f.listBuckets(rc)
+	case "GET s3/buckets/{bucket_id}":
+		f.getBucket(rc, id)
+	case "DELETE s3/buckets/{bucket_id}":
+		f.deleteBucket(rc, id)
+	case "PUT s3/buckets/{bucket_id}/quota":
+		f.putBucketQuota(rc, id)
+	case "POST s3/access-keys":
+		f.createAccessKey(rc)
+	case "GET s3/access-keys":
+		f.listAccessKeys(rc)
+	case "DELETE s3/access-keys/{key_id}":
+		f.revokeAccessKey(rc, id)
 	case "GET compute/instances/{vm_id}/firewall":
 		f.getFirewall(rc, id)
 	case "PUT compute/instances/{vm_id}/firewall":

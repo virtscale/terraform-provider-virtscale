@@ -191,6 +191,16 @@ const lostCreateHint = "the first request may still have created the resource: "
 const lostPatchHint = "the first request may still have been applied: " +
 	"run another plan to see the current state"
 
+// hintKey carries the recovery sentence a particular create wants instead of the generic one.
+type hintKey struct{}
+
+// withLostCreateHint makes the error of a keyed create that gives up after a lost answer say hint instead of
+// lostCreateHint: the generic one speaks of name_taken and tofu import, which is wrong for a resource that has no name
+// to collide on (an access key) or another code for it (a bucket).
+func withLostCreateHint(ctx context.Context, hint string) context.Context {
+	return context.WithValue(ctx, hintKey{}, hint)
+}
+
 // FieldError is one entry of a problem body's errors[]: which request field
 // the API refused and why.
 type FieldError struct {
@@ -490,6 +500,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 		payload = b
 	}
 
+	createHint, _ := ctx.Value(hintKey{}).(string)
 	var lastErr error
 	for attempt := 1; ; attempt++ {
 		req, err := c.newRequest(ctx, method, fullURL, payload, idempotencyKey, headers)
@@ -507,9 +518,9 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 				// theirs. An earlier attempt's API error says more than the
 				// cancellation does.
 				if lastErr != nil {
-					return giveUp(lastErr, 0, idempotencyKey, method)
+					return giveUp(lastErr, 0, idempotencyKey, method, createHint)
 				}
-				return giveUp(transportErr, 0, idempotencyKey, method)
+				return giveUp(transportErr, 0, idempotencyKey, method, createHint)
 			}
 			lastErr = transportErr
 		case ex.status >= 200 && ex.status < 300:
@@ -527,7 +538,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 		}
 
 		if attempt >= c.retry.maxAttempts || !retryable(method, idempotencyKey, ex, apiErr, transportErr) {
-			return giveUp(lastErr, attempt, idempotencyKey, method)
+			return giveUp(lastErr, attempt, idempotencyKey, method, createHint)
 		}
 		var header http.Header
 		if ex != nil {
@@ -535,13 +546,13 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 		}
 		wait, ok := c.retryDelay(attempt, header)
 		if !ok {
-			return giveUp(lastErr, attempt, idempotencyKey, method)
+			return giveUp(lastErr, attempt, idempotencyKey, method, createHint)
 		}
 		if deadline, has := ctx.Deadline(); has && c.retry.now().Add(wait).After(deadline) {
-			return giveUp(lastErr, attempt, idempotencyKey, method)
+			return giveUp(lastErr, attempt, idempotencyKey, method, createHint)
 		}
 		if err := c.retry.sleep(ctx, wait); err != nil {
-			return giveUp(lastErr, attempt, idempotencyKey, method)
+			return giveUp(lastErr, attempt, idempotencyKey, method, createHint)
 		}
 	}
 }
@@ -551,15 +562,18 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 // carries its own count) how many sends it took, and, for a request that
 // carried an Idempotency-Key, how to recover when the failure leaves open that
 // the API processed it anyway. The recovery sentence depends on the method: a
-// POST creates a resource (see lostCreateHint), while a PATCH, a PUT or a DELETE changes or
-// removes one (see lostPatchHint).
-func giveUp(err error, attempts int, idempotencyKey, method string) error {
+// POST creates a resource (see lostCreateHint, or the hint of that create), while a
+// PATCH, a PUT or a DELETE changes or removes one (see lostPatchHint).
+func giveUp(err error, attempts int, idempotencyKey, method, createHint string) error {
 	lost := idempotencyKey != "" && mayHaveBeenApplied(err)
-	// Only a POST creates something to look for; a keyed PATCH, PUT or DELETE changed or removed a resource that is in the
-	// state already, so another plan shows where it stands.
+	// Only a POST creates something to look for; a keyed PATCH, PUT or DELETE changed or removed a resource that is in
+	// the state already, so another plan shows where it stands.
 	hint := lostPatchHint
 	if method == http.MethodPost {
 		hint = lostCreateHint
+		if createHint != "" {
+			hint = createHint
+		}
 	}
 
 	var apiErr *APIError

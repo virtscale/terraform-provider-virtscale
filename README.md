@@ -17,6 +17,8 @@ from there.
 - Resource `virtscale_project`: a project, which groups servers, public IPs and networks. Data source
   `virtscale_project` finds one by name, or the organization's default project.
 - Resource `virtscale_instance_firewall`: the firewall rules of one instance.
+- Resources `virtscale_s3_bucket` (with its own size and object ceilings) and `virtscale_s3_access_key`: object
+  storage.
 - Resource `virtscale_vpc`: a VPC, a private address space in one project and one region.
 - Resource `virtscale_public_ip`: a VirtScale public IP address, optionally associated with an instance.
   The default customer quota is one public IP per region; addresses in state `error` do not count against it.
@@ -97,6 +99,7 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
 | `virtscale_vpc` (create, destroy, refresh) | `network:write`, and `compute:read` to find its project with the `virtscale_project` data source |
 | `virtscale_instance_firewall` (set, clear, refresh) | `network:write` |
+| `virtscale_s3_bucket`, `virtscale_s3_access_key` (create, change, destroy, refresh) | `storage:write` (or the older `write`) |
 | `virtscale_project` (create, rename, destroy) | `write`: `compute:write` only reads projects |
 | `virtscale_project` (data source, refresh) | `compute:read` (`compute:write` covers it too) |
 | `virtscale_images`, `virtscale_regions`, `virtscale_instance_types`, `virtscale_plans` (data sources) | `compute:read` (`compute:write` covers it too) |
@@ -108,7 +111,8 @@ A configuration with an instance and a public IP associated to it needs both `co
 
 `compute:write` covers every `compute.*` and `operation.*` permission, reads included (SSH keys are
 `compute.ssh_key.*`), and reading projects (`project.list`, `project.read`); `network:write` covers every
-`network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`, VPCs `network.vpc.*`). Creating, renaming and
+`network.*` and `edge.*` permission (public IPs are `edge.public_ip.*`, VPCs `network.vpc.*`); `storage:write` covers
+every `storage.*` permission (buckets, their ceilings and access keys). Creating, renaming and
 deleting projects (`project.create`, `project.update`, `project.delete`) is covered by the older `write` scope only. The `:read` scopes cover the `.read` and `.list` permissions of their family. The older
 all-family scopes also work: `write` for everything above, `read` for plan-only use.
 
@@ -309,11 +313,19 @@ needs the same `description` in the configuration, or the plan replaces it. Impo
 
 The whole firewall rule set of one instance. The API replaces the set as one and applies it asynchronously, so the
 resource owns all of it: a rule added in the panel shows up as a difference and is removed by the next apply. Apply
-waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. A set that
-ended in `error` is not in force, so the resource then reports no confirmed rules: the next plan shows the difference
-and the next apply sets the rules again. Destroying the resource waits for a change that is still being applied and then
-clears the rules this API lets you set (an empty set); the platform's own base rules are not part of the set. An
-instance that is gone has no rules to clear.
+waits (up to 20 minutes) until the API says `applied` and fails with its text if the set ends in `error`. The first
+`error` it sees ends the wait, although the platform retries a few times and may succeed later, so a failure can be a
+transient one: the next plan reads the state as it is. A set that ended in `error` may not be fully in force, so the
+resource then reports no confirmed rules: the next plan shows the difference, and the next apply of an update sets the
+rules again (a create that failed is tainted and replaced). A change the platform's worker gave up on (a precondition
+such as a missing network binding) can stay `pending` for good: apply then ends at the 20 minutes with `last seen: state
+pending`, and a later apply or the destroy sets the rules again, because the API only refuses a new change while an
+operation really runs. Destroying the resource asks for the empty rule set (the rules this API lets you set; the
+platform's own base rules are not part of the set) at once, asks again while another change is still being applied
+(`409 operation_in_flight`), and then waits until the empty set is applied; asking and waiting share one budget of 10
+minutes. An instance that is gone
+has no rules to clear. An instance the platform does not let you change rules for (a region policy) is refused with
+`409 vm_action_not_allowed`.
 
 **The first apply replaces whatever rules the instance already holds** (set in the panel or at creation), without a
 preview of them. To see them first, import the instance's firewall (`tofu import`, below) and run `tofu plan`: the
@@ -349,6 +361,81 @@ resource "virtscale_instance_firewall" "web" {
 ```
 
 Import by the instance's id: `tofu import virtscale_instance_firewall.web <instance id>`.
+
+### `virtscale_s3_bucket`
+
+An object-storage bucket. It is created, resized and deleted asynchronously: apply waits (up to 20 minutes) until the
+bucket is `active` and fails if it ends in `provision_failed`, `degraded` or `suspended`. The organization needs the S3
+service switched on (the panel does it), and has a limit of buckets (`422 bucket_limit_reached`).
+
+| Attribute        | Type   | Required/Computed | Notes |
+| ---------------- | ------ | ----------------- | ----- |
+| `name`           | string | Required, forces replacement | 3-63 lower-case letters, digits and hyphens, starting and ending with a letter or digit, no dots, no two hyphens in a row, and not a name (`admin`, `api`, `www`, `internal`, `system`, `backup`, `billing`, `metrics`, `health`) or a prefix (`virtscale-`, `vs-`, `s3-`, `rgw-`, `admin-`, `internal-`, `system-`) the platform keeps: checked at plan time with the API's sentences (`400 bucket_name_invalid`, `400 bucket_name_reserved`). Unique within the organization (`409 bucket_already_exists`). |
+| `versioning`     | bool   | Optional, default `false` | Keep previous versions of overwritten and deleted objects. Fixed at creation: a change is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken (below). |
+| `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
+| `max_objects`    | number | Optional | The most objects. Same rules. |
+| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it a non-empty bucket is `409 bucket_not_empty`. The provider's own: the API does not store it, so import leaves it `false`. |
+| `id`, `state`, `created_at` | string | Computed | |
+
+Deleting is a **soft delete**: the API marks the bucket `deleting_soft` and answers `202` at once, its data is kept for
+a retention window (7 days), and the plan's bucket slot is freed. Access to the bucket is cut **afterwards, by a worker**:
+the cut is not instant and not guaranteed (the worker retries and can give up, and an access key of the organization can
+undo it until the platform's reconciler writes it again), so a bucket that was just destroyed can stay reachable over S3
+for a while. A bucket in that state reads as gone, but **its name stays taken** until it is purged (`409
+bucket_already_exists` for a new bucket of that name; the panel can restore a soft-deleted bucket). **The platform's
+purge worker is on in production** (since 2026-10-27, `S3CP_BUCKET_PURGE_ENABLED=true`, not a dry run), so a soft-deleted
+bucket is erased when its 7 days are up and its name is free again; a deployment that ships the worker off (the API's
+default) never erases one. Until then the bucket keeps a retention row: the API limits the buckets an organization holds,
+live and soft-deleted, to twice its bucket limit (`422 bucket_retention_limit_reached`, which names the oldest erasure
+date), so do not create and destroy buckets in a loop. A destroy of a bucket that is already being deleted (`409
+bucket_already_deleting`) is done; one in a state that cannot be deleted (`409 bucket_not_deletable`, while it is still
+being built or erased) is an error with the API's sentence. The ceilings are applied by the object store after the API
+accepts them, and a change right after another operation of the bucket can meet `409 operation_in_flight`, which the
+provider repeats for about a minute.
+
+If a create fails after the bucket was made (the API refuses a ceiling, `422 bucket_quota_exceeds_plan`; the bucket ends
+in `provision_failed`), the bucket is in the state, tainted by the error, and the next apply would replace it, which
+cannot work because the soft-deleted bucket keeps the name. After a refused ceiling, fix it in the configuration, run
+`tofu untaint` on the bucket and apply again; after a failed build, give the bucket another name. To destroy a bucket that
+holds objects, set `force_destroy = true`, run `tofu apply` so that the setting is stored, and destroy again. Import by
+id: `tofu import virtscale_s3_bucket.logs <id>`.
+
+### `virtscale_s3_access_key`
+
+An S3 access key for the organization's storage. There is nothing to configure. **The secret is returned exactly once,
+by the request that creates the key**, so the provider keeps `secret_access_key` in the state, marked sensitive. That
+means the state holds a credential: use an encrypted backend (or OpenTofu's state encryption), and do not print the
+attribute in an output. A key's secret cannot be read back, so an imported key has none (`secret_access_key` is null).
+Destroying the resource revokes the key and waits until it reads revoked (a key that is already revoked, `409
+access_key_already_revoked`, is done, and one that is being revoked, `409 access_key_already_revoking`, is waited for;
+a key that cannot be revoked yet, `409 access_key_not_revocable`, is an error with the API's sentence). To rotate, replace the resource
+(`tofu apply -replace=virtscale_s3_access_key.app`, or `replace_triggered_by`). The key is a key on the organization's
+own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete
+window.
+
+If a create is repeated after a lost answer (a gateway error), the API answers the repeat with the stored result, which
+never holds the secret. The key exists then, so the provider keeps it in the state and fails with "Access Key Secret Not
+Returned": run `tofu destroy` (or apply again, which replaces it) to revoke it and get a new one. If the provider gives up
+before it gets any answer, the key may exist with its secret lost: look at the organization's access keys (at most 5) in the
+panel or with the API, and revoke any you did not receive. Destroying the resource revokes the key; a revoke that fails
+leaves it `degraded`, which the destroy reports at once.
+
+| Attribute           | Type   | Required/Computed | Notes |
+| ------------------- | ------ | ----------------- | ----- |
+| `id`                | string | Computed | |
+| `access_key_id`     | string | Computed | The public half, to use as the S3 access key id. An organization holds at most 5 keys (`422 access_key_limit_reached`). |
+| `secret_access_key` | string | Computed, sensitive | Known only after the create here. |
+| `state`, `created_at` | string | Computed | |
+
+Import by id: `tofu import virtscale_s3_access_key.app <id>`.
+
+### What the provider does not manage: IAM
+
+Members, invitations and API keys are managed by people, not by API keys: the `iam.*` permissions are in no key scope
+(no scope map of an API key holds them, so a key cannot mint or revoke keys or invite, change or remove members; for
+people the writes also need a fresh second factor, where the deployment enforces it). That is deliberate, so a leaked
+key cannot widen its own reach, and the provider has no resource for them. Use the panel for members and keys;
+`virtscale_caller` shows what the key you run Terraform with can do.
 
 ### `virtscale_public_ip`
 
@@ -406,7 +493,8 @@ Managed VPS plans with `id`, `name`, `vcpus`, `ram_mb`, `disk_gb`, `monthly_pric
 Unit tests (client package) run with plain `go test`. Provider and resource tests are Terraform acceptance
 tests (`terraform-plugin-testing`) against an in-process fake of the customer API; they only run with
 `TF_ACC=1` and `tofu` on `PATH`. The fake is written from the deployed API's spec and handlers
-(s3-control-plane `94f5021f`: wire shapes, error envelope, state machines, key scopes), not from the client's
+(s3-control-plane `94f5021f`, and `87607618` for the S3 buckets and access keys: wire shapes, error envelope, state
+machines, the codes, sentences and order of the refusals, key scopes), not from the client's
 own types, so a wrong field name or status in the client fails a test instead of being mirrored back. On top of
 that, every request the client sends the fake and every answer it gets back is checked against the OpenAPI document
 the provider was written against, `internal/contract/customer-v1.json` (s3-control-plane `87607618`; `SOURCE` says
@@ -427,12 +515,29 @@ go test ./... -count=1 -v
 
 ### Live acceptance (staging)
 
-`TestLiveSshKeyResource_LifecycleProof` is skipped unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`,
-`VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all set. It runs the same
-lifecycle proof as the fake-backed tests against a real API: apply creates the key, a second plan is empty,
-import by id works, and destroy removes it. The API key needs compute write scope, SSH keys must be switched
-on for that API, and the test creates one key named `tf-live-<random>` and deletes it again. The staging API
-is cluster-internal, so run it from somewhere that reaches the endpoint.
+The live tests run the same lifecycle proof as the fake-backed ones against a real API: apply creates the objects, a
+second plan is empty, an in-place update works where the resource allows one, import by id works, and destroy removes
+them. One test per family:
+
+| Test | Proves |
+| ---- | ------ |
+| `TestLiveSshKeyResource_LifecycleProof` | `virtscale_ssh_key` |
+| `TestLiveCatalogueProof` | `virtscale_caller` (its organization is the configured one), `virtscale_regions` (lists the live region), `virtscale_instance_types`, `virtscale_plans`, `virtscale_project` |
+| `TestLiveProjectResource_LifecycleProof` | `virtscale_project`: create, an empty second plan, description and labels in place, import |
+| `TestLiveVpcResource_LifecycleProof` | `virtscale_vpc` in the default project: waits for `active`, empty second plan, import as `<project>/<vpc>`, destroy waits until it is gone |
+| `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
+| `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
+
+Each has a twin against the fake (`TestAcc...AgainstTheFake`) that proves the test code in CI. A test is skipped
+unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`, `VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all
+set. It creates only objects named `tf-live-<random>` and deletes them again. The API key needs the `write` scope
+(projects), `network:write` and `compute:write` (VPCs, instances, firewalls) and `storage:write` or `write` (S3). The
+place defaults to staging's (`VIRTSCALE_LIVE_REGION=stg`, `VIRTSCALE_LIVE_STORAGE_POOL=stg-local`,
+`VIRTSCALE_LIVE_NETWORK_PROFILE=stg-tenant`; set them to run elsewhere). The staging API is cluster-internal, so run
+it from somewhere that reaches the endpoint. Staging has room for one small server at a time. A soft-deleted bucket is
+not purged while the platform's purge worker is off: it keeps its name and one of the organization's retention rows
+(twice its bucket limit in all), so do not loop the S3 test. Allow a long run: the waits for a server and a firewall are
+minutes (`-timeout 60m` below).
 
 ```bash
 TF_ACC=1 \
@@ -440,20 +545,28 @@ TF_ACC_TERRAFORM_PATH=$(command -v tofu) \
 TF_ACC_PROVIDER_NAMESPACE=virtscale \
 TF_ACC_PROVIDER_HOST=registry.terraform.io \
 VIRTSCALE_LIVE=1 VIRTSCALE_API_KEY=... VIRTSCALE_ORGANIZATION=... VIRTSCALE_ENDPOINT=... \
-go test ./internal/provider -run TestLiveSshKeyResource -count=1 -v
+go test ./internal/provider -run TestLive -count=1 -v -timeout 60m
 ```
 
-The run counts only when `-v` shows `--- PASS: TestLiveSshKeyResource_LifecycleProof` (a skip prints `ok` too). The test
-refuses the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fails at once, instead of skipping,
-when a live run is requested and `tofu` cannot be found.
+A run counts only when `-v` shows `--- PASS` for the test (a skip prints `ok` too). The tests refuse the production endpoint unless `VIRTSCALE_LIVE_ALLOW_PRODUCTION=1`, and fail at once, instead of
+skipping, when a live run is requested and `tofu` cannot be found.
 
 In CI the job `provider-staging-live` does this for you, without anyone holding the key. It exists only in a pipeline
 started through the GitLab API on `main` with the variable `PROVIDER_STAGING_LIVE=1`; a push, a merge request or a web
 click never runs it. The job logs in to OpenBao with the JWT role `provider-staging-live` (this project, protected
-`main`, API pipelines), reads the staging test org's key, runs the test above against
-`http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the token. It fails unless the log shows
-`--- PASS` for the test, withholds the log if it contains the key, and checks that the org's key list holds no more
-`tf-live-*` keys after the run than before. The script re-executes itself under `env -i` with a short allowlist of
+`main`, API pipelines), reads the staging test org's key, and runs the tests above one after another (a failed one does
+not stop the next, so a run shows which families work; the S3 one only when the pipeline is started with
+`PROVIDER_STAGING_LIVE_S3=1`) against `http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the
+token. It refuses to start if the org already holds `tf-live-*` objects (SSH keys, projects, instances, buckets that are
+not soft-deleted, VPCs), withholds a test's log if it contains the key (checked after every test, with the artifact
+updated each time), fails unless the log shows `--- PASS` for every test, and counts again afterwards: the run must leave
+nothing behind. Each test has 30 minutes (`-timeout 30m`) and the job 90 (the sum of the ceilings is larger, but a run
+that needs more than 90 minutes in all is stuck). A job that is killed can leave `tf-live-*` objects behind: the next run
+then refuses to start and says how many of which kind; delete them (instances and VPCs first, then projects, then SSH
+keys; buckets are only soft-deleted) before running again. The lists are read as one page (the API's default: 50 buckets
+or VPCs, 100 instances; SSH keys and projects are not paged), which is plenty for a test org that holds nothing else of
+that name. The part of the script that counts is tested in CI against a
+local API (`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of
 variables, so nothing a trigger sets (proxy, Go, curl, apt, `PATH`, ...) reaches it; it uses its own pinned and
 checksum-verified `tofu`, the public OpenBao CA in `ci/bao-ca.pem`, and runs without a cache. Only users with the
 Maintainer role can start a pipeline with variables in this project.

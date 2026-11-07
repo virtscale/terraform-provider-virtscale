@@ -189,7 +189,7 @@ func liveSshKeyEnv(t *testing.T) (endpoint, apiKey, org string) {
 }
 
 // productionHost is the provider's default endpoint host: a live run against it is refused unless
-// the caller says so, because the test creates (and deletes) a real key there.
+// the caller says so, because the tests create (and delete) real objects there.
 const productionHost = "api.virtscale.nl"
 
 // refuseProductionEndpoint returns an error when endpoint names the production API and the caller
@@ -199,8 +199,9 @@ func refuseProductionEndpoint(endpoint string, allow bool) error {
 	if err != nil {
 		return fmt.Errorf("VIRTSCALE_ENDPOINT is not a URL: %v", err)
 	}
-	if strings.EqualFold(u.Hostname(), productionHost) && !allow {
-		return fmt.Errorf("VIRTSCALE_ENDPOINT is the production API; the live test creates a key there: set VIRTSCALE_LIVE_ALLOW_PRODUCTION=1 to run it anyway")
+	// A trailing dot names the same host.
+	if strings.EqualFold(strings.TrimSuffix(u.Hostname(), "."), productionHost) && !allow {
+		return fmt.Errorf("VIRTSCALE_ENDPOINT is the production API; a live test creates objects there: set VIRTSCALE_LIVE_ALLOW_PRODUCTION=1 to run it anyway")
 	}
 	return nil
 }
@@ -294,6 +295,7 @@ func TestRefuseProductionEndpoint(t *testing.T) {
 	}{
 		{"https://api.virtscale.nl", false, true},
 		{"https://API.virtscale.nl:443/", false, true},
+		{"https://api.virtscale.nl./", false, true},
 		{"https://api.virtscale.nl", true, false},
 		{"http://s3-staging-customer-api.s3-staging.svc.cluster.local", false, false},
 		{"http://127.0.0.1:8080", false, false},

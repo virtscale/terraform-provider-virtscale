@@ -45,7 +45,15 @@ func TestAccVpcResource_Lifecycle(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
-		CheckDestroy:             checkVpcsGone(fake),
+		CheckDestroy: func(s *terraform.State) error {
+			if err := checkVpcsGone(fake)(s); err != nil {
+				return err
+			}
+			if keys := fake.ProjectIdempotencyKeys(); len(keys) != 2 { // the create, and the delete
+				return fmt.Errorf("the create and the delete sent %d Idempotency-Keys, want 2", len(keys))
+			}
+			return nil
+		},
 		Steps: []resource.TestStep{
 			{
 				Config: vpcConfig(fake, "net-a", `  description = "first"`+"\n"),
