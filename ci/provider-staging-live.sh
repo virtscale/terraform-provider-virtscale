@@ -210,7 +210,9 @@ echo "the staging org before the run: $before"
 
 # 5. The tests, one `go test` process each. A prefix assignment gives the key to this one command and its children only,
 # and GOPROXY=off keeps the Go toolchain off the network while the key is in the environment (the modules were fetched
-# and verified above). A test that fails or skips is recorded and the next one still runs.
+# and verified above). tofu itself does go out in TestLiveRegistryRelease_SshKeyProof: it installs the pinned release
+# from registry.terraform.io and GitHub, checked against the signed SHA256SUMS. A test that fails or skips is recorded
+# and the next one still runs.
 rc=0
 results=""
 : >"$work/go-test.log"

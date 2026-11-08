@@ -579,6 +579,7 @@ them. One test per family:
 | `TestLiveProjectResource_LifecycleProof` | `virtscale_project`: create, an empty second plan, description and labels in place, import |
 | `TestLiveVpcResource_LifecycleProof` | `virtscale_vpc` in the default project: waits for `active`, empty second plan, import as `<project>/<vpc>`, destroy waits until it is gone |
 | `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
+| `TestLiveRegistryRelease_SshKeyProof` | the published release (exactly `registryReleaseVersion`) installed from registry.terraform.io, checked against its signed SHA256SUMS: `virtscale_ssh_key` create, an empty second plan, destroy. It has no twin against the fake: it needs the registry and GitHub |
 | `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
 
 Each has a twin against the fake (`TestAcc...AgainstTheFake`) that proves the test code in CI. A test is skipped
