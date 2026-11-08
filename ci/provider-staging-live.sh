@@ -61,7 +61,7 @@ ENDPOINT="http://s3-staging-customer-api.s3-staging.svc.cluster.local"
 # The S3 test needs an object store behind the API, which staging has not, and every bucket it creates is soft-deleted and,
 # while the platform's purge worker is off, never purged (it keeps its name and a retention row for good): it runs only when
 # the pipeline is started with PROVIDER_STAGING_LIVE_S3=1.
-TESTS_FIRST="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof"
+TESTS_FIRST="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof TestLiveRegistryRelease_SshKeyProof"
 TESTS_LAST="TestLiveInstanceFirewallResource_LifecycleProof"
 TESTS="$TESTS_FIRST $TESTS_LAST"
 live_s3=""
