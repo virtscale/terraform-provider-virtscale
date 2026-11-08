@@ -614,6 +614,7 @@ them. One test per family:
 
 | Test | Proves |
 | ---- | ------ |
+| `TestLiveSweepLeftovers` | not a proof: it removes the instances named `tf-live-*` that an earlier run left behind (protection lifted first, then deleted, waited until gone) and passes at once when there are none. The CI job runs it first of all, so a protected leftover cannot block the clean-start check or take the staging host's one server slot |
 | `TestLiveSshKeyResource_LifecycleProof` | `virtscale_ssh_key` |
 | `TestLiveCatalogueProof` | `virtscale_caller` (its organization is the configured one), `virtscale_regions` (lists the live region), `virtscale_instance_types`, `virtscale_plans`, `virtscale_project` |
 | `TestLiveProjectResource_LifecycleProof` | `virtscale_project`: create, an empty second plan, description and labels in place, import |
@@ -621,11 +622,11 @@ them. One test per family:
 | `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
 | `TestLiveRegistryRelease_SshKeyProof` | the published release (exactly `registryReleaseVersion`) installed from registry.terraform.io, checked against its signed SHA256SUMS: `virtscale_ssh_key` create, an empty second plan, destroy. It has no twin against the fake: it needs the registry and GitHub |
 | `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
-| `TestLiveInstanceAttributesProof` | `virtscale_instance` on the smallest size, created with `user_data` and `disable_api_termination = true`: the destroy is refused while protected, a resize 1/1024 to 1/2048 happens in place (the instance restarts), the protection is lifted, the destroy works. Needs cloud-init (`user_data`), protection and resizing switched on for the staging org |
+| `TestLiveInstanceAttributesProof` | `virtscale_instance` on the smallest size, created with `user_data` and `disable_api_termination = true`: the destroy is refused while protected, the protection is lifted in place, the destroy works. With `VIRTSCALE_LIVE_RESIZE=1` a resize 1/1024 to 1/2048 happens in place too (the instance restarts) between the lift and the destroy. Needs cloud-init (`user_data`) and protection switched on for the staging org. **The resize is opt-in**: staging is a fenced deployment (`settings.compute_os_fenced`: a fixed table of flavors) and refuses every resize by design, so the in-place resize is proven by the fake-API acceptance tests and, live, by a non-fenced region with `VIRTSCALE_LIVE_RESIZE=1`. The test removes its own instance by name when it ends, whatever step failed |
 
 Each has a twin against the fake (`TestAcc...AgainstTheFake`) that proves the test code in CI. A test is skipped
 unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`, `VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all
-set. It creates only objects named `tf-live-<random>` and deletes them again. The API key needs the `write` scope
+set. It creates only objects named `tf-live-<random>` and deletes them again; the instance tests also remove their instance when a step fails, and `TestLiveSweepLeftovers` removes what a killed run left. The API key needs the `write` scope
 (projects), `network:write` and `compute:write` (VPCs, instances, firewalls) and `storage:write` or `write` (S3). The
 place defaults to staging's (`VIRTSCALE_LIVE_REGION=stg`, `VIRTSCALE_LIVE_STORAGE_POOL=stg-local`,
 `VIRTSCALE_LIVE_NETWORK_PROFILE=stg-tenant`; set them to run elsewhere). The staging API is cluster-internal, so run
@@ -652,13 +653,14 @@ click never runs it. The job logs in to OpenBao with the JWT role `provider-stag
 `main`, API pipelines), reads the staging test org's key, and runs the tests above one after another (a failed one does
 not stop the next, so a run shows which families work; the S3 one only when the pipeline is started with
 `PROVIDER_STAGING_LIVE_S3=1`) against `http://s3-staging-customer-api.s3-staging.svc.cluster.local`, and revokes the
-token. It refuses to start if the org already holds `tf-live-*` objects (SSH keys, projects, instances, buckets that are
-not soft-deleted, VPCs), withholds a test's log if it contains the key (checked after every test, with the artifact
+token. The first test it runs is `TestLiveSweepLeftovers`, which removes leftover `tf-live-*` instances. It then refuses
+to start if the org still holds `tf-live-*` objects (SSH keys, projects, instances, buckets that are not soft-deleted,
+VPCs), withholds a test's log if it contains the key (checked after every test, with the artifact
 updated each time), fails unless the log shows `--- PASS` for every test, and counts again afterwards: the run must leave
 nothing behind. Each test has 30 minutes (`-timeout 30m`) and the job 90 (the sum of the ceilings is larger, but a run
-that needs more than 90 minutes in all is stuck). A job that is killed can leave `tf-live-*` objects behind: the next run
-then refuses to start and says how many of which kind; delete them (instances and VPCs first, then projects, then SSH
-keys; buckets are only soft-deleted) before running again. The lists are read as one page (the API's default: 50 buckets
+that needs more than 90 minutes in all is stuck). A job that is killed can leave `tf-live-*` objects behind: instances are removed by the sweeper at the start of the next
+run; for any other kind the run refuses to start and says how many of which kind, so delete them (VPCs first, then
+projects, then SSH keys; buckets are only soft-deleted) before running again. The lists are read as one page (the API's default: 50 buckets
 or VPCs, 100 instances; SSH keys and projects are not paged), which is plenty for a test org that holds nothing else of
 that name. The part of the script that counts is tested in CI against a
 local API (`internal/provider/live_script_test.go`). The script re-executes itself under `env -i` with a short allowlist of

@@ -81,6 +81,16 @@ need "the key scan found the key" '0) fail "the API key appears in the output of
 # A run starts only on a clean org, so that a leak of an earlier run is never the baseline.
 need "the clean-start guard" '[ "$before" = "ssh_keys=0 projects=0 instances=0 buckets=0 vpcs=0" ]'
 need "the after-run guard" '[ "$after" = "$before" ]'
+# The sweeper (TestLiveSweepLeftovers) removes tf-live-* instances an earlier run left behind, and it runs before the
+# clean-start count: after it, not before, or one protected leftover stops every later run at the guard.
+need "the sweeper test" 'TESTS_SWEEP="TestLiveSweepLeftovers"'
+sweep_line=$(line_of 'run_live_test "$TESTS_SWEEP"')
+count_line=$(line_of 'before=$(leftovers)')
+if [ -n "$sweep_line" ] && [ -n "$count_line" ]; then
+  [ "$sweep_line" -lt "$count_line" ] || bad "the sweeper must run before the clean-start count"
+else
+  bad "the sweeper run and the clean-start count must both be in $script"
+fi
 # S3 is opt-in, and only for exactly 1.
 grep -qxF 'if [ "${PROVIDER_STAGING_LIVE_S3:-}" = 1 ]; then' "$script" || bad "the S3 opt-in must be exactly: if [ \"\${PROVIDER_STAGING_LIVE_S3:-}\" = 1 ]; then"
 need "S3 off by default" 'live_s3=""'
