@@ -138,7 +138,7 @@ An API key carries scopes, and the API refuses a call the key's scopes do not co
 
 | You use | The key needs |
 | ------- | ------------- |
-| `virtscale_instance` (create, destroy, refresh) | `compute:write` |
+| `virtscale_instance` (create, resize, protect, destroy, refresh) | `compute:write` |
 | `virtscale_ssh_key` (import, destroy, refresh) | `compute:write` |
 | `virtscale_public_ip` (allocate, associate, disassociate, release, refresh) | `network:write` |
 | `virtscale_vpc` (create, destroy, refresh) | `network:write`, and `compute:read` to find its project with the `virtscale_project` data source |
@@ -202,6 +202,7 @@ resource may exist without being in state. The error says so and says what to do
 
 Waiting for a result is separate from retrying a request: creating an instance waits up to 20 minutes for
 state `running` (in practice 30 to 60 seconds) and fails at once, with the API's `error_class` and `error_detail`, if it reaches `error`;
+resizing one waits up to 20 minutes for the new size;
 destroying waits up to 10 minutes (an instance is gone in about 15 seconds); each public IP operation waits up to 10 minutes. Waits poll every 5 seconds.
 
 ## Errors
@@ -216,6 +217,7 @@ including the field list the API sends with a `400`. Where the fix is on your si
 | `403 source_address_not_allowed` | the key's network limits do not include this address |
 | `404` about the organization | check `VIRTSCALE_ORGANIZATION`, or that the key belongs to that organization |
 | `412 generation_mismatch` | the resource was changed by something else while the change was made: apply again |
+| `409 vm_protected` | the instance is protected against deletion: set `disable_api_termination = false` and apply first, then destroy or replace it |
 
 Only a `404` that says the resource itself is gone is read as "gone": its code is `not_found` and its detail is
 the API's sentence for that kind of resource (an instance, a public IP or an SSH key, as asked about). Every other
@@ -237,19 +239,22 @@ the API prints the request.
 | `region`          | string | Required, forces replacement | |
 | `image`           | string | Required, forces replacement | Image id from `virtscale_images`. Set at creation only; the provider does not detect image drift in v0. |
 | `instance_type`   | string | Optional, Computed, forces replacement when set to a different value | A catalogue type from `virtscale_instance_types`, for example `g1-small`. It sets the three sizes; name it **or** give `vcpus`, `memory_mb` and `disk_gb`, not both. **Production has no orderable types today** (`virtscale_instance_types` returns none, and a type is refused with `422 instance_type_unpriced`): give the sizes instead. Read back from the API (null for an instance it reports no type for). A platform that only sells types refuses raw sizes with `422 instance_type_required`. |
-| `vcpus`           | number | Optional, Computed, forces replacement when set to a different value | 1, 2, 4, 8, 16 or 32. Taken from `instance_type` when one is named; otherwise `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` are given together. |
-| `memory_mb`       | number | Optional, Computed, forces replacement when set to a different value | Whole gigabytes from 1 to 128, written in megabytes: gigabytes times 1024 (1024 for 1 GB, 4096 for 4 GB, 131072 for 128 GB). Given with `vcpus`, as above. |
-| `disk_gb`         | number | Optional, Computed, forces replacement when set to a different value | 10 to 2000, in steps of 10. Given with `vcpus`, as above. |
+| `vcpus`           | number | Optional, Computed, changes in place | 1, 2, 4, 8, 16 or 32. Taken from `instance_type` when one is named; otherwise `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` are given together. A different value resizes the instance in place (below): **it restarts**. |
+| `memory_mb`       | number | Optional, Computed, changes in place | Whole gigabytes from 1 to 128, written in megabytes: gigabytes times 1024 (1024 for 1 GB, 4096 for 4 GB, 131072 for 128 GB). Given with `vcpus`, as above. A different value resizes the instance in place (below): **it restarts**. |
+| `disk_gb`         | number | Optional, Computed, forces replacement when set to a different value | 10 to 2000, in steps of 10. Given with `vcpus`, as above. The API resizes vCPUs and memory only, so a different disk is a new instance. |
 | `storage_pool`    | string | Optional, Computed, forces replacement when set to a different value | For example `gro-ceph` in `gro`. Left out with `instance_type`, the API uses the type's own pool; with raw sizes it is required. State holds the pool the instance is on. |
 | `network_profile` | string | Optional, Computed, forces replacement when set to a different value | For example `gro-tenant-default` in `gro`. Left out, the API picks the first profile your organization may use in the region on the hosts the instance is placed on. State holds the profile the instance is on. |
-| `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. The API refuses `user_data`, so the provider has no such attribute. |
+| `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. |
+| `user_data`       | string | Optional, Sensitive, forces replacement | Plain cloud-init text for the first boot: a `#cloud-config` document, a script that starts with `#!`, or a MIME multipart document, at most 32 KiB (checked at plan time; an empty value is refused too). The provider sends it as standard base64 and the API applies it after the platform's own part (the keys of `ssh_keys`). It is read at the first boot only, so a different value replaces the instance. **Never read back:** state keeps the value you configured, and an imported instance has none, so a configuration that sets `user_data` after `tofu import` plans a replacement (put `lifecycle { ignore_changes = [user_data] }` on it to avoid that). Sensitive, so plans hide it, but the state holds it as text. `503 not_ready` means cloud-init is not switched on for this API yet; a payload the API cannot deliver is `422 user_data_invalid`. |
+| `workload_type`   | string | Optional, Computed, forces replacement when set to a different value | `customer` (the API's default) or `infra`, VirtScale's own hardware pools; checked at plan time. Only an organization of kind internal may ask for `infra`: any other gets `422 workload_not_allowed`. Read back from the API (VmOut has `workload_type`). |
+| `disable_api_termination` | bool | Optional, Computed, changes in place | Protect the instance against deletion, like AWS's `DisableApiTermination`. Defaults to what the API reports, `false`. A create sets it once the instance runs; a change is one `PUT .../protection`, never a replacement; a refresh reads it back (`protected`). While it is `true`, a destroy or a replacement is refused with `409 vm_protected` and the provider adds "set disable_api_termination = false and apply first": it never lifts the protection for you. Changing it needs the `compute.instance.update` permission (`compute:write`). |
 | `hostname`        | string | Optional, Computed | The lower-case fully qualified name the instance is known by in your organization (for example `web.example.com`); checked at plan time (labels of lowercase letters, digits and hyphens, at least two labels, at most 253 characters). Unique among the organization's live instances: a duplicate is `409 hostname_taken`; another organization may use the same name. It is a handle only: the platform creates no DNS record for it. Changing it is an in-place update, not a replacement. It is read back on every refresh, so a change made elsewhere shows as a difference, and `tofu import` fills it. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). |
 | `id`              | string | Computed | |
 | `state`           | string | Computed | |
 | `status`          | string | Computed | The instance's status as the API reports it, for example `running` or `stopped`. |
 | `fqdn`            | string | Computed | Null for a customer account. |
-| `private_ipv4`    | string | Computed | The instance's private IPv4 address as the platform reports it; empty until it is known. An associated public IP is not the private address. |
-| `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. |
+| `private_ipv4`    | string | Computed | The instance's private IPv4 address as the platform reports it; empty until it is known. An associated public IP is not the private address. Kept across plans, so an in-place change does not plan it as known after apply. |
+| `image_name`      | string | Computed | The name of the image the instance was built from, as reported by the API. Kept across plans, like `private_ipv4`. |
 | `created_at`      | string | Computed | RFC 3339. |
 
 The optional attributes follow the API's own rules: a create names an `instance_type` or all of `vcpus`, `memory_mb`,
@@ -268,10 +273,21 @@ a size. Destroying an instance waits until it is gone.
 
 The provider does not manage power state. An instance stopped through the API stays stopped, and the plan stays empty
 (`state` reads `stopped` after the next refresh). An instance create takes about 30 to 60 seconds and a destroy about
-15 seconds; the waits below are ceilings, not what to expect. Every attribute except `hostname` forces
-replacement; changing `hostname` is an in-place update (one PATCH, guarded by the instance's current generation
-read just before it, so a change made at the same moment by someone else is refused with `412
-generation_mismatch` and the next run picks it up).
+15 seconds; the waits below are ceilings, not what to expect. Four attributes change in place: `hostname` (one PATCH,
+guarded by the instance's current generation read just before it, so a change made at the same moment by someone else is
+refused with `412 generation_mismatch` and the next run picks it up), `disable_api_termination` (one PUT) and `vcpus` and
+`memory_mb` (a resize, below). Every other attribute forces replacement. The in-place changes of one apply are made in
+that order: hostname, protection, resize.
+
+**Resize.** A different `vcpus` or `memory_mb` is one `POST .../resize` of the same instance, with an `Idempotency-Key`,
+and **the instance restarts** (a cold resize: the platform stops it, moves it to the new size and starts it again; a
+stopped instance stays stopped). Apply waits (up to 20 minutes) until the instance reports the new `vcpus` and
+`memory_mb` and is `running` or `stopped` again. A resize the platform cannot complete is reverted: the instance keeps
+its size and apply fails with the operation's `error_class` and `error_detail`. The disk cannot change (a different
+`disk_gb` replaces the instance), and so does a different `instance_type`. Resizing is a feature that may be switched off
+for an organization: the API then answers `503 not_ready`, which is shown as it comes and not retried. A resize of an
+instance whose `instance_type` is set keeps that type in the API; to manage the sizes, give `vcpus`, `memory_mb`,
+`disk_gb` and `storage_pool` instead of the type.
 
 ### `virtscale_ssh_key`
 
@@ -603,6 +619,7 @@ them. One test per family:
 | `TestLiveS3Resources_LifecycleProof` | `virtscale_s3_bucket` (a ceiling changed in place; destroy is a soft delete) and `virtscale_s3_access_key` (the secret is in the state; destroy revokes). **Opt-in** (`VIRTSCALE_LIVE_S3=1`): it needs an object store behind the API, which staging has not, and the bucket it leaves soft-deleted may never be purged |
 | `TestLiveRegistryRelease_SshKeyProof` | the published release (exactly `registryReleaseVersion`) installed from registry.terraform.io, checked against its signed SHA256SUMS: `virtscale_ssh_key` create, an empty second plan, destroy. It has no twin against the fake: it needs the registry and GitHub |
 | `TestLiveInstanceFirewallResource_LifecycleProof` | `virtscale_instance` and `virtscale_instance_firewall` on the smallest size: rules applied, one rule added in place, import |
+| `TestLiveInstanceAttributesProof` | `virtscale_instance` on the smallest size, created with `user_data` and `disable_api_termination = true`: the destroy is refused while protected, a resize 1/1024 to 1/2048 happens in place (the instance restarts), the protection is lifted, the destroy works. Needs cloud-init (`user_data`), protection and resizing switched on for the staging org |
 
 Each has a twin against the fake (`TestAcc...AgainstTheFake`) that proves the test code in CI. A test is skipped
 unless `TF_ACC=1`, `VIRTSCALE_LIVE=1`, `VIRTSCALE_API_KEY`, `VIRTSCALE_ORGANIZATION` and `VIRTSCALE_ENDPOINT` are all

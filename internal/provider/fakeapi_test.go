@@ -110,6 +110,18 @@ type fakeAPI struct {
 	// its transaction (db/idempotency.py claim()).
 	inProgressLeft int
 
+	// internalOrg lets a create ask for workload_type infra (an organization of kind internal); userDataOff is
+	// S3CP_COMPUTE_USER_DATA_ENABLED=false (a create with user_data is 503 not_ready); resizeOff is
+	// S3CP_COMPUTE_VM_RESIZE_ENABLED=false for a customer organization (a resize is 503 not_ready); resizeFail makes
+	// the next resizes end failed with that detail, the instance back at its old size.
+	internalOrg, userDataOff, resizeOff bool
+	resizeFail                          string
+	// userDataSent is the user_data string of each create, as it arrived (the API keeps only its presence),
+	// ops the operations of the resizes, bodies the bodies of the requests of one route, in order.
+	userDataSent map[string]string
+	ops          map[string]*wireOperationRef
+	bodies       map[string][]string
+
 	// calls records "METHOD route" for every request that reached a route.
 	calls []string
 	// requestedPaths records the URL path of every request that arrived at
@@ -263,6 +275,17 @@ type fakeVm struct {
 	deletedAt *time.Time
 	// deletingLeft counts the reads the vm still stays in state deleting.
 	deletingLeft int
+	// resize is the resize the executor is carrying out, nil when none runs.
+	resize *fakeResize
+}
+
+// fakeResize is one accepted resize: the target shape, the operation that converges it, and the state the vm returns
+// to (a running vm comes back running, a stopped one stopped).
+type fakeResize struct {
+	vcpus, memoryMB int
+	op              *wireOperationRef
+	prevState       string
+	fail            string
 }
 
 // fakeFault is one injected failure.
@@ -324,6 +347,9 @@ func newFakeAPI(t *testing.T, apiKey, org string) *fakeAPI {
 		callSeq:        make(map[string][]string),
 		sshKeys:        make(map[string]*wireSshKeyOut),
 		sshKeyQuota:    20,
+		userDataSent:   make(map[string]string),
+		ops:            make(map[string]*wireOperationRef),
+		bodies:         make(map[string][]string),
 	}
 	spec, err := contract.Load()
 	if err != nil {
@@ -739,10 +765,13 @@ func mutating(calls []string) []string {
 func (f *fakeAPI) Protect(id string, on bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	vm, ok := f.vms[id]
-	if !ok {
-		return
+	if vm, ok := f.vms[id]; ok {
+		setProtected(vm, on)
 	}
+}
+
+// setProtected is vms.set_vm_protection's write: the flag, and allowed_actions without delete while it is on.
+func setProtected(vm *fakeVm, on bool) {
 	vm.Protected = on
 	vm.AllowedActions = nil
 	for _, action := range allVmActions {
@@ -750,6 +779,78 @@ func (f *fakeAPI) Protect(id string, on bool) {
 			vm.AllowedActions = append(vm.AllowedActions, action)
 		}
 	}
+}
+
+// IsProtected reports VmOut.protected of vm id.
+func (f *fakeAPI) IsProtected(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	return ok && vm.Protected
+}
+
+// SetInternalOrg makes the organization one of kind internal: a create may ask for workload_type infra.
+func (f *fakeAPI) SetInternalOrg(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.internalOrg = on
+}
+
+// SetUserDataOff makes a create that carries user_data answer 503 not_ready, as a deployment with cloud-init off.
+func (f *fakeAPI) SetUserDataOff(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.userDataOff = on
+}
+
+// SetResizeOff makes a resize answer 503 not_ready, as a customer organization while resizing is switched off.
+func (f *fakeAPI) SetResizeOff(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resizeOff = on
+}
+
+// FailResizes makes every resize that is accepted from now on end failed with detail: the instance goes back to the
+// size and state it had. "" ends the failures.
+func (f *fakeAPI) FailResizes(detail string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resizeFail = detail
+}
+
+// SetState sets the lifecycle state of vm id, for a test that needs an instance that was stopped through the API.
+func (f *fakeAPI) SetState(id, state string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vm, ok := f.vms[id]; ok {
+		vm.State, vm.Status = state, state
+	}
+}
+
+// UserDataSent is the user_data string the create of vm id carried, exactly as it arrived on the wire.
+func (f *fakeAPI) UserDataSent(id string) (string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.userDataSent[id]
+	return s, ok
+}
+
+// Bodies lists the request bodies of one route ("POST compute/instances/{vm_id}/resize"), in arrival order, for the
+// routes that record them (resize and protection).
+func (f *fakeAPI) Bodies(route string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.bodies[route]...)
+}
+
+// VmShape is the vcpus and memory_mb of vm id.
+func (f *fakeAPI) VmShape(id string) (vcpus, memoryMB int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if vm, ok := f.vms[id]; ok {
+		return vm.VCPUs, vm.MemoryMB
+	}
+	return 0, 0
 }
 
 // SetDeleteSteps makes a delete stay in state "deleting" for n reads before
@@ -897,8 +998,11 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key = "compute/instances"
 	case len(parts) == 3 && parts[0] == "compute" && parts[1] == "instances":
 		key, param, id = "compute/instances/{vm_id}", "vm_id", parts[2]
-	case len(parts) == 4 && parts[0] == "compute" && parts[1] == "instances" && parts[3] == "firewall":
-		key, param, id = "compute/instances/{vm_id}/firewall", "vm_id", parts[2]
+	case len(parts) == 4 && parts[0] == "compute" && parts[1] == "instances" &&
+		(parts[3] == "firewall" || parts[3] == "resize" || parts[3] == "protection"):
+		key, param, id = "compute/instances/{vm_id}/"+parts[3], "vm_id", parts[2]
+	case len(parts) == 2 && parts[0] == "operations":
+		key, param, id = "operations/{operation_id}", "operation_id", parts[1]
 	case rest == "compute/images":
 		key = "compute/images"
 	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types", rest == "projects":
@@ -931,6 +1035,8 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
 		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
 		"GET compute/instances/{vm_id}/firewall", "PUT compute/instances/{vm_id}/firewall",
+		"POST compute/instances/{vm_id}/resize", "PUT compute/instances/{vm_id}/protection",
+		"GET operations/{operation_id}",
 		"GET s3/buckets", "POST s3/buckets", "GET s3/buckets/{bucket_id}", "DELETE s3/buckets/{bucket_id}", "PUT s3/buckets/{bucket_id}/quota",
 		"GET s3/access-keys", "POST s3/access-keys", "DELETE s3/access-keys/{key_id}",
 		"GET projects", "POST projects", "GET projects/{project}", "PATCH projects/{project}", "DELETE projects/{project}",
@@ -971,6 +1077,9 @@ var routePermissions = map[string]string{
 	"GET instance-types":                                  "compute.instance_type.list",
 	"GET compute/instances/{vm_id}/firewall":              "network.read",
 	"PUT compute/instances/{vm_id}/firewall":              "network.firewall.update",
+	"POST compute/instances/{vm_id}/resize":               "compute.instance.update",
+	"PUT compute/instances/{vm_id}/protection":            "compute.instance.update",
+	"GET operations/{operation_id}":                       "operation.read",
 	"GET s3/buckets":                                      "storage.bucket.list",
 	"POST s3/buckets":                                     "storage.bucket.create",
 	"GET s3/buckets/{bucket_id}":                          "storage.bucket.read",
@@ -1155,6 +1264,12 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.getFirewall(rc, id)
 	case "PUT compute/instances/{vm_id}/firewall":
 		f.putFirewall(rc, id)
+	case "POST compute/instances/{vm_id}/resize":
+		f.resizeVm(rc, id)
+	case "PUT compute/instances/{vm_id}/protection":
+		f.setProtection(rc, id)
+	case "GET operations/{operation_id}":
+		f.getOperation(rc, id)
 	case "POST projects":
 		f.createProject(rc)
 	case "GET projects":
@@ -1359,7 +1474,8 @@ type vmCreateIn struct {
 	Hostname, InstanceType                                         string
 	VCPUs, MemoryMB, DiskGB                                        int
 	SSHKeys                                                        []string
-	UserData                                                       *string
+	UserData                                                       string
+	HasUserData                                                    bool
 }
 
 func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
@@ -1377,7 +1493,9 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 		Hostname:       strOrEmpty(b.nullableStr("hostname")),
 		InstanceType:   strOrEmpty(b.nullableStr("instance_type")),
 		SSHKeys:        b.strList("ssh_keys"),
-		UserData:       b.nullableStr("user_data"),
+	}
+	if ud := b.nullableStr("user_data"); ud != nil {
+		in.UserData, in.HasUserData = *ud, true
 	}
 	if in.WorkloadType == "" {
 		in.WorkloadType = "customer"
@@ -1426,10 +1544,40 @@ func canonicalVmName(raw string) (string, bool) {
 
 const (
 	detailOperationInFlightVm = "another operation is already running for this VM; wait for it to finish and retry"
-	detailUserDataUnsupported = "user_data is not accepted: the instance is built asynchronously, so cloud-init would " +
-		"have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, " +
-		"so where such a payload may live is still an open design question"
+	detailUserDataNotReady    = "cloud-init user data is not switched on for this API yet"
+	detailResizeNotReady      = "resizing an instance is not switched on for this organization yet"
+
+	// fakeMaxUserDataBytes is the ceiling of the decoded user_data (32 KiB).
+	fakeMaxUserDataBytes = 32 * 1024
 )
+
+// checkUserData is _check_user_data (PROV-002): any non-null value is 503 not_ready while the deployment has cloud-init
+// off, then the value is judged: standard base64, not empty, at most 32 KiB decoded (422 user_data_invalid, a fixed
+// sentence that repeats nothing of the payload). It answers the refusal itself and reports whether the create may go on.
+func (f *fakeAPI) checkUserData(rc *reqCtx, req vmCreateIn) bool {
+	if !req.HasUserData {
+		return true
+	}
+	f.mu.Lock()
+	off := f.userDataOff
+	f.mu.Unlock()
+	if off {
+		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", detailUserDataNotReady)
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(req.UserData)
+	switch {
+	case err != nil:
+		rc.unprocessable("user_data_invalid", "user_data must be standard base64")
+	case len(raw) == 0:
+		rc.unprocessable("user_data_invalid", "user_data is empty")
+	case len(raw) > fakeMaxUserDataBytes:
+		rc.unprocessable("user_data_invalid", "user_data is larger than 32 KiB once decoded")
+	default:
+		return true
+	}
+	return false
+}
 
 // createVm follows compute.py create_vm's gate order: body validation, then
 // user_data (before the key is claimed), then -- TF7 -- the SSH-key flag
@@ -1443,8 +1591,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		rc.invalid(errs...)
 		return
 	}
-	if req.UserData != nil {
-		rc.unprocessable("user_data_unsupported", detailUserDataUnsupported)
+	if !f.checkUserData(rc, req) {
 		return
 	}
 
@@ -1489,11 +1636,11 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 	if !f.resolveSshKeys(rc, req.SSHKeys) {
 		return
 	}
-	if req.WorkloadType != "customer" {
-		if req.WorkloadType != "infra" {
-			rc.unprocessable("invalid_spec", "workload_type must be one of: infra, customer")
-			return
-		}
+	if req.WorkloadType != "customer" && req.WorkloadType != "infra" {
+		rc.unprocessable("invalid_spec", "workload_type must be one of: infra, customer")
+		return
+	}
+	if req.WorkloadType == "infra" && !f.internalOrg {
 		rc.unprocessable("workload_not_allowed", "a customer account cannot request infra workloads")
 		return
 	}
@@ -1557,8 +1704,9 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			MemoryMB:         sizes.memoryMB,
 			DiskGB:           sizes.diskGB,
 			StoragePoolID:    sizes.pool,
-			WorkloadType:     "customer",
+			WorkloadType:     req.WorkloadType,
 			NetworkProfileID: sizes.profile,
+			UserDataPresent:  req.HasUserData,
 			State:            "pending",
 			Status:           "pending",
 			DesiredState:     "running",
@@ -1572,6 +1720,9 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		inFlight: true,
 	}
 	f.vms[id] = vm
+	if req.HasUserData {
+		f.userDataSent[id] = req.UserData
+	}
 
 	op := f.newOperation("vm.create", "vm", id, now)
 	payload := map[string]any{"vm": vm.wireVmOut, "operation": op}
@@ -1711,6 +1862,8 @@ func (f *fakeAPI) advance(vm *fakeVm) {
 		}
 	case vm.DesiredState == "deleted":
 		vm.State = "deleting"
+	case vm.resize != nil:
+		f.advanceResize(vm)
 	case vm.State == "pending":
 		vm.State = "provisioning"
 	case vm.State == "provisioning":
@@ -1955,6 +2108,147 @@ func (f *fakeAPI) patchVm(rc *reqCtx, id string) {
 		}
 	}
 	rc.json(http.StatusOK, vm.wireVmOut, "ETag", generationETag(vm.Generation))
+}
+
+// advanceResize is the resize executor: the first read after the 202 finds the cloud has accepted it (state resizing,
+// operation running), the next finds it done -- the new size committed and the state back to what it was -- or, for a
+// resize that cannot be completed, reverted: the old size, the failure recorded on the row and on the operation.
+func (f *fakeAPI) advanceResize(vm *fakeVm) {
+	rz := vm.resize
+	if vm.State != "resizing" {
+		vm.State = "resizing"
+		rz.op.State, rz.op.Attempt = "running", 1
+		return
+	}
+	now := time.Now().UTC()
+	rz.op.FinishedAt = &now
+	vm.State = rz.prevState
+	if rz.fail != "" {
+		class, detail := "resize_failed", rz.fail
+		vm.ErrorClass, vm.ErrorDetail = &class, &detail
+		rz.op.State, rz.op.ErrorClass, rz.op.ErrorDetail = "failed", &class, &detail
+	} else {
+		vm.VCPUs, vm.MemoryMB = rz.vcpus, rz.memoryMB
+		vm.ErrorClass, vm.ErrorDetail = nil, nil
+		rz.op.State = "succeeded"
+	}
+	vm.inFlight = false
+	vm.resize = nil
+}
+
+// recordBody keeps the body of a request of route, for the routes a test asks about.
+func (f *fakeAPI) recordBody(route string, raw []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.bodies[route] = append(f.bodies[route], string(raw))
+}
+
+// resizeVm is POST /compute/instances/{id}/resize (vms.py resize_vm_request): body, the switch, the vm, a state it can
+// be resized in, no other operation, a size that differs and is on the grid. It writes a target, never a size: the
+// executor (advanceResize) commits the size once the cloud has confirmed it.
+func (f *fakeAPI) resizeVm(rc *reqCtx, id string) {
+	raw, _ := io.ReadAll(rc.r.Body)
+	f.recordBody("POST compute/instances/{vm_id}/resize", raw)
+	b := newBodyCheck(bytes.NewReader(raw))
+	vcpus := b.integer("vcpus", true, 1)
+	memoryMB := b.integer("memory_mb", true, 256)
+	if errs := b.finish(); len(errs) > 0 {
+		rc.invalid(errs...)
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resizeOff {
+		rc.problem(http.StatusServiceUnavailable, "not_ready", "Service unavailable", detailResizeNotReady)
+		return
+	}
+	vm, ok := f.vms[id]
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	if vm.State != "running" && vm.State != "stopped" {
+		rc.conflict("vm_not_in_a_state_for_this", fmt.Sprintf("this VM is %s, so its size cannot be changed", vm.State))
+		return
+	}
+	if vm.inFlight {
+		rc.conflict("operation_in_flight", detailOperationInFlightVm)
+		return
+	}
+	if vcpus == vm.VCPUs && memoryMB == vm.MemoryMB {
+		rc.unprocessable("no_change", "this VM already has that many vCPUs and that much memory")
+		return
+	}
+	var problems []string
+	if !containsInt([]int{1, 2, 4, 8, 16, 32}, vcpus) {
+		problems = append(problems, "vcpus must be one of 1, 2, 4, 8, 16, 32")
+	}
+	if memoryMB < 1024 || memoryMB > 131072 || memoryMB%1024 != 0 {
+		problems = append(problems, "memory_mb must be whole gigabytes from 1 to 128, in megabytes")
+	}
+	if len(problems) > 0 {
+		rc.unprocessable("invalid_spec", strings.Join(problems, "; "))
+		return
+	}
+
+	now := time.Now().UTC()
+	op := f.newOperation("vm.resize", "vm", id, now)
+	f.ops[op.ID] = &op
+	vm.resize = &fakeResize{vcpus: vcpus, memoryMB: memoryMB, op: &op, prevState: vm.State, fail: f.resizeFail}
+	vm.inFlight = true
+	vm.UpdatedAt = now
+	rc.json(http.StatusAccepted, map[string]any{"vm": vm.wireVmOut, "operation": op}, "Location", f.operationLocation(op))
+}
+
+func containsInt(list []int, n int) bool {
+	for _, v := range list {
+		if v == n {
+			return true
+		}
+	}
+	return false
+}
+
+// setProtection is PUT /compute/instances/{id}/protection: the delete guard on or off. It changes nothing about the
+// VM itself -- no restart, no operation -- so it answers 200 with the VM.
+func (f *fakeAPI) setProtection(rc *reqCtx, id string) {
+	raw, _ := io.ReadAll(rc.r.Body)
+	f.recordBody("PUT compute/instances/{vm_id}/protection", raw)
+	b := newBodyCheck(bytes.NewReader(raw))
+	var on bool
+	if flag, ok := b.present("protected", true); ok {
+		if err := json.Unmarshal(flag, &on); err != nil {
+			b.fail("protected", "Input should be a valid boolean")
+		}
+	}
+	if errs := b.finish(); len(errs) > 0 {
+		rc.invalid(errs...)
+		return
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	vm, ok := f.vms[id]
+	if !ok || vm.deletedAt != nil {
+		rc.notFound("vm")
+		return
+	}
+	setProtected(vm, on)
+	vm.UpdatedAt = time.Now().UTC()
+	rc.json(http.StatusOK, vm.wireVmOut, "ETag", generationETag(vm.Generation))
+}
+
+// getOperation is GET /operations/{id}, for the operations of the resizes the fake has accepted.
+func (f *fakeAPI) getOperation(rc *reqCtx, id string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	op, ok := f.ops[id]
+	if !ok {
+		rc.notFound("operation")
+		return
+	}
+	rc.json(http.StatusOK, *op)
 }
 
 // --- Public IP handlers ------------------------------------------------
@@ -3018,8 +3312,9 @@ func TestFakeAPI_RefusesWhatTheAPIRefuses(t *testing.T) {
 		name, extra, code, detail string
 	}{
 		{"an ssh key that was never imported", `"ssh_keys":["a"]`, "ssh_key_not_found", "no SSH key named 'a' in this organization; import it with POST /v1/orgs/" + testOrgID + "/compute/ssh-keys"},
-		{"user_data", `"user_data":"#cloud-config"`, "user_data_unsupported", "user_data is not accepted: the instance is built asynchronously, so cloud-init would have to be persisted to reach the worker that boots it -- and cloud-init is where bootstrap secrets go, so where such a payload may live is still an open design question"},
-		{"empty user_data", `"user_data":""`, "user_data_unsupported", ""},
+		{"user_data that is not base64", `"user_data":"#cloud-config"`, "user_data_invalid", "user_data must be standard base64"},
+		{"empty user_data", `"user_data":""`, "user_data_invalid", "user_data is empty"},
+		{"user_data over 32 KiB", `"user_data":"` + base64.StdEncoding.EncodeToString(bytes.Repeat([]byte("a"), fakeMaxUserDataBytes+1)) + `"`, "user_data_invalid", "user_data is larger than 32 KiB once decoded"},
 		{"infra workload", `"workload_type":"infra"`, "workload_not_allowed", "a customer account cannot request infra workloads"},
 	}
 	for _, tc := range cases {

@@ -267,6 +267,9 @@ func (e *APIError) hint() string {
 	case e.Status == http.StatusForbidden && e.Code == "source_address_not_allowed":
 		return "the key's network limits do not include this address; " +
 			"run Terraform from an allowed address or widen the key's network limits"
+	case e.Status == http.StatusConflict && e.Code == "vm_protected":
+		// The provider never lifts a protection for the user: the way out is the attribute that set it.
+		return "set disable_api_termination = false and apply first"
 	case e.Status == http.StatusPreconditionFailed && e.Code == "generation_mismatch":
 		// The API says to retry with the new ETag; the provider read the resource just before, so
 		// this is a race with another change of the same resource, and what the user can do is plan again.
@@ -749,9 +752,9 @@ func (c *Client) orgPath(p string) string {
 // Hostname, when set, is the lower-case FQDN the instance should carry; a nil
 // Hostname is left out of the body entirely, so the instance has no hostname.
 //
-// user_data, disk_type and workload_type are intentionally not represented: the API refuses any non-null user_data
-// and any workload_type other than the server-side default for a customer organization, and the provider names a
-// storage pool rather than a disk type.
+// UserData is the cloud-init text as standard base64 (at most 32 KiB decoded); the API keeps only its presence and never
+// returns it. WorkloadType is "customer" (the API's default) or "infra", which only an internal organization may ask
+// for. Both are left out of the body when empty. disk_type is not represented: the provider names a storage pool.
 type VmCreateRequest struct {
 	Name           string   `json:"name"`
 	Image          string   `json:"image"`
@@ -764,6 +767,8 @@ type VmCreateRequest struct {
 	NetworkProfile string   `json:"network_profile,omitempty"`
 	Hostname       *string  `json:"hostname,omitempty"`
 	SSHKeys        []string `json:"ssh_keys,omitempty"`
+	UserData       string   `json:"user_data,omitempty"`
+	WorkloadType   string   `json:"workload_type,omitempty"`
 }
 
 // ImageRef is the embedded image summary on a Vm.
@@ -809,6 +814,8 @@ type Vm struct {
 	ErrorClass       *string   `json:"error_class"`
 	ErrorDetail      *string   `json:"error_detail"`
 	SSHKeyNames      []string  `json:"ssh_key_names"`
+	WorkloadType     string    `json:"workload_type"`
+	UserDataPresent  bool      `json:"user_data_present"`
 	Protected        bool      `json:"protected"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
@@ -944,6 +951,42 @@ func (c *Client) UpdateVmHostname(ctx context.Context, id string, generation int
 
 	var out Vm
 	if err := c.doJSONWithHeaders(ctx, http.MethodPatch, c.orgPath("compute/instances/"+url.PathEscape(id)), body, idempotencyKey, headers, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// resizeLostHint is what a keyed resize that gave up after a lost answer says: nothing was created, but the resize may
+// be running.
+const resizeLostHint = "the first request may still have started the resize: run another plan to see the size the instance has now"
+
+// ResizeVm sends POST /v1/orgs/{org}/compute/instances/{id}/resize with {"vcpus","memory_mb"} and answers 202 with the
+// instance and the operation that converges it. The instance restarts; a resize that cannot be completed is reverted by
+// the platform. The Idempotency-Key makes the request safe to send again after a lost answer.
+func (c *Client) ResizeVm(ctx context.Context, id string, vcpus, memoryMB int, idempotencyKey string) (*Vm, *Operation, error) {
+	body := struct {
+		VCPUs    int `json:"vcpus"`
+		MemoryMB int `json:"memory_mb"`
+	}{vcpus, memoryMB}
+
+	var out vmAccepted
+	ctx = withLostCreateHint(ctx, resizeLostHint)
+	if err := c.doJSON(ctx, http.MethodPost, c.orgPath("compute/instances/"+url.PathEscape(id)+"/resize"), body, idempotencyKey, &out); err != nil {
+		return nil, nil, err
+	}
+	return &out.Vm, &out.Operation, nil
+}
+
+// SetVmProtection sends PUT /v1/orgs/{org}/compute/instances/{id}/protection with {"protected": protected}: while it is
+// on, deleting the instance is refused with 409 vm_protected. It changes nothing about the instance itself and answers
+// 200 with it. Setting a flag is idempotent, and the Idempotency-Key lets the request be sent again after a lost answer.
+func (c *Client) SetVmProtection(ctx context.Context, id string, protected bool, idempotencyKey string) (*Vm, error) {
+	body := struct {
+		Protected bool `json:"protected"`
+	}{protected}
+
+	var out Vm
+	if err := c.doJSON(ctx, http.MethodPut, c.orgPath("compute/instances/"+url.PathEscape(id)+"/protection"), body, idempotencyKey, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil

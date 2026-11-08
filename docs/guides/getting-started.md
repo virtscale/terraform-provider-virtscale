@@ -225,7 +225,9 @@ If the connection times out, check that `ssh_cidr` is the address you connect fr
 
 ## Change and destroy
 
-Most attributes of an instance cannot be changed in place: a different `name`, `region`, `image`, size (`vcpus`, `memory_mb` or `disk_gb`) or `ssh_keys` replaces the instance, which is destroyed and built again. So does a different `storage_pool` or `network_profile`, if you set one in the configuration; a value you leave out is the platform's choice and is never a change. The plan shows that as `must be replaced`: read it before you apply. The `hostname`, the firewall rules and the public IP's `instance_id` change in place.
+Most attributes of an instance cannot be changed in place: a different `name`, `region`, `image`, `disk_gb`, `ssh_keys` or `user_data` replaces the instance, which is destroyed and built again. So does a different `storage_pool` or `network_profile`, if you set one in the configuration; a value you leave out is the platform's choice and is never a change. The plan shows that as `must be replaced`: read it before you apply. The `hostname`, `disable_api_termination`, the firewall rules and the public IP's `instance_id` change in place, and so do `vcpus` and `memory_mb`: a resize keeps the instance and its disk, but **the instance restarts** (apply waits until it is back), and an organization may have resizing switched off (`503 not_ready`).
+
+An instance with `disable_api_termination = true` cannot be destroyed or replaced: the API refuses with `409 vm_protected`. Set the attribute to `false`, apply, and then destroy; the provider never lifts the protection for you.
 
 ```shell
 tofu destroy

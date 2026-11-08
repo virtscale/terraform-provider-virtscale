@@ -480,7 +480,9 @@ func guide(secrets []string, imports map[string]string) string {
 		"safe as the state.\n" +
 		"- **The provider configuration.** `api_key` is not stored in the state, but it is better kept out of configuration files " +
 		"and variables: set `VIRTSCALE_API_KEY` in the environment.\n" +
-		"- **Instance data.** The provider has no `user_data` attribute, so no instance data is stored.\n" +
+		"- **Instance data.** `virtscale_instance.user_data` is cloud-init text, and cloud-init is where bootstrap secrets go: " +
+		"it is sensitive, so plan and apply output hide it, but the state holds it as text, like every sensitive attribute. " +
+		"The API never returns it, so an imported instance has none.\n" +
 		"- **IAM.** The provider has no resource for IAM: members, invitations and API keys are managed by people, because no " +
 		"API key scope holds `iam.*` (a key cannot mint keys, so a leaked key cannot widen its reach).\n\n")
 	b.WriteString("## Import\n\nEvery resource is imported by the id shown below; a VPC is addressed through its project, so its id has two parts. " +

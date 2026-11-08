@@ -184,9 +184,9 @@ func testAccCheckInstanceDestroy(fake *fakeAPI) resource.TestCheckFunc {
 }
 
 // TestAccInstanceResource_Lifecycle covers scenarios (1)-(4): create ->
-// running with attributes set, ImportStateVerify, a vcpus change planning a
-// replace and ending running again, then destroy leaving the fake's copy of
-// the vm in state "deleted".
+// running with attributes set, ImportStateVerify, a vcpus change resizing the
+// same instance in place (it was a replacement before P1) and ending running
+// again, then destroy leaving the fake's copy of the vm in state "deleted".
 func TestAccInstanceResource_Lifecycle(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
@@ -220,13 +220,19 @@ func TestAccInstanceResource_Lifecycle(t *testing.T) {
 			{
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
-						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionDestroyBeforeCreate),
+						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionUpdate),
 					},
 				},
 				Config: testAccInstanceConfig(fake, "lifecycle-1", 2),
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_instance.test", "state", "running"),
 					resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "2"),
+					func(*terraform.State) error {
+						if n := fake.CreateCount(); n != 1 {
+							return fmt.Errorf("creates = %d, want 1: a vcpus change resizes in place", n)
+						}
+						return nil
+					},
 				),
 			},
 		},
@@ -587,15 +593,15 @@ func TestAccInstanceResource_ReplacingAProtectedVmKeepsTheRefusal(t *testing.T) 
 				Config: testAccInstanceConfig(fake, "protected-vm", 1),
 				Check:  vmIDFromState(&id),
 			},
-			{
+			{ // A disk change replaces the instance (a vcpus change resizes it in place since P1).
 				PreConfig:   func() { fake.Protect(id, true) },
-				Config:      testAccInstanceConfig(fake, "protected-vm", 2),
+				Config:      attrConfig(fake, "protected-vm", 1, 1024, 20, ""),
 				ExpectError: regexp.MustCompile(`vm_protected`),
 			},
 			{
 				PreConfig: func() { fake.Protect(id, false) },
-				Config:    testAccInstanceConfig(fake, "protected-vm", 2),
-				Check:     resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "2"),
+				Config:    attrConfig(fake, "protected-vm", 1, 1024, 20, ""),
+				Check:     resource.TestCheckResourceAttr("virtscale_instance.test", "disk_gb", "20"),
 			},
 		},
 	})
@@ -953,8 +959,8 @@ func TestAccInstanceResource_ATakenHostnameIsRefusedWithTheAPIsSentence(t *testi
 }
 
 // TestAccInstanceResource_ReplacingKeepsTheHostname: hostname survives a
-// replacement (vcpus changed): the destroyed instance releases the name, so the
-// replacement may take it again.
+// replacement (disk_gb changed; a vcpus change resizes in place since P1): the
+// destroyed instance releases the name, so the replacement may take it again.
 func TestAccInstanceResource_ReplacingKeepsTheHostname(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 
@@ -968,7 +974,7 @@ func TestAccInstanceResource_ReplacingKeepsTheHostname(t *testing.T) {
 				Check:  resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
 			},
 			{
-				Config: testAccInstanceConfigExtra(fake, "keep-hostname", 2, `hostname = "a.example.com"`),
+				Config: attrConfig(fake, "keep-hostname", 1, 1024, 20, `hostname = "a.example.com"`),
 				ConfigPlanChecks: resource.ConfigPlanChecks{
 					PreApply: []plancheck.PlanCheck{
 						plancheck.ExpectResourceAction("virtscale_instance.test", plancheck.ResourceActionDestroyBeforeCreate),
@@ -976,7 +982,7 @@ func TestAccInstanceResource_ReplacingKeepsTheHostname(t *testing.T) {
 				},
 				Check: resource.ComposeAggregateTestCheckFunc(
 					resource.TestCheckResourceAttr("virtscale_instance.test", "hostname", "a.example.com"),
-					resource.TestCheckResourceAttr("virtscale_instance.test", "vcpus", "2"),
+					resource.TestCheckResourceAttr("virtscale_instance.test", "disk_gb", "20"),
 					func(*terraform.State) error {
 						if n := fake.CallCount("PATCH compute/instances/{vm_id}"); n != 0 {
 							return fmt.Errorf("a replacement sent %d PATCH(es), want 0", n)
