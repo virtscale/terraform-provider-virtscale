@@ -4,11 +4,12 @@ Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virts
 
 ## Status
 
-Pre-release. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is
-the source of truth. Until the first release it is used via `dev_overrides` only; nothing is on a Terraform registry
-yet. GitLab push-mirrors to `github.com/virtscale/terraform-provider-virtscale`, where GitHub Actions builds, signs and
-publishes a release to registry.terraform.io and registry.opentofu.org when a `v*` tag arrives; see
-[RELEASING.md](RELEASING.md).
+Version 0.1.0 is released and published on registry.terraform.io, and it installs with Terraform and with OpenTofu when
+the source carries the registry host: `registry.terraform.io/virtscale/virtscale`. registry.opentofu.org does not list
+it yet, so the short source `virtscale/virtscale` fails in OpenTofu until the requests `opentofu/registry` #6388 and
+#6396 are merged. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is the
+source of truth. GitLab push-mirrors to `github.com/virtscale/terraform-provider-virtscale`, where GitHub Actions builds,
+signs and publishes a release when a `v*` tag arrives; see [RELEASING.md](RELEASING.md).
 
 ## What it provides
 
@@ -45,21 +46,27 @@ schema fails CI), check that a broken example is refused, and check that no exam
 The import ids on the pages are checked against what each resource's `ImportState` takes. The pages also say what the
 validators of an attribute accept.
 
-## Install from the registry (available from the first release)
+## Install from the registry
 
-No version is released yet, so `init` finds nothing today; use `dev_overrides` (below) until the first release. From
-then on a configuration needs only the source address, and Terraform and OpenTofu each fetch the provider from their own
-registry:
+Write the full source address, with the registry host. It works in Terraform and in OpenTofu, because both fetch the
+provider from registry.terraform.io when the source names that host:
 
 ```hcl
 terraform {
   required_providers {
     virtscale = {
-      source = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
+      version = "~> 0.1"
     }
   }
 }
 ```
+
+The short source `virtscale/virtscale` means the CLI's own default registry. For OpenTofu that is registry.opentofu.org,
+which answers 404 for this provider until it is added there, so `tofu init` fails with `provider registry
+registry.opentofu.org does not have a provider named registry.opentofu.org/virtscale/virtscale`. Terraform CLI users
+may shorten the source to `virtscale/virtscale`; every example and guide here keeps the long form so that one
+configuration serves both CLIs.
 
 Pin a release with `version = "..."` (the registry page lists them). Both CLIs verify the release's checksums and their
 GPG signature against the key the registry holds. `dev_overrides` stays the way to run a local build while developing.
@@ -78,10 +85,12 @@ go install .
 
 ## Local use (dev_overrides)
 
-OpenTofu resolves `source = "virtscale/virtscale"` against `registry.opentofu.org`; a plain Terraform CLI
-resolves the same source string against `registry.terraform.io`. A `dev_overrides` block must list **both**
-hostnames, pointing at the same local build directory, or you'll see `Inconsistent dependency lock file`.
-With `dev_overrides` in effect, `tofu init` / `terraform init` is skipped entirely for that provider.
+A configuration with the full source `registry.terraform.io/virtscale/virtscale` (as in every example here) needs only
+the `registry.terraform.io` line below. OpenTofu resolves the short source `virtscale/virtscale` against
+`registry.opentofu.org` and a plain Terraform CLI against `registry.terraform.io`, so list **both** hostnames, pointing
+at the same local build directory, when a configuration may use the short source or both CLIs: a block that names only
+one fails with `Inconsistent dependency lock file` under the other. With `dev_overrides` in effect, `tofu init` /
+`terraform init` is skipped entirely for that provider.
 
 Create a CLI config file, e.g. `~/.tfrc.d/dev.tfrc`:
 
@@ -192,8 +201,8 @@ resource may exist without being in state. The error says so and says what to do
 `not_ready`, a refusal of the API and a certificate error carry no such hint: nothing was created.
 
 Waiting for a result is separate from retrying a request: creating an instance waits up to 20 minutes for
-state `running` and fails at once, with the API's `error_class` and `error_detail`, if it reaches `error`;
-destroying waits up to 10 minutes; each public IP operation waits up to 10 minutes. Waits poll every 5 seconds.
+state `running` (in practice 30 to 60 seconds) and fails at once, with the API's `error_class` and `error_detail`, if it reaches `error`;
+destroying waits up to 10 minutes (an instance is gone in about 15 seconds); each public IP operation waits up to 10 minutes. Waits poll every 5 seconds.
 
 ## Errors
 
@@ -212,7 +221,7 @@ Only a `404` that says the resource itself is gone is read as "gone": its code i
 the API's sentence for that kind of resource (an instance, a public IP or an SSH key, as asked about). Every other
 `404` is an error with the API's own detail, and the resource stays in state: a `404` about the organization
 (pointing the provider at the wrong organization), about the compute service or a region, an unknown route (a
-mistyped `endpoint`) and a proxy's error page. Dropping a live resource on a wrong `404` would orphan it, and a
+mistyped `endpoint`: a bare `404 not_found: Not Found`, with no hint) and a proxy's error page. Dropping a live resource on a wrong `404` would orphan it, and a
 destroy that waits for "gone" would report a deletion nobody saw.
 
 Error text that came from the response has your API key replaced by `[redacted]`, in case a proxy in front of
@@ -227,12 +236,12 @@ the API prints the request.
 | `name`            | string | Required, forces replacement | 1-63 lowercase letters, digits or hyphens, starting and ending with a letter or digit; checked at plan time (the API lower-cases names and strips a trailing `.virtscale.nl`, so any other form would come back different). Unique among live instances in the same region; a deleted instance's name is reusable. |
 | `region`          | string | Required, forces replacement | |
 | `image`           | string | Required, forces replacement | Image id from `virtscale_images`. Set at creation only; the provider does not detect image drift in v0. |
-| `instance_type`   | string | Optional, Computed, forces replacement when set to a different value | A catalogue type from `virtscale_instance_types`, for example `g1-small`. It sets the three sizes; name it **or** give `vcpus`, `memory_mb` and `disk_gb`, not both. The first VM needs only a type: no pool or profile id. Read back from the API (null for an instance it reports no type for). The platform may require a type, in which case raw sizes are refused with `422 instance_type_required`. |
-| `vcpus`           | number | Optional, Computed, forces replacement when set to a different value | Taken from `instance_type` when one is named; otherwise `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` are given together. |
-| `memory_mb`       | number | Optional, Computed, forces replacement when set to a different value | As `vcpus`. |
-| `disk_gb`         | number | Optional, Computed, forces replacement when set to a different value | As `vcpus`. |
-| `storage_pool`    | string | Optional, Computed, forces replacement when set to a different value | Left out with `instance_type`, the API uses the type's own pool; with raw sizes it is required. State holds the pool the instance is on. |
-| `network_profile` | string | Optional, Computed, forces replacement when set to a different value | Left out, the API picks the first profile your organization may use in the region on the hosts the instance is placed on. State holds the profile the instance is on. |
+| `instance_type`   | string | Optional, Computed, forces replacement when set to a different value | A catalogue type from `virtscale_instance_types`, for example `g1-small`. It sets the three sizes; name it **or** give `vcpus`, `memory_mb` and `disk_gb`, not both. **Production has no orderable types today** (`virtscale_instance_types` returns none, and a type is refused with `422 instance_type_unpriced`): give the sizes instead. Read back from the API (null for an instance it reports no type for). A platform that only sells types refuses raw sizes with `422 instance_type_required`. |
+| `vcpus`           | number | Optional, Computed, forces replacement when set to a different value | 1, 2, 4, 8, 16 or 32. Taken from `instance_type` when one is named; otherwise `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` are given together. |
+| `memory_mb`       | number | Optional, Computed, forces replacement when set to a different value | Whole gigabytes from 1 to 128, written in megabytes: gigabytes times 1024 (1024 for 1 GB, 4096 for 4 GB, 131072 for 128 GB). Given with `vcpus`, as above. |
+| `disk_gb`         | number | Optional, Computed, forces replacement when set to a different value | 10 to 2000, in steps of 10. Given with `vcpus`, as above. |
+| `storage_pool`    | string | Optional, Computed, forces replacement when set to a different value | For example `gro-ceph` in `gro`. Left out with `instance_type`, the API uses the type's own pool; with raw sizes it is required. State holds the pool the instance is on. |
+| `network_profile` | string | Optional, Computed, forces replacement when set to a different value | For example `gro-tenant-default` in `gro`. Left out, the API picks the first profile your organization may use in the region on the hosts the instance is placed on. State holds the profile the instance is on. |
 | `ssh_keys`        | list(string) | Optional, forces replacement | Names of keys imported into the organization with `virtscale_ssh_key`, at most 10, each listed once (both checked at plan time, with the API's own wording). cloud-init installs them for the image's default user (for example `debian` or `ubuntu`) at first boot, and the instance keeps them if a key is deleted or replaced later. A name that was never imported is `422 ssh_key_not_found`, and a `503 not_ready` means SSH keys are not switched on for this API yet. Read back from the API on import, so an imported instance does not plan a replacement for its keys. The API refuses `user_data`, so the provider has no such attribute. |
 | `hostname`        | string | Optional, Computed | The lower-case fully qualified name the instance is known by in your organization (for example `web.example.com`); checked at plan time (labels of lowercase letters, digits and hyphens, at least two labels, at most 253 characters). Unique among the organization's live instances: a duplicate is `409 hostname_taken`; another organization may use the same name. It is a handle only: the platform creates no DNS record for it. Changing it is an in-place update, not a replacement. It is read back on every refresh, so a change made elsewhere shows as a difference, and `tofu import` fills it. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). |
 | `id`              | string | Computed | |
@@ -249,9 +258,17 @@ wording. What the API decides it still decides, and its answer is shown as it co
 a type it does not sell in the region, `422 storage_pool_unavailable`, `422 network_profile_unavailable`. A value
 left out of the configuration is the API's choice, read back into state: naming a different one later replaces the
 instance, and taking the line out again keeps what the instance has, so the next plan is empty.
-The API checks `vcpus`, `memory_mb` and `disk_gb` against the platform's size limits and the image's
-minimums (`min_disk_gb` and `min_ram_mb` in `virtscale_images`); a refusal lists every violation
-(`422 invalid_spec`). Destroying an instance waits until it is gone. Every attribute except `hostname` forces
+The API checks `vcpus`, `memory_mb` and `disk_gb` against a size grid: `vcpus` is 1, 2, 4, 8, 16 or 32, memory is whole
+gigabytes from 1 to 128 (`memory_mb` is gigabytes times 1024) and `disk_gb` is 10 to 2000 in steps of 10; a size off
+the grid is refused with a list of every violation (`422 invalid_spec`). The organization's quota must have room for it
+as well. Until the instance-type catalogue has orderable types, look the values up in the API: `GET
+/v1/orgs/{org}/compute/limits`, `GET /v1/orgs/{org}/compute/storage-pools` and `GET
+/v1/orgs/{org}/compute/network-profiles`. The `min_disk_gb` and `min_ram_mb` of an image are 0 today and are no guide to
+a size. Destroying an instance waits until it is gone.
+
+The provider does not manage power state. An instance stopped through the API stays stopped, and the plan stays empty
+(`state` reads `stopped` after the next refresh). An instance create takes about 30 to 60 seconds and a destroy about
+15 seconds; the waits below are ceilings, not what to expect. Every attribute except `hostname` forces
 replacement; changing `hostname` is an in-place update (one PATCH, guarded by the instance's current generation
 read just before it, so a change made at the same moment by someone else is refused with `412
 generation_mismatch` and the next run picks it up).
@@ -285,11 +302,12 @@ resource "virtscale_instance" "web" {
 
 **One key, one meaning, whatever the text.** The API stores the key in canonical form, `<type> <base64>`, with the
 comment dropped. The provider compares the key type and the decoded key bytes, not the text. So
-`file("~/.ssh/id_ed25519.pub")`, with its comment and trailing newline, never differs from what the API stores;
+`file("~/.ssh/id_ed25519.pub")`, with its comment and trailing newline, is the same key as what the API stores;
 surrounding whitespace and CRLF line endings do not matter; and two spellings of one base64 string (spare bits in
-its last character) are one key. A plan that only changes the text of the same key is an in-place update that stores
-your text and makes no API call. That is what you see right after `tofu import`, where the state holds the API's
-canonical form and your configuration holds the file with its comment. It never replaces the key. A different key
+its last character) are one key. The text is still shown: a plan that only changes the text of the same key, such as an
+edit of the comment, shows an in-place `~ public_key` change that stores your text and makes no API call. That is also
+what you see in the first plan after `tofu import`, where the state holds the API's canonical form and your
+configuration holds the file with its comment. It never replaces the key. A different key
 does: the old key is destroyed and the new one is created (the API's import, not `tofu import`). A text that does not parse (a bad key) is compared exactly, so it still reaches the API,
 which refuses it with `422 invalid_public_key`.
 
@@ -330,7 +348,8 @@ The data source `virtscale_project` takes an optional `name` and returns `id`, `
 A private address space in one project and one region, built and deleted asynchronously: apply waits (up to 20
 minutes) until the VPC is `active` and fails with the platform's reason if it ends in `error`; destroy waits (up to 10
 minutes) until it is gone. A VPC has no update call, so a change to any attribute replaces it. VPCs are switched on per
-deployment: where they are not, every call is `503 not_ready` and the error says so.
+deployment: where they are not, every call is `503 not_ready` and the error says so. **Production does not switch them
+on yet:** a plan succeeds there, and only the apply fails, at once, with `503 not_ready`.
 
 | Attribute         | Type   | Required/Computed | Notes |
 | ----------------- | ------ | ----------------- | ----- |
@@ -415,7 +434,7 @@ service switched on (the panel does it), and has a limit of buckets (`422 bucket
 | `versioning`     | bool   | Optional, default `false` | Keep previous versions of overwritten and deleted objects. Fixed at creation: a change is refused at plan time, because replacing the bucket would soft-delete it and its name stays taken (below). |
 | `max_size_bytes` | number | Optional | The most bytes this bucket may hold, inside the organization's ceiling (`422 bucket_quota_exceeds_plan` above it). Leave it out for no per-bucket cap. Changes in place; removing it clears the cap. |
 | `max_objects`    | number | Optional | The most objects. Same rules. |
-| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it, a bucket whose last metering sample saw objects or bytes is `409 bucket_not_empty` (what the API calls empty is below). The provider's own: the API does not store it, so import leaves it `false`. |
+| `force_destroy`  | bool   | Optional, default `false` | Acknowledge on destroy that the bucket may hold objects. Without it, a bucket whose last metering sample saw objects or bytes is `409 bucket_not_empty` (what the API calls empty is below); a young bucket that has no sample yet is not (below). The provider's own: the API does not store it, so import leaves it `false`. |
 | `id`, `state`, `created_at` | string | Computed | |
 
 Deleting is a **soft delete**: the API marks the bucket `deleting_soft` and answers `202` at once, its data is kept for
@@ -441,9 +460,11 @@ incomplete multipart uploads) is `409 bucket_not_empty` unless `force_destroy` i
 and counts, and on a versioned bucket it says that the sample counts previous versions a plain object listing does not
 show, so deleting every object you can see does not make it empty. **When there is no sample the API lets the delete
 through** without `force_destroy`: none for the organization, none for this bucket, or only one older than the bucket
-(a bucket filled or created since the last sample is let through the same way). A bucket you have just emptied can still
-be refused until the next sample; set `force_destroy = true`, apply, and destroy again. Nothing is erased either way and
-the retention window is unchanged.
+(a bucket filled or created since the last sample is let through the same way). So a young bucket, one that has had no
+sample yet (samples come every 10 minutes), is soft-deleted with `force_destroy = false` even when it holds objects. It
+is recoverable: the objects are kept for the 7 days of the retention window and the panel can restore the bucket. A
+bucket you have just emptied can still be refused until the next sample; set `force_destroy = true`, apply, and
+destroy again. Nothing is erased either way and the retention window is unchanged.
 
 If a create fails after the bucket was made (the API refuses a ceiling, `422 bucket_quota_exceeds_plan`; the bucket ends
 in `provision_failed`), the bucket is in the state, tainted by the error, and the next apply would replace it, which
@@ -454,7 +475,8 @@ id: `tofu import virtscale_s3_bucket.logs <id>`.
 
 ### `virtscale_s3_access_key`
 
-An S3 access key for the organization's storage. There is nothing to configure. **The secret is returned exactly once,
+An S3 access key for the organization's storage. There is nothing to configure. An organization holds at most 5 active
+access keys: a sixth is `422 access_key_limit_reached` until one is revoked. **The secret is returned exactly once,
 by the request that creates the key**, so the provider keeps `secret_access_key` in the state, marked sensitive. That
 means the state holds a credential: use an encrypted backend (or OpenTofu's state encryption), and do not print the
 attribute in an output. A key's secret cannot be read back, so an imported key has none (`secret_access_key` is null).
@@ -529,7 +551,7 @@ Read-only catalogues, in the order the API gives them. `virtscale_regions.region
 `status` (`active`, `coming_soon`, `maintenance`, `retired`), `access`, `entitled` (whether this organization may use
 a restricted region), `default` and `disk_types` (`disk_type` and `status`). `virtscale_instance_types.instance_types`
 lists `id`, `vrn`, `name`, `family`, `cpu_kind`, `vcpus`, `memory_mb`, `disk_gb`, `regions` (where it can be ordered
-now) and `status`; the optional `region` keeps the types that can be ordered there. `virtscale_plans.plans` lists the
+now) and `status`; the optional `region` keeps the types that can be ordered there. Production has no orderable types today, so the list is empty there. `virtscale_plans.plans` lists the
 Managed VPS plans with `id`, `name`, `vcpus`, `ram_mb`, `disk_gb`, `monthly_price_cents`, `currency`, `status`,
 `management_level` and `backup_policy`.
 
@@ -539,7 +561,7 @@ Managed VPS plans with `id`, `name`, `vcpus`, `ram_mb`, `disk_gb`, `monthly_pric
 | --------- | ------ | ------------------ | ----- |
 | `region`  | string | Required | |
 | `id`      | string | Computed | Set to `region`. |
-| `images`  | list(object) | Computed | Sorted by `name`. Each object: `id`, `name`, `os_distro` (nullable), `os_version` (nullable), `min_disk_gb`, `min_ram_mb`. |
+| `images`  | list(object) | Computed | Sorted by `name`. Each object: `id`, `name`, `os_distro` (nullable), `os_version` (nullable), `min_disk_gb`, `min_ram_mb` (both 0 for every image today: not a guide to a size). |
 
 ## Testing
 

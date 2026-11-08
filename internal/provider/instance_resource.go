@@ -238,7 +238,17 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"An instance resized outside Terraform keeps its instance_type in the API. If the configuration names only " +
 			"instance_type, the next refresh shows the new vcpus and memory_mb in state but plans no change. To manage " +
 			"the sizes, set vcpus, memory_mb, disk_gb and storage_pool in the configuration instead of instance_type; a " +
-			"size that then differs from the configuration plans a replacement.",
+			"size that then differs from the configuration plans a replacement.\n\n" +
+			"Size an instance with vcpus, memory_mb, disk_gb and storage_pool. The API takes this grid: vcpus is 1, 2, " +
+			"4, 8, 16 or 32; memory is whole gigabytes from 1 to 128, given in megabytes (gigabytes times 1024, so " +
+			"memory_mb is 1024 to 131072); disk_gb is 10 to 2000 in steps of 10. A size off the grid is refused with " +
+			"422 invalid_spec, which lists every violation. Where to look the values up today: the API at GET " +
+			"/v1/orgs/{org}/compute/limits, /compute/storage-pools and /compute/network-profiles. The catalogue of " +
+			"instance types is empty in production, so there instance_type is refused with 422 instance_type_unpriced. " +
+			"The min_disk_gb and min_ram_mb of an image are 0 today: they are no guide to a size.\n\n" +
+			"The provider does not manage power state. An instance stopped through the API stays stopped and the plan " +
+			"stays empty; state shows stopped after the next refresh. A create takes about 30 to 60 seconds and a " +
+			"destroy about 15 seconds (apply waits up to 20 minutes for a create and 10 for a destroy).",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:    true,
@@ -290,7 +300,8 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"Read back from the API, so it is null for an instance the API reports no type for; an " +
 					"instance that has one keeps it when the line is removed. A different type replaces the " +
 					"instance. The platform may require a type, in which case it refuses vcpus, memory_mb and " +
-					"disk_gb with 422 instance_type_required.",
+					"disk_gb with 422 instance_type_required. Production has no orderable types yet: a type is " +
+					"refused there with 422 instance_type_unpriced, so give the sizes instead.",
 				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
 				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 				PlanModifiers: []planmodifier.String{
@@ -301,26 +312,28 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"vcpus": schema.Int64Attribute{
 				Optional: true,
 				Computed: true,
-				Description: "Number of virtual CPUs. Taken from instance_type when one is named; otherwise give " +
-					"vcpus, memory_mb, disk_gb and storage_pool together.",
+				Description: "Number of virtual CPUs: 1, 2, 4, 8, 16 or 32. Taken from instance_type when one is " +
+					"named; otherwise give vcpus, memory_mb, disk_gb and storage_pool together.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
 					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"memory_mb": schema.Int64Attribute{
-				Optional:    true,
-				Computed:    true,
-				Description: "Memory, in megabytes. Taken from instance_type when one is named.",
+				Optional: true,
+				Computed: true,
+				Description: "Memory, in megabytes: whole gigabytes from 1 to 128, so gigabytes times 1024 (1024 for " +
+					"1 GB, 131072 for 128 GB). Taken from instance_type when one is named.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
 					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"disk_gb": schema.Int64Attribute{
-				Optional:    true,
-				Computed:    true,
-				Description: "Boot disk size, in gigabytes. Taken from instance_type when one is named.",
+				Optional: true,
+				Computed: true,
+				Description: "Boot disk size, in gigabytes: 10 to 2000, in steps of 10. Taken from instance_type " +
+					"when one is named.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
 					int64planmodifier.RequiresReplaceIfConfigured(),
@@ -329,10 +342,11 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"storage_pool": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
-				Description: "The storage pool id to place the instance's disk on. Left out with instance_type, the " +
-					"API uses the type's own pool; with vcpus, memory_mb and disk_gb it is required. State holds the " +
-					"pool the instance is on. Naming a different pool replaces the instance; removing the line keeps " +
-					"the pool.",
+				Description: "The storage pool id to place the instance's disk on, for example gro-ceph in gro (the " +
+					"API lists the organization's pools at GET /v1/orgs/{org}/compute/storage-pools). Left out with " +
+					"instance_type, the API uses the type's own pool; with vcpus, memory_mb and disk_gb it is " +
+					"required. State holds the pool the instance is on. Naming a different pool replaces the " +
+					"instance; removing the line keeps the pool.",
 				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
 				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
 				PlanModifiers: []planmodifier.String{
@@ -343,9 +357,10 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 			"network_profile": schema.StringAttribute{
 				Optional: true,
 				Computed: true,
-				Description: "The network profile id to attach the instance to. Left out, the API picks the first " +
-					"profile your organization may use in the region on the hosts the instance is placed on. State " +
-					"holds the profile the instance is on. Naming a different profile replaces the instance; " +
+				Description: "The network profile id to attach the instance to, for example gro-tenant-default in gro " +
+					"(the API lists them at GET /v1/orgs/{org}/compute/network-profiles). Left out, the API picks the " +
+					"first profile your organization may use in the region on the hosts the instance is placed on. " +
+					"State holds the profile the instance is on. Naming a different profile replaces the instance; " +
 					"removing the line keeps the profile.",
 				// An empty string is not a choice: the API would pick a value and the apply would fail as inconsistent.
 				Validators: []validator.String{stringvalidator.LengthAtLeast(1)},

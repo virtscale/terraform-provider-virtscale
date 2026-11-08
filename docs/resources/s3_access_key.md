@@ -2,12 +2,12 @@
 page_title: "virtscale_s3_access_key Resource - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  An S3 access key for the organization's storage. The secret is returned exactly once, by the request that mints the key, and nowhere else: the provider keeps it in the state, marked sensitive, so the state holds a credential and must be protected (an encrypted backend, or OpenTofu state encryption). It cannot be read back, so an imported key has none. Destroying the resource revokes the key. Note that the key is a key on the organization's own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete window. Needs an API key with the storage:write (or write) scope.
+  An S3 access key for the organization's storage. The secret is returned exactly once, by the request that mints the key, and nowhere else: the provider keeps it in the state, marked sensitive, so the state holds a credential and must be protected (an encrypted backend, or OpenTofu state encryption). It cannot be read back, so an imported key has none. Destroying the resource revokes the key. Note that the key is a key on the organization's own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete window. An organization holds at most 5 active access keys: a sixth is refused with 422 access_key_limit_reached until one is revoked. Needs an API key with the storage:write (or write) scope.
 ---
 
 # virtscale_s3_access_key (Resource)
 
-An S3 access key for the organization's storage. The secret is returned exactly once, by the request that mints the key, and nowhere else: the provider keeps it in the state, marked sensitive, so the state holds a credential and must be protected (an encrypted backend, or OpenTofu state encryption). It cannot be read back, so an imported key has none. Destroying the resource revokes the key. Note that the key is a key on the organization's own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete window. Needs an API key with the storage:write (or write) scope.
+An S3 access key for the organization's storage. The secret is returned exactly once, by the request that mints the key, and nowhere else: the provider keeps it in the state, marked sensitive, so the state holds a credential and must be protected (an encrypted backend, or OpenTofu state encryption). It cannot be read back, so an imported key has none. Destroying the resource revokes the key. Note that the key is a key on the organization's own storage owner: it can delete the organization's buckets and objects directly over S3, bypassing the soft-delete window. An organization holds at most 5 active access keys: a sixth is refused with 422 access_key_limit_reached until one is revoked. Needs an API key with the storage:write (or write) scope.
 
 ## Example Usage
 

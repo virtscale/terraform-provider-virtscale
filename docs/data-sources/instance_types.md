@@ -2,12 +2,12 @@
 page_title: "virtscale_instance_types Data Source - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  The public instance types, in the order the API lists them (by sort order, then id).
+  The public instance types, in the order the API lists them (by sort order, then id). The catalogue is empty in production today, so the list is empty there and an instance is sized with vcpus, memory_mb, disk_gb and storage_pool instead.
 ---
 
 # virtscale_instance_types (Data Source)
 
-The public instance types, in the order the API lists them (by sort order, then id).
+The public instance types, in the order the API lists them (by sort order, then id). The catalogue is empty in production today, so the list is empty there and an instance is sized with vcpus, memory_mb, disk_gb and storage_pool instead.
 
 ## Example Usage
 

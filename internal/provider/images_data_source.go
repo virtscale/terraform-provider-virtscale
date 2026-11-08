@@ -87,11 +87,11 @@ func (d *ImagesDataSource) Schema(_ context.Context, _ datasource.SchemaRequest,
 						},
 						"min_disk_gb": schema.Int64Attribute{
 							Computed:    true,
-							Description: "The minimum boot disk size, in gigabytes, this image requires.",
+							Description: "The minimum boot disk size, in gigabytes, this image requires. 0 today for every image: not a guide to choosing a size.",
 						},
 						"min_ram_mb": schema.Int64Attribute{
 							Computed:    true,
-							Description: "The minimum memory, in megabytes, this image requires.",
+							Description: "The minimum memory, in megabytes, this image requires. 0 today for every image: not a guide to choosing a size.",
 						},
 					},
 				},

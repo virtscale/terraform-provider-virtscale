@@ -69,7 +69,8 @@ func (r *VpcResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *
 		Description: "A VPC: a private address space in one project and one region. It is built and deleted " +
 			"asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed " +
 			"after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope " +
-			"(and compute:read to find the project, for example with the virtscale_project data source).",
+			"(and compute:read to find the project, for example with the virtscale_project data source). VPCs are " +
+			"not switched on in production yet: a plan succeeds, but every call, apply included, answers 503 not_ready.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed: true, Description: "The VPC's id (a UUID), assigned by the API.",

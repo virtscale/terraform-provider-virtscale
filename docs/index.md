@@ -15,7 +15,7 @@ Interact with the VirtScale customer API (compute instances, and more) as Terraf
 terraform {
   required_providers {
     virtscale = {
-      source = "virtscale/virtscale"
+      source = "registry.terraform.io/virtscale/virtscale"
     }
   }
 }
@@ -37,7 +37,7 @@ provider "virtscale" {}
 
 - [Authentication](guides/authentication.md): Create an organization API key in the customer panel, choose its scopes, give it to the provider through the environment, and rotate it.
 - [Getting started](guides/getting-started.md): Build a first VM end to end with the virtscale provider: an SSH key, an instance, a firewall and a public IP, then plan, apply, connect and destroy.
-- [Installation](guides/installation.md): Install the virtscale provider from the Terraform or OpenTofu registry, pin and lock its version, verify the release signature, or build it locally.
+- [Installation](guides/installation.md): Install the virtscale provider with Terraform or OpenTofu, pin and lock its version, verify the release signature, or build it locally.
 - [State, secrets and import](guides/state-secrets-and-import.md): What the state of the virtscale provider holds, which attributes are sensitive, and how to import each resource.
 
 ## Resources

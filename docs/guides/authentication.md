@@ -56,7 +56,7 @@ Set both variables in the shell that runs `init`, `plan` and `apply`, or in your
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
@@ -79,7 +79,7 @@ Check that the key works, and what it may do, with the `virtscale_caller` data s
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
@@ -113,7 +113,7 @@ output "api_key_expires_at" {
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
