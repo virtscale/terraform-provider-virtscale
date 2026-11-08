@@ -40,6 +40,51 @@ func TestGiveUp_AGatewayErrorAfterAThrottleSaysItGaveUp(t *testing.T) {
 	}
 }
 
+// The suffix follows the real retry decision for the last attempt, not the status class: a 500 is never retried, and a 502
+// on a request that cannot be repeated (a POST without an Idempotency-Key) is not either, so after a 429 they are answers.
+func TestGiveUp_TheSuffixFollowsTheRetryDecisionOfTheLastAttempt(t *testing.T) {
+	throttle := problemStep(429, "rate_limited", "Retry-After", "1")
+	cases := []struct {
+		name  string
+		steps []func(http.ResponseWriter, *http.Request)
+		run   func(c *Client) error
+		calls int
+		want  bool
+	}{
+		{"429 then 500 on a GET", []func(http.ResponseWriter, *http.Request){throttle, problemStep(500, "internal_error")}, getVm, 2, false},
+		{"429 then 502 on a keyless POST", []func(http.ResponseWriter, *http.Request){throttle, htmlStep(502)}, createVmKeyless, 2, false},
+		{"429 then 502 on a keyed POST, until the limit", []func(http.ResponseWriter, *http.Request){throttle, htmlStep(502)}, createVmKeyed, 5, true},
+		{"429 then 502 on a GET, until the limit", []func(http.ResponseWriter, *http.Request){throttle, htmlStep(502)}, getVm, 5, true},
+		{"429 five times", []func(http.ResponseWriter, *http.Request){throttle}, getVm, 5, true},
+		{"429 then 503 not_ready", []func(http.ResponseWriter, *http.Request){throttle, problemStep(503, "not_ready")}, getVm, 2, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, sc, _ := newScriptedClient(t, tc.steps...)
+			err := tc.run(c)
+			apiErr := asAPIError(t, err)
+			if sc.count() != tc.calls {
+				t.Errorf("calls = %d, want %d", sc.count(), tc.calls)
+			}
+			if got := strings.Contains(apiErr.Error(), "gave up after"); got != tc.want {
+				t.Errorf("Error() = %q; gave-up suffix = %v, want %v", apiErr, got, tc.want)
+			}
+		})
+	}
+}
+
+func getVm(c *Client) error { _, err := c.GetVm(context.Background(), "vm-1"); return err }
+
+func createVmKeyless(c *Client) error {
+	_, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, "")
+	return err
+}
+
+func createVmKeyed(c *Client) error {
+	_, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, "key-1")
+	return err
+}
+
 // A 404 that is not a VirtScale problem answer came from somewhere else: a mistyped endpoint. The error says where to look.
 func TestAPIError_ANotFoundThatIsNotFromTheAPINamesTheEndpoint(t *testing.T) {
 	const hint = "check VIRTSCALE_ENDPOINT (or the provider's endpoint): the request did not reach the VirtScale API, " +

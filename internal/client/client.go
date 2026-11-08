@@ -169,6 +169,11 @@ type APIError struct {
 	// have made.
 	MayHaveBeenApplied bool
 
+	// retryable is what retryable() said about the attempt that produced this error: the suffix "gave up after N
+	// attempts" is only true when the client stopped at its limits (attempts, Retry-After, deadline) and not because the
+	// answer was final.
+	retryable bool
+
 	// recovery is the sentence Error() appends for MayHaveBeenApplied, set by
 	// giveUp from the request method (lostCreateHint for a create, otherwise the
 	// change's own hint). Empty on a hand-built APIError, which keeps the create
@@ -235,8 +240,9 @@ func (e *APIError) Error() string {
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
 	}
-	// Only an error that was itself worth retrying "gave up": a definitive answer (a 422 after a 429) is just the answer.
-	if e.Attempts > 1 && e.transient() {
+	// Only an error the client would have retried "gave up": any other answer (a 422, a 500, a 502 to a request that cannot
+	// be repeated) is just the answer, however many throttled attempts came before it.
+	if e.Attempts > 1 && e.retryable {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
 	if e.MayHaveBeenApplied {
@@ -250,20 +256,6 @@ func (e *APIError) Error() string {
 		msg += "; " + hint
 	}
 	return msg
-}
-
-// transient reports whether the error is one the client retries when it can: a 429, a 5xx other than the 503 not_ready of
-// a feature that is switched off, or a 409 idempotency_in_progress.
-func (e *APIError) transient() bool {
-	switch {
-	case e.Status == http.StatusTooManyRequests:
-		return true
-	case e.Status == http.StatusServiceUnavailable && e.Code == "not_ready":
-		return false
-	case e.Status >= 500:
-		return true
-	}
-	return e.Status == http.StatusConflict && e.Code == "idempotency_in_progress"
 }
 
 // permissionNameRE finds the permission a 403 permission_denied names: "this
@@ -573,6 +565,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 		default:
 			apiErr = c.newAPIError(ex.status, ex.body)
 			apiErr.Attempts = attempt
+			apiErr.retryable = retryable(method, idempotencyKey, ex, apiErr, nil)
 			lastErr = apiErr
 		}
 
