@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
@@ -184,6 +186,31 @@ func (sshKeyUniqueValidator) ValidateList(_ context.Context, req validator.ListR
 	}
 }
 
+// maxUserDataBytes is the API's ceiling on user_data once decoded (32 KiB). The attribute holds the plain text, so
+// its length in bytes is the decoded size.
+const maxUserDataBytes = 32 * 1024
+
+// userDataSizeValidator refuses, at plan time, a user_data the API would refuse with 422 user_data_invalid for its size.
+type userDataSizeValidator struct{}
+
+func (userDataSizeValidator) Description(context.Context) string {
+	return "at most 32 KiB of cloud-init text"
+}
+
+func (v userDataSizeValidator) MarkdownDescription(ctx context.Context) string {
+	return v.Description(ctx)
+}
+
+func (userDataSizeValidator) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	if n := len(req.ConfigValue.ValueString()); n > maxUserDataBytes {
+		resp.Diagnostics.AddAttributeError(req.Path, "user_data is too large",
+			fmt.Sprintf("user_data is %d bytes; the API takes at most 32 KiB (%d bytes) of cloud-init", n, maxUserDataBytes))
+	}
+}
+
 // InstanceResource implements the virtscale_instance resource.
 type InstanceResource struct {
 	client *client.Client
@@ -215,6 +242,10 @@ type instanceResourceModel struct {
 	FQDN           types.String `tfsdk:"fqdn"`
 	PrivateIPv4    types.String `tfsdk:"private_ipv4"`
 	CreatedAt      types.String `tfsdk:"created_at"`
+
+	UserData              types.String `tfsdk:"user_data"`
+	WorkloadType          types.String `tfsdk:"workload_type"`
+	DisableAPITermination types.Bool   `tfsdk:"disable_api_termination"`
 }
 
 // Metadata sets the resource's type name to <provider type name>_instance.
@@ -222,23 +253,24 @@ func (r *InstanceResource) Metadata(_ context.Context, req resource.MetadataRequ
 	resp.TypeName = req.ProviderTypeName + "_instance"
 }
 
-// Schema declares the virtscale_instance attributes. Every required and
-// optional attribute forces replacement, except hostname: it is the one
-// in-place change the API offers.
+// Schema declares the virtscale_instance attributes. Every required and optional attribute forces replacement, except
+// hostname and disable_api_termination (one PATCH, one PUT) and vcpus and memory_mb (a cold resize).
 //
-// The sizes, storage_pool, network_profile and instance_type are optional because the API picks what a create leaves
-// out (customer API compute.py _check_create_shape, domain/compute/vms.py create_vm_request): an instance type fills the
-// three sizes and, unless a pool is named, the pool of its own; a profile left out is the first one the organization
-// may use in the region. They are computed too, so the chosen values are read back into state, and keep their value
-// across plans (UseStateForUnknown). They replace the instance only when the configuration sets a value that differs
-// (RequiresReplaceIfConfigured): a value left out of the configuration is the API's to choose, not a change.
+// The sizes, storage_pool, network_profile, instance_type and workload_type are optional because the API picks what a
+// create leaves out (customer API compute.py _check_create_shape, domain/compute/vms.py create_vm_request): an instance
+// type fills the three sizes and, unless a pool is named, the pool of its own; a profile left out is the first one the
+// organization may use in the region. They are computed too, so the chosen values are read back into state, and keep
+// their value across plans (UseStateForUnknown). Those that replace the instance do so only when the configuration sets
+// a value that differs (RequiresReplaceIfConfigured): a value left out of the configuration is the API's to choose, not
+// a change.
 func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
 	resp.Schema = schema.Schema{
 		Description: "A VirtScale compute instance (VM).\n\n" +
 			"An instance resized outside Terraform keeps its instance_type in the API. If the configuration names only " +
 			"instance_type, the next refresh shows the new vcpus and memory_mb in state but plans no change. To manage " +
-			"the sizes, set vcpus, memory_mb, disk_gb and storage_pool in the configuration instead of instance_type; a " +
-			"size that then differs from the configuration plans a replacement.\n\n" +
+			"the sizes, set vcpus, memory_mb, disk_gb and storage_pool in the configuration instead of instance_type: a " +
+			"vcpus or memory_mb that then differs resizes the instance in place (it restarts), a disk_gb that differs " +
+			"plans a replacement.\n\n" +
 			"Size an instance with vcpus, memory_mb, disk_gb and storage_pool. The API takes this grid: vcpus is 1, 2, " +
 			"4, 8, 16 or 32; memory is whole gigabytes from 1 to 128, given in megabytes (gigabytes times 1024, so " +
 			"memory_mb is 1024 to 131072); disk_gb is 10 to 2000 in steps of 10. A size off the grid is refused with " +
@@ -290,6 +322,9 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Description: "The human-readable name of the image the instance is currently " +
 					"running, as reported by the API. Informational only -- it does not " +
 					"participate in planning and never forces a replacement.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"instance_type": schema.StringAttribute{
 				Optional: true,
@@ -313,27 +348,29 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Optional: true,
 				Computed: true,
 				Description: "Number of virtual CPUs: 1, 2, 4, 8, 16 or 32. Taken from instance_type when one is " +
-					"named; otherwise give vcpus, memory_mb, disk_gb and storage_pool together.",
+					"named; otherwise give vcpus, memory_mb, disk_gb and storage_pool together. Changing it resizes " +
+					"the instance in place: THE INSTANCE RESTARTS, and apply waits until it reports the new size. " +
+					"Resizing may be switched off for your organization (503 not_ready).",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
-					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"memory_mb": schema.Int64Attribute{
 				Optional: true,
 				Computed: true,
 				Description: "Memory, in megabytes: whole gigabytes from 1 to 128, so gigabytes times 1024 (1024 for " +
-					"1 GB, 131072 for 128 GB). Taken from instance_type when one is named.",
+					"1 GB, 131072 for 128 GB). Taken from instance_type when one is named. Changing it resizes the " +
+					"instance in place: THE INSTANCE RESTARTS, and apply waits until it reports the new size. " +
+					"Resizing may be switched off for your organization (503 not_ready).",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
-					int64planmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
 			"disk_gb": schema.Int64Attribute{
 				Optional: true,
 				Computed: true,
 				Description: "Boot disk size, in gigabytes: 10 to 2000, in steps of 10. Taken from instance_type " +
-					"when one is named.",
+					"when one is named. A different value replaces the instance: the API resizes vCPUs and memory only.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
 					int64planmodifier.RequiresReplaceIfConfigured(),
@@ -387,6 +424,48 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					listplanmodifier.RequiresReplace(),
 				},
 			},
+			"user_data": schema.StringAttribute{
+				Optional:  true,
+				Sensitive: true,
+				Description: "Plain cloud-init text for the first boot: a #cloud-config document, a script that starts " +
+					"with #!, or a MIME multipart document, at most 32 KiB (checked at plan time). The provider sends it " +
+					"as standard base64 and the API applies it after the platform's own part (the SSH keys of " +
+					"ssh_keys). It is read at the first boot only, so a different value replaces the instance. The " +
+					"API never returns it: state keeps the configured value, an imported instance has none, and a " +
+					"configuration that sets it after an import plans a replacement (use ignore_changes to avoid " +
+					"that). Marked sensitive, because cloud-init is where bootstrap secrets go; the state holds it " +
+					"as text. A 503 not_ready means cloud-init is not switched on for this API yet; a payload it " +
+					"cannot deliver is 422 user_data_invalid.",
+				Validators: []validator.String{stringvalidator.LengthAtLeast(1), userDataSizeValidator{}},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
+			},
+			"workload_type": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "Which hardware the instance runs on: customer (the API's default) or infra, VirtScale's " +
+					"own pools. Only an organization of kind internal may ask for infra; any other gets 422 " +
+					"workload_not_allowed. Read back from the API. A different value replaces the instance; " +
+					"removing the line keeps the value.",
+				Validators: []validator.String{stringvalidator.OneOf("customer", "infra")},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIfConfigured(),
+				},
+			},
+			"disable_api_termination": schema.BoolAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "Protect the instance against deletion, like AWS's DisableApiTermination: while it is true, " +
+					"deleting the instance is refused with 409 vm_protected (a destroy, or a replacement, then fails " +
+					"until you set it to false and apply). Defaults to what the API reports, false. Changing it is an " +
+					"in-place update; a create sets it once the instance runs. Changing it needs the " +
+					"compute.instance.update permission. Removing the line keeps the current value.",
+				PlanModifiers: []planmodifier.Bool{
+					boolplanmodifier.UseStateForUnknown(),
+				},
+			},
 			"state": schema.StringAttribute{
 				Computed:    true,
 				Description: "The instance's current lifecycle state, as reported by the API.",
@@ -420,6 +499,9 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Computed: true,
 				Description: "The instance's private IPv4 address, as reported by the platform; empty until it is " +
 					"known. An associated public IP is not the private address.",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
 			},
 			"created_at": schema.StringAttribute{
 				Computed:    true,
@@ -502,6 +584,8 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 			return
 		}
 	}
+	// What the configuration asked for, before the model is overwritten with what the API reports (not protected yet).
+	protect := plan.DisableAPITermination.ValueBool()
 
 	idempotencyKey, err := newIdempotencyKey()
 	if err != nil {
@@ -515,6 +599,12 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 	if !plan.Hostname.IsNull() && !plan.Hostname.IsUnknown() {
 		h := plan.Hostname.ValueString()
 		hostname = &h
+	}
+
+	// user_data travels as standard base64 of the configured text (the API's own encoding rule); left out, it is not sent.
+	var userData string
+	if !plan.UserData.IsNull() && !plan.UserData.IsUnknown() {
+		userData = base64.StdEncoding.EncodeToString([]byte(plan.UserData.ValueString()))
 	}
 
 	// The optional attributes the configuration left out are unknown in the plan, and read as "" or 0 here: the client
@@ -531,6 +621,8 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		NetworkProfile: plan.NetworkProfile.ValueString(),
 		Hostname:       hostname,
 		SSHKeys:        sshKeys,
+		UserData:       userData,
+		WorkloadType:   plan.WorkloadType.ValueString(),
 	}, idempotencyKey)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Create Instance", apiErrorDetail(err))
@@ -578,6 +670,69 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 
 	applyVmToModel(&plan, final)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+	if resp.Diagnostics.HasError() || !protect {
+		return
+	}
+
+	// The protection is set once the instance runs, so a build that fails is never left protected. If it cannot be set
+	// the instance stays in the state (saved above, unprotected): the error is Terraform's taint, and the next apply or
+	// a destroy finds it.
+	protected, err := r.setProtection(ctx, final.ID, true)
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Protect Instance",
+			apiErrorDetail(err)+"; the instance was built and is running, but it is not protected")
+		return
+	}
+	applyVmToModel(&plan, protected)
+	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// setProtection switches the delete guard of instance id, with a fresh Idempotency-Key (setting a flag is idempotent, so
+// a lost answer may be asked again).
+func (r *InstanceResource) setProtection(ctx context.Context, id string, protected bool) (*client.Vm, error) {
+	key, err := newIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	return r.client.SetVmProtection(ctx, id, protected, key)
+}
+
+// resizeInstance asks for a new size and waits until the instance reports it and is back in a stable state, running or
+// stopped as it was. The platform restarts the instance for a resize and reverts one it cannot complete: the revert shows
+// as a failed operation with the instance still at its old size, which is an error here. An instance that ends in state
+// error is one too.
+func (r *InstanceResource) resizeInstance(ctx context.Context, id string, vcpus, memoryMB int64) (*client.Vm, error) {
+	key, err := newIdempotencyKey()
+	if err != nil {
+		return nil, err
+	}
+	_, op, err := r.client.ResizeVm(ctx, id, int(vcpus), int(memoryMB), key)
+	if err != nil {
+		return nil, err
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+	return r.client.WaitVm(waitCtx, id, pollInterval, func(v *client.Vm) (bool, error) {
+		switch {
+		case v == nil:
+			return false, errors.New("the instance disappeared while it was being resized")
+		case (v.State == "running" || v.State == "stopped") && int64(v.VCPUs) == vcpus && int64(v.MemoryMB) == memoryMB:
+			return true, nil
+		case v.State == "error":
+			return false, fmt.Errorf("the instance entered error state: error_class=%s error_detail=%s",
+				ptrOrEmpty(v.ErrorClass), ptrOrEmpty(v.ErrorDetail))
+		}
+		current, err := r.client.GetOperation(waitCtx, op.ID)
+		if err != nil {
+			return false, err
+		}
+		if current.State == "failed" || current.State == "cancelled" {
+			return false, fmt.Errorf("the resize %s and the instance keeps its size: error_class=%s error_detail=%s",
+				current.State, ptrOrEmpty(current.ErrorClass), ptrOrEmpty(current.ErrorDetail))
+		}
+		return false, nil
+	})
 }
 
 // Read refreshes state from the API. The 404 that says the vm is gone, or state
@@ -675,13 +830,11 @@ func sameNames(a, b []string) bool {
 	return true
 }
 
-// Update carries out the one in-place change the API offers: a hostname
-// change. A configured, non-null hostname that differs from the state's is
-// sent as a PATCH, with the generation of a fresh read as its precondition and
-// a fresh Idempotency-Key. Everything else forces replacement, so a plan that
-// reaches Update changes nothing but the hostname -- and when even that does
-// not differ, the computed values the plan left unknown are resolved from a
-// read instead.
+// Update carries out the in-place changes: a hostname (one PATCH, with the generation of a fresh read as its
+// precondition), disable_api_termination (one PUT) and vcpus or memory_mb (one resize, waited for: the instance
+// restarts). Each is sent only when the plan differs from the state; everything else forces replacement, so a plan that
+// reaches Update changes nothing else -- and when it changes none of these, the computed values the plan left unknown
+// are resolved from a read instead.
 func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
 	var plan, prior instanceResourceModel
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
@@ -690,11 +843,14 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 		return
 	}
 
+	id := prior.ID.ValueString()
+	var vm *client.Vm
+
 	if hostnameChanged(plan.Hostname, prior.Hostname) {
 		// The generation the PATCH must carry is read fresh, not taken from
 		// the state: the instance may have moved on since the last refresh,
 		// and a stale If-Match would be refused with 412 generation_mismatch.
-		vm, err := r.client.GetVm(ctx, prior.ID.ValueString())
+		current, err := r.client.GetVm(ctx, id)
 		if err != nil {
 			resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
 			return
@@ -707,26 +863,44 @@ func (r *InstanceResource) Update(ctx context.Context, req resource.UpdateReques
 		}
 
 		hostname := plan.Hostname.ValueString()
-		updated, err := r.client.UpdateVmHostname(ctx, vm.ID, vm.Generation, &hostname, idempotencyKey)
-		if err != nil {
+		if vm, err = r.client.UpdateVmHostname(ctx, current.ID, current.Generation, &hostname, idempotencyKey); err != nil {
 			resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
 			return
 		}
-
-		applyVmToModel(&plan, updated)
-		resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
-		return
 	}
 
-	// Nothing to change: refresh the computed values the plan left unknown so
-	// that no unknown is written to state.
-	vm, err := r.client.GetVm(ctx, prior.ID.ValueString())
-	if err != nil {
-		resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
-		return
+	if !plan.DisableAPITermination.IsUnknown() && plan.DisableAPITermination.ValueBool() != prior.DisableAPITermination.ValueBool() {
+		var err error
+		if vm, err = r.setProtection(ctx, id, plan.DisableAPITermination.ValueBool()); err != nil {
+			resp.Diagnostics.AddError("Unable to Change Instance Protection", apiErrorDetail(err))
+			return
+		}
+	}
+
+	if sizeChanged(plan, prior) {
+		var err error
+		if vm, err = r.resizeInstance(ctx, id, plan.VCPUs.ValueInt64(), plan.MemoryMB.ValueInt64()); err != nil {
+			resp.Diagnostics.AddError("Unable to Resize Instance", apiErrorDetail(err))
+			return
+		}
+	}
+
+	if vm == nil {
+		var err error
+		if vm, err = r.client.GetVm(ctx, id); err != nil {
+			resp.Diagnostics.AddError("Unable to Update Instance", apiErrorDetail(err))
+			return
+		}
 	}
 	applyVmToModel(&plan, vm)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
+}
+
+// sizeChanged reports whether the plan asks for a vcpus or memory_mb the state does not hold. Both are known in a plan
+// that reaches Update (configured, or kept from the state).
+func sizeChanged(plan, prior instanceResourceModel) bool {
+	return !plan.VCPUs.IsUnknown() && !plan.MemoryMB.IsUnknown() &&
+		(plan.VCPUs.ValueInt64() != prior.VCPUs.ValueInt64() || plan.MemoryMB.ValueInt64() != prior.MemoryMB.ValueInt64())
 }
 
 // hostnameChanged reports whether planned differs from prior: a known,
@@ -800,7 +974,7 @@ func (r *InstanceResource) ImportState(ctx context.Context, req resource.ImportS
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
-// applyVmToModel copies observed API state into model. It never touches
+// applyVmToModel copies observed API state into model. It never touches user_data (the API never returns it) or
 // image: Create must leave image at the planned value (the framework's own
 // consistency check aborts the apply with "Provider produced inconsistent
 // result" if a Required, non-Computed attribute changes after apply), and
@@ -821,6 +995,8 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	model.State = types.StringValue(vm.State)
 	model.Status = types.StringValue(vm.Status)
 	model.CreatedAt = types.StringValue(vm.CreatedAt.Format(time.RFC3339))
+	model.WorkloadType = types.StringValue(vm.WorkloadType)
+	model.DisableAPITermination = types.BoolValue(vm.Protected)
 
 	if vm.FQDN != nil {
 		model.FQDN = types.StringValue(*vm.FQDN)

@@ -271,12 +271,12 @@ func TestTheGuideListsTheSensitiveAttributesOfTheSchemas(t *testing.T) {
 	}
 	guide := pages["docs/guides/state-secrets-and-import.md"]
 	// the generated list, one bullet each (the prose names the secret too, so a bullet is what proves the schema says so)
-	for _, want := range []string{"\n- `virtscale_s3_access_key.secret_access_key`\n", "\n- `provider.api_key`\n"} {
+	for _, want := range []string{"\n- `virtscale_s3_access_key.secret_access_key`\n", "\n- `provider.api_key`\n", "\n- `virtscale_instance.user_data`\n"} {
 		if !strings.Contains(guide, want) {
 			t.Errorf("the list of sensitive attributes does not hold %q", strings.TrimSpace(want))
 		}
 	}
-	for _, want := range []string{"encrypted backend", "tofu plan -out", "tofu show -json", "no `user_data` attribute"} {
+	for _, want := range []string{"encrypted backend", "tofu plan -out", "tofu show -json", "`virtscale_instance.user_data` is cloud-init text", "never returns it"} {
 		if !strings.Contains(guide, want) {
 			t.Errorf("the guide does not mention %q", want)
 		}

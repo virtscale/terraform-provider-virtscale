@@ -388,6 +388,127 @@ func TestLiveInstanceFirewallResource_LifecycleProof(t *testing.T) {
 	runInstanceFirewallProof(t, liveProviderBlock, liveParamsFromEnv(), c)
 }
 
+// --- an instance with user_data, protection and a resize in place --------------------------------------------------
+
+// runInstanceAttributesProof is one sequential proof of the attributes of an internal VM, on one small server: it is
+// created with user_data and disable_api_termination = true, a destroy is refused while it is protected, it is resized
+// in place (1 vCPU, 1024 MB to 1 vCPU, 2048 MB: the instance restarts), the protection is lifted and the destroy works.
+func runInstanceAttributesProof(t *testing.T, providerBlock string, p liveParams, c *client.Client) {
+	t.Helper()
+	name := liveName(t)
+	config := func(protected bool, memoryMB int) string {
+		return providerBlock + fmt.Sprintf(`
+data "virtscale_images" "r" {
+  region = %q
+}
+
+resource "virtscale_instance" "i" {
+  name                    = %q
+  region                  = %q
+  image                   = [for i in data.virtscale_images.r.images : i.id if i.min_ram_mb <= 1024 && i.min_disk_gb <= 10][0]
+  vcpus                   = 1
+  memory_mb               = %d
+  disk_gb                 = 10
+  storage_pool            = %q
+  network_profile         = %q
+  user_data               = "#cloud-config\nruncmd:\n  - echo tf-live\n"
+  disable_api_termination = %t
+}
+`, p.region, name, p.region, memoryMB, p.storagePool, p.networkProfile, protected)
+	}
+	var id string
+	// api reads the instance the way the API reports it, to prove what the state says.
+	api := func(want func(*client.Vm) error) resource.TestCheckFunc {
+		return func(*terraform.State) error {
+			ctx, cancel := context.WithTimeout(context.Background(), liveCheckTimeout)
+			defer cancel()
+			vm, err := c.GetVm(ctx, id)
+			if err != nil {
+				return fmt.Errorf("the read failed: %s", errKind(err))
+			}
+			return want(vm)
+		}
+	}
+	inPlace := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
+		plancheck.ExpectResourceAction("virtscale_instance.i", plancheck.ResourceActionUpdate),
+	}}
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             destroyCheckFor("virtscale_instance", instanceGone(c)),
+		Steps: []resource.TestStep{
+			{
+				Config: config(true, 1024),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					func(s *terraform.State) error {
+						rs := s.RootModule().Resources["virtscale_instance.i"]
+						if rs == nil {
+							return fmt.Errorf("virtscale_instance.i not found in state")
+						}
+						id = rs.Primary.ID
+						return nil
+					},
+					resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
+					resource.TestCheckResourceAttr("virtscale_instance.i", "disable_api_termination", "true"),
+					resource.TestCheckResourceAttr("virtscale_instance.i", "workload_type", "customer"),
+					api(func(vm *client.Vm) error {
+						if !vm.Protected || !vm.UserDataPresent {
+							return fmt.Errorf("the API reports protected = %v, user_data_present = %v, want both true", vm.Protected, vm.UserDataPresent)
+						}
+						return nil
+					}),
+				),
+			},
+			{Config: config(true, 1024), ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}},
+			{ // A protected instance cannot be destroyed, and the error says how to go on.
+				Config:      config(true, 1024),
+				Destroy:     true,
+				ExpectError: wrapSafeInOrder("vm_protected", "set disable_api_termination = false and apply first"),
+			},
+			{ // The resize is in place: the same instance, the new memory, running again.
+				Config:           config(true, 2048),
+				ConfigPlanChecks: inPlace,
+				Check: resource.ComposeAggregateTestCheckFunc(
+					resource.TestCheckResourceAttr("virtscale_instance.i", "memory_mb", "2048"),
+					resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
+					resource.TestCheckResourceAttrPtr("virtscale_instance.i", "id", &id),
+					api(func(vm *client.Vm) error {
+						if vm.MemoryMB != 2048 || vm.VCPUs != 1 || vm.State != "running" {
+							return fmt.Errorf("the API reports %d vcpus, %d MB, state %s, want 1, 2048, running", vm.VCPUs, vm.MemoryMB, vm.State)
+						}
+						return nil
+					}),
+				),
+			},
+			{ // Lifting the protection is an update in place, and then the destroy at the end works.
+				Config:           config(false, 2048),
+				ConfigPlanChecks: inPlace,
+				Check: api(func(vm *client.Vm) error {
+					if vm.Protected {
+						return fmt.Errorf("the API still reports the instance protected")
+					}
+					return nil
+				}),
+			},
+		},
+	})
+}
+
+func TestAccInstanceAttributes_LiveProofAgainstTheFake(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	c, _ := liveClient(fake.URL(), "test-api-key", fake.org)
+	runInstanceAttributesProof(t, testAccProviderBlock(fake), fakeParams(), c)
+}
+
+func TestLiveInstanceAttributesProof(t *testing.T) {
+	endpoint, apiKey, org := liveSshKeyEnv(t)
+	c, err := liveClient(endpoint, apiKey, org)
+	if err != nil {
+		t.Fatalf("build the API client: %v", err)
+	}
+	runInstanceAttributesProof(t, liveProviderBlock, liveParamsFromEnv(), c)
+}
+
 // --- S3: a bucket and an access key ----------------------------------------------------------------------------------
 
 func bucketGoneOrSoftDeleted(c *client.Client) goneCheck {
