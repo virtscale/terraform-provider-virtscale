@@ -61,7 +61,7 @@ ENDPOINT="http://s3-staging-customer-api.s3-staging.svc.cluster.local"
 # The S3 test needs an object store behind the API, which staging has not, and every bucket it creates is soft-deleted and,
 # while the platform's purge worker is off, never purged (it keeps its name and a retention row for good): it runs only when
 # the pipeline is started with PROVIDER_STAGING_LIVE_S3=1.
-TESTS_FIRST="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof"
+TESTS_FIRST="TestLiveSshKeyResource_LifecycleProof TestLiveCatalogueProof TestLiveProjectResource_LifecycleProof TestLiveVpcResource_LifecycleProof TestLiveRegistryRelease_SshKeyProof"
 TESTS_LAST="TestLiveInstanceFirewallResource_LifecycleProof"
 TESTS="$TESTS_FIRST $TESTS_LAST"
 live_s3=""
@@ -210,7 +210,9 @@ echo "the staging org before the run: $before"
 
 # 5. The tests, one `go test` process each. A prefix assignment gives the key to this one command and its children only,
 # and GOPROXY=off keeps the Go toolchain off the network while the key is in the environment (the modules were fetched
-# and verified above). A test that fails or skips is recorded and the next one still runs.
+# and verified above). tofu itself does go out in TestLiveRegistryRelease_SshKeyProof: it installs the pinned release
+# from registry.terraform.io and GitHub, checked against the signed SHA256SUMS. A test that fails or skips is recorded
+# and the next one still runs.
 rc=0
 results=""
 : >"$work/go-test.log"
