@@ -602,7 +602,9 @@ how to update it): a route the contract does not have, a deprecated `/compute/vm
 not know and an answer that lacks a required field all fail the test. This stands in for a generated client until
 `sdk-go` can be used (decision D12 in `docs/plans/terraform-provider-virtscale.md`). Its SSH-key
 routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
-parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Run
+parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Its host
+placement (`host_id`, the host-local pool `ams1-local`, the refusals) follows s3-control-plane `c140d937`
+(`feat/internal-instance-types`), which is not deployed yet. Run
 everything with:
 
 ```bash
