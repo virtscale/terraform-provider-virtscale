@@ -119,6 +119,7 @@
         },
         "required": [
           "access_key",
+          "secret_access_key",
           "operation"
         ],
         "title": "AccessKeyCreated",
@@ -158,6 +159,8 @@
                 "type": "null"
               }
             ],
+            "deprecated": true,
+            "description": "Deprecated: always null, and will be removed in v2. The secret is shown once, in the `201` body that minted it, and is held nowhere else.",
             "title": "Openbao Path"
           },
           "operation_id": {
@@ -196,9 +199,13 @@
         },
         "required": [
           "id",
+          "rgw_access_key_id",
           "state",
           "created_at",
-          "updated_at"
+          "updated_at",
+          "last_rotated_at",
+          "openbao_path",
+          "operation_id"
         ],
         "title": "AccessKeyOut",
         "type": "object"
@@ -615,10 +622,15 @@
           "id",
           "identifier",
           "name",
+          "description",
           "scopes",
+          "project_id",
           "allowed_cidrs",
           "created_at",
-          "never_expires"
+          "expires_at",
+          "never_expires",
+          "last_used_at",
+          "revoked_at"
         ],
         "title": "ApiTokenOut",
         "type": "object"
@@ -743,9 +755,16 @@
           "ts",
           "action",
           "resource_type",
+          "resource_id",
           "result",
           "actor_sub",
-          "actor_realm"
+          "actor_realm",
+          "actor_token_id",
+          "request_id",
+          "operation_id",
+          "reason",
+          "before",
+          "after"
         ],
         "title": "AuditEventOut",
         "type": "object"
@@ -774,6 +793,11 @@
           },
           "payment_method_state": {
             "default": "none",
+            "enum": [
+              "none",
+              "attached",
+              "failed"
+            ],
             "title": "Payment Method State",
             "type": "string"
           },
@@ -813,8 +837,12 @@
         "required": [
           "state",
           "billing_exempt",
+          "current_period_end",
+          "spend_budget_cents",
           "month_to_date",
-          "prices"
+          "prices",
+          "plan",
+          "payment_method_state"
         ],
         "title": "BillingOut",
         "type": "object"
@@ -1055,9 +1083,16 @@
           "name",
           "state",
           "versioning",
+          "observed_versioning",
           "created_at",
           "updated_at",
-          "quota"
+          "soft_deleted_at",
+          "purge_after",
+          "quota",
+          "observed_quota",
+          "observed_exists",
+          "observed_at",
+          "operation_id"
         ],
         "title": "BucketOut",
         "type": "object"
@@ -1090,6 +1125,10 @@
             "title": "Max Size Bytes"
           }
         },
+        "required": [
+          "max_size_bytes",
+          "max_objects"
+        ],
         "title": "BucketQuotaOut",
         "type": "object"
       },
@@ -1564,7 +1603,8 @@
         "required": [
           "output",
           "truncated",
-          "size_bytes"
+          "size_bytes",
+          "marker"
         ],
         "title": "ConsoleOutputOut",
         "type": "object"
@@ -1946,7 +1986,8 @@
           "os_distro",
           "os_version",
           "min_disk_gb",
-          "min_ram_mb"
+          "min_ram_mb",
+          "disk_format"
         ],
         "title": "ImageOut",
         "type": "object"
@@ -2166,7 +2207,9 @@
           "joined",
           "invited_by_sub",
           "sent_at",
-          "expires_at"
+          "expires_at",
+          "redeemed_at",
+          "revoked_at"
         ],
         "title": "InvitationOut",
         "type": "object"
@@ -2296,7 +2339,11 @@
           "status",
           "currency",
           "total_cents",
-          "amount_due_cents"
+          "amount_due_cents",
+          "period_start",
+          "period_end",
+          "hosted_invoice_url",
+          "invoice_pdf"
         ],
         "title": "InvoiceOut",
         "type": "object"
@@ -2348,7 +2395,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[AccessKeyOut]",
         "type": "object"
@@ -2375,7 +2423,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[ApiTokenOut]",
         "type": "object"
@@ -2402,7 +2451,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[AuditEventOut]",
         "type": "object"
@@ -2429,7 +2479,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[BillingPriceOut]",
         "type": "object"
@@ -2456,7 +2507,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[BucketOut]",
         "type": "object"
@@ -2483,7 +2535,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[EndpointOut]",
         "type": "object"
@@ -2510,7 +2563,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[ImageOut]",
         "type": "object"
@@ -2537,7 +2591,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[InstanceTypeOut]",
         "type": "object"
@@ -2564,7 +2619,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[InvitationOut]",
         "type": "object"
@@ -2591,7 +2647,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[InvoiceOut]",
         "type": "object"
@@ -2618,7 +2675,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[MemberOut]",
         "type": "object"
@@ -2645,7 +2703,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[NetworkProfileOut]",
         "type": "object"
@@ -2672,7 +2731,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[OperationRef]",
         "type": "object"
@@ -2699,7 +2759,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[PlanOut]",
         "type": "object"
@@ -2726,7 +2787,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[ProjectOut]",
         "type": "object"
@@ -2753,7 +2815,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[PublicIpOut]",
         "type": "object"
@@ -2780,7 +2843,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[RegionOut]",
         "type": "object"
@@ -2807,7 +2871,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[SizeOut]",
         "type": "object"
@@ -2834,7 +2899,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[SshKeyOut]",
         "type": "object"
@@ -2861,7 +2927,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[StoragePoolOut]",
         "type": "object"
@@ -2888,7 +2955,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[VmOut]",
         "type": "object"
@@ -2915,7 +2983,8 @@
           }
         },
         "required": [
-          "items"
+          "items",
+          "next_cursor"
         ],
         "title": "ListResponse[Vpc]",
         "type": "object"
@@ -3115,6 +3184,7 @@
           "id",
           "subject",
           "role",
+          "email",
           "created_at"
         ],
         "title": "MemberOut",
@@ -3301,9 +3371,12 @@
           "state",
           "resource_type",
           "resource_id",
+          "error_class",
+          "error_detail",
           "attempt",
           "max_attempts",
-          "created_at"
+          "created_at",
+          "finished_at"
         ],
         "title": "OperationRef",
         "type": "object"
@@ -3343,7 +3416,9 @@
         },
         "required": [
           "org_id",
-          "name"
+          "name",
+          "s3",
+          "quota"
         ],
         "title": "OrgContext",
         "type": "object"
@@ -3412,7 +3487,9 @@
           "current_version",
           "effective_date",
           "draft",
-          "accepted"
+          "url",
+          "accepted",
+          "accepted_at"
         ],
         "title": "OrgDocumentOut",
         "type": "object"
@@ -3828,7 +3905,8 @@
           "document",
           "current_version",
           "effective_date",
-          "draft"
+          "draft",
+          "url"
         ],
         "title": "PublicDocumentOut",
         "type": "object"
@@ -4500,6 +4578,11 @@
         "required": [
           "cap_bytes",
           "cap_objects",
+          "enforced_bytes",
+          "enforced_objects",
+          "usage_bytes",
+          "usage_objects",
+          "frozen_reason",
           "soft_bytes"
         ],
         "title": "S3QuotaOut",
@@ -4594,7 +4677,13 @@
         "required": [
           "cap_bytes",
           "cap_objects",
-          "soft_bytes"
+          "enforced_bytes",
+          "enforced_objects",
+          "usage_bytes",
+          "usage_objects",
+          "frozen_reason",
+          "soft_bytes",
+          "warning"
         ],
         "title": "S3QuotaUpdateOut",
         "type": "object"
@@ -4772,6 +4861,7 @@
         },
         "required": [
           "items",
+          "next_cursor",
           "scheduling_enabled"
         ],
         "title": "ScheduledActionListOut",
@@ -5120,7 +5210,8 @@
         "required": [
           "id",
           "region_id",
-          "status"
+          "status",
+          "media"
         ],
         "title": "StoragePoolOut",
         "type": "object"
@@ -5630,7 +5721,7 @@
             "title": "Private Ip"
           },
           "protected": {
-            "description": "While true, deleting the VM is refused with 409 vm_protected. An owner of the organization switches it with PUT /v1/orgs/{org}/compute/instances/{vm_id}/protection.",
+            "description": "While true, deleting the VM is refused with 409 vm_protected. Switch it with PUT /v1/orgs/{org}/compute/instances/{vm_id}/protection.",
             "title": "Protected",
             "type": "boolean"
           },
@@ -5705,6 +5796,8 @@
           "observed_at",
           "ssh_key_names",
           "user_data_present",
+          "host_keys_state",
+          "host_keys",
           "protected",
           "allowed_actions",
           "available_actions",
@@ -7773,7 +7866,7 @@
     },
     "/v1/orgs/{org}/compute/instances/{vm_id}": {
       "delete": {
-        "description": "Delete an instance: queue the teardown and return `202` with the operation to poll.\n\nA protected instance is refused with `409 vm_protected` until its owner lifts the protection.\nA retry with the same `Idempotency-Key` gets the first answer back.",
+        "description": "Delete an instance: queue the teardown and return `202` with the operation to poll.\n\nA protected instance is refused with `409 vm_protected` until its protection is lifted.\nA retry with the same `Idempotency-Key` gets the first answer back.",
         "operationId": "delete_vm_v1_orgs__org__compute_instances__vm_id__delete",
         "parameters": [
           {
@@ -8585,7 +8678,7 @@
     },
     "/v1/orgs/{org}/compute/instances/{vm_id}/protection": {
       "put": {
-        "description": "Switch this VM's protection against deletion on or off.\n\nWhile it is on, deleting the VM answers ``409 vm_protected`` -- to everybody,\nthis organization's owners included -- so a VM that must not disappear by\naccident cannot. It changes nothing about the VM itself: no restart, no\noperation, nothing in the cloud, which is why this answers ``200`` with the\nVM rather than ``202``. Every switch, in either direction, is audited.\n\n**Only an owner of this organization may switch it**, either way: anyone\nelse is ``403 owner_required``, and an API token is never an owner.\n\n``404`` for a VM this organization cannot see. ``503 not_ready`` while\ninstance lifecycle actions are not switched on; the delete guard itself is\nnot behind that switch.\n\n``409 vm_action_not_allowed`` for a VM whose action policy withholds\n``protection`` (``domain/compute/vm_actions.py``): a VM in a region whose\ndisks are single copies on one host -- HEL -- is protected or not as staff\ndecided, in either direction, because lifting it would hand the VM its stop\nand reboot back.\n\nThe switch itself -- the locked read, the policy, the write and the audit row --\nis ``vms.set_vm_protection``, which the staff route calls too. It answers after\nthe flags and the owner check, and before anything is written.",
+        "description": "Switch this VM's protection against deletion on or off.\n\nWhile it is on, deleting the VM answers ``409 vm_protected`` -- to everybody,\nthis organization's owners included -- so a VM that must not disappear by\naccident cannot. It changes nothing about the VM itself: no restart, no\noperation, nothing in the cloud, which is why this answers ``200`` with the\nVM rather than ``202``. Every switch, in either direction, is audited.\n\n**Governed by IAM like every other route** (the AWS ``ModifyInstanceAttribute``\n``DisableApiTermination`` shape): the router-wide permission check admits whoever\nholds ``compute.instance.update`` -- the owner, admin and member roles, and an API\nkey with the ``write`` or ``compute:write`` scope, so a Terraform key sets and lifts\nprotection itself -- and anyone else is ``403 permission_denied``. There is no\nowner-only rule and no lifecycle switch. The permission is checked again inside this\nhandler, so it holds with ``S3CP_IAM_ENFORCEMENT_ENABLED`` off, when the router-wide\ngate only logs: the check is fail-closed and audited like the gate's own refusals.\n\n``404`` for a VM this organization cannot see. ``503 not_ready`` only while\ncompute mutations are off.\n\n``409 vm_action_not_allowed`` for a VM whose action policy withholds\n``protection`` (``domain/compute/vm_actions.py``): a VM in a region whose\ndisks are single copies on one host -- HEL -- is protected or not as staff\ndecided, in either direction, because lifting it would hand the VM its stop\nand reboot back.\n\nThe switch itself -- the locked read, the policy, the write and the audit row --\nis ``vms.set_vm_protection``, which the staff route calls too. It answers after\nthe mutations flag and the permission check, and before anything is written.",
         "operationId": "set_vm_protection_v1_orgs__org__compute_instances__vm_id__protection_put",
         "parameters": [
           {
@@ -8983,7 +9076,7 @@
     },
     "/v1/orgs/{org}/compute/instances/{vm_id}/resize": {
       "post": {
-        "description": "Move an instance onto a different size.\n\n**The instance restarts.** `202`: the operation to poll is returned; a resize that cannot be\ncompleted is reverted and the instance keeps the size it had.",
+        "description": "Move an instance onto a different size.\n\n**The instance restarts.** `202`: the operation to poll is returned; a resize that cannot be\ncompleted is reverted and the instance keeps the size it had. Resize is switched off for\ncustomer organizations in some deployments (`503 not_ready`); organizations of kind\n`internal` are not held back by that switch.",
         "operationId": "resize_vm_v1_orgs__org__compute_instances__vm_id__resize_post",
         "parameters": [
           {
@@ -9861,7 +9954,7 @@
         ]
       },
       "post": {
-        "description": "Reserve one slot in the region's pool, and queue the allocation.\n\nRefused with ``409 compute_not_enabled``/``region_not_ready`` for the two\npreconditions ``edge.allocate_public_ip_request`` checks, ``422\nquota_exceeded`` at ``QuotaProfile.public_ips`` -- see that function's\ndocstring. Takes an ``Idempotency-Key`` (PROV-009): a retry of the same request gets the\nfirst answer back instead of a second address charged against the quota.",
+        "description": "Reserve one slot in the region's pool, and queue the allocation.\n\nRefused with ``422 region_unavailable`` for a region that does not exist, ``409\ncompute_not_enabled``/``region_not_ready`` for the two\npreconditions ``edge.allocate_public_ip_request`` checks, ``422\nquota_exceeded`` at ``QuotaProfile.public_ips`` -- see that function's\ndocstring. Takes an ``Idempotency-Key`` (PROV-009): a retry of the same request gets the\nfirst answer back instead of a second address charged against the quota.",
         "operationId": "allocate_public_ip_v1_orgs__org__compute_public_ips_post",
         "parameters": [
           {
@@ -11278,7 +11371,7 @@
     "/v1/orgs/{org}/compute/vms/{vm_id}": {
       "delete": {
         "deprecated": true,
-        "description": "Delete an instance: queue the teardown and return `202` with the operation to poll.\n\nA protected instance is refused with `409 vm_protected` until its owner lifts the protection.\nA retry with the same `Idempotency-Key` gets the first answer back.",
+        "description": "Delete an instance: queue the teardown and return `202` with the operation to poll.\n\nA protected instance is refused with `409 vm_protected` until its protection is lifted.\nA retry with the same `Idempotency-Key` gets the first answer back.",
         "operationId": "delete_vm_v1_orgs__org__compute_vms__vm_id__delete",
         "parameters": [
           {
@@ -12156,7 +12249,7 @@
     "/v1/orgs/{org}/compute/vms/{vm_id}/protection": {
       "put": {
         "deprecated": true,
-        "description": "Switch this VM's protection against deletion on or off.\n\nWhile it is on, deleting the VM answers ``409 vm_protected`` -- to everybody,\nthis organization's owners included -- so a VM that must not disappear by\naccident cannot. It changes nothing about the VM itself: no restart, no\noperation, nothing in the cloud, which is why this answers ``200`` with the\nVM rather than ``202``. Every switch, in either direction, is audited.\n\n**Only an owner of this organization may switch it**, either way: anyone\nelse is ``403 owner_required``, and an API token is never an owner.\n\n``404`` for a VM this organization cannot see. ``503 not_ready`` while\ninstance lifecycle actions are not switched on; the delete guard itself is\nnot behind that switch.\n\n``409 vm_action_not_allowed`` for a VM whose action policy withholds\n``protection`` (``domain/compute/vm_actions.py``): a VM in a region whose\ndisks are single copies on one host -- HEL -- is protected or not as staff\ndecided, in either direction, because lifting it would hand the VM its stop\nand reboot back.\n\nThe switch itself -- the locked read, the policy, the write and the audit row --\nis ``vms.set_vm_protection``, which the staff route calls too. It answers after\nthe flags and the owner check, and before anything is written.",
+        "description": "Switch this VM's protection against deletion on or off.\n\nWhile it is on, deleting the VM answers ``409 vm_protected`` -- to everybody,\nthis organization's owners included -- so a VM that must not disappear by\naccident cannot. It changes nothing about the VM itself: no restart, no\noperation, nothing in the cloud, which is why this answers ``200`` with the\nVM rather than ``202``. Every switch, in either direction, is audited.\n\n**Governed by IAM like every other route** (the AWS ``ModifyInstanceAttribute``\n``DisableApiTermination`` shape): the router-wide permission check admits whoever\nholds ``compute.instance.update`` -- the owner, admin and member roles, and an API\nkey with the ``write`` or ``compute:write`` scope, so a Terraform key sets and lifts\nprotection itself -- and anyone else is ``403 permission_denied``. There is no\nowner-only rule and no lifecycle switch. The permission is checked again inside this\nhandler, so it holds with ``S3CP_IAM_ENFORCEMENT_ENABLED`` off, when the router-wide\ngate only logs: the check is fail-closed and audited like the gate's own refusals.\n\n``404`` for a VM this organization cannot see. ``503 not_ready`` only while\ncompute mutations are off.\n\n``409 vm_action_not_allowed`` for a VM whose action policy withholds\n``protection`` (``domain/compute/vm_actions.py``): a VM in a region whose\ndisks are single copies on one host -- HEL -- is protected or not as staff\ndecided, in either direction, because lifting it would hand the VM its stop\nand reboot back.\n\nThe switch itself -- the locked read, the policy, the write and the audit row --\nis ``vms.set_vm_protection``, which the staff route calls too. It answers after\nthe mutations flag and the permission check, and before anything is written.",
         "operationId": "set_vm_protection_v1_orgs__org__compute_vms__vm_id__protection_put",
         "parameters": [
           {
@@ -12646,7 +12739,7 @@
     "/v1/orgs/{org}/compute/vms/{vm_id}/resize": {
       "post": {
         "deprecated": true,
-        "description": "Move an instance onto a different size.\n\n**The instance restarts.** `202`: the operation to poll is returned; a resize that cannot be\ncompleted is reverted and the instance keeps the size it had.",
+        "description": "Move an instance onto a different size.\n\n**The instance restarts.** `202`: the operation to poll is returned; a resize that cannot be\ncompleted is reverted and the instance keeps the size it had. Resize is switched off for\ncustomer organizations in some deployments (`503 not_ready`); organizations of kind\n`internal` are not held back by that switch.",
         "operationId": "resize_vm_v1_orgs__org__compute_vms__vm_id__resize_post",
         "parameters": [
           {

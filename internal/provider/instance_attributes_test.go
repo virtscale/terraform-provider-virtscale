@@ -364,11 +364,11 @@ func TestAccInstanceResource_AFailedProtectionKeepsTheInstanceInState(t *testing
 			{
 				PreConfig: func() {
 					fake.FailNext(1, matchRoute(http.MethodPut, "/protection"), func(rc *reqCtx) {
-						rc.problem(http.StatusForbidden, "owner_required", "Forbidden", "only an owner may change the protection")
+						rc.problem(http.StatusForbidden, "permission_denied", "Forbidden", "this principal does not hold compute.instance.update")
 					})
 				},
 				Config:      attrConfig(fake, "half", 1, 1024, 10, "disable_api_termination = true"),
-				ExpectError: wrapSafeInOrder("owner_required", "built and is running", "not protected"),
+				ExpectError: wrapSafeInOrder("permission_denied", "built and is running", "not protected"),
 			},
 			{ // The tainted instance is replaced and the second try protects it.
 				Config: attrConfig(fake, "half", 1, 1024, 10, "disable_api_termination = true"),
