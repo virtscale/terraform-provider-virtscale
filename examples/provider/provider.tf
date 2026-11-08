@@ -1,7 +1,7 @@
 terraform {
   required_providers {
     virtscale = {
-      source = "virtscale/virtscale"
+      source = "registry.terraform.io/virtscale/virtscale"
     }
   }
 }

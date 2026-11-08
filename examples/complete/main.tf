@@ -1,7 +1,7 @@
 terraform {
   required_providers {
     virtscale = {
-      source = "virtscale/virtscale"
+      source = "registry.terraform.io/virtscale/virtscale"
     }
   }
 }
@@ -44,6 +44,8 @@ resource "virtscale_project" "example" {
   labels      = { env = "example" }
 }
 
+# VPCs are not switched on in production yet: plan succeeds, apply answers 503 not_ready. Remove this resource and the
+# vpc_cidr output to apply the rest there.
 resource "virtscale_vpc" "example" {
   project_id = virtscale_project.example.id
   name       = "example"
@@ -57,14 +59,18 @@ resource "virtscale_ssh_key" "example" {
   public_key = file(var.public_key_path)
 }
 
-# An instance type sets the sizes; the platform chooses the storage pool and the network profile.
+# The size is vcpus (1, 2, 4, 8, 16 or 32), memory_mb (whole GB from 1 to 128, times 1024), disk_gb (10 to 2000 in steps
+# of 10) and a storage_pool (gro-ceph in gro); the platform chooses the network profile.
 resource "virtscale_instance" "example" {
-  name          = "example"
-  hostname      = "example.example.com"
-  region        = var.region
-  image         = local.debian_12_image_id
-  instance_type = "g1-small"
-  ssh_keys      = [virtscale_ssh_key.example.name]
+  name         = "example"
+  hostname     = "example.example.com"
+  region       = var.region
+  image        = local.debian_12_image_id
+  vcpus        = 1
+  memory_mb    = 1024
+  disk_gb      = 10
+  storage_pool = "gro-ceph"
+  ssh_keys     = [virtscale_ssh_key.example.name]
 }
 
 # The whole rule set of the instance; ssh from one network only.

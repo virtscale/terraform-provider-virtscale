@@ -15,15 +15,15 @@ This guide builds one VM you can log in to: an SSH key, an instance, a firewall 
 - You have an OpenSSH key pair. The public key, `~/.ssh/id_ed25519.pub` in this guide, is imported into your organization; the private key never leaves your machine. Supported types: `ssh-ed25519`, `ecdsa-sha2-nistp256`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp521` and `ssh-rsa` of 2048 to 16384 bits.
 - You know the public address you will log in from. The firewall below lets in SSH from that address only.
 
-## Find the region, image and instance type
+## Find the region and the image
 
-An instance is built from three choices: a region, an image and an instance type. The type sets the vCPUs, the memory and the boot disk; the platform picks the storage pool and the network profile itself. All three have data sources. Put this in an empty directory as `main.tf` and run `tofu init` and `tofu plan` (or `terraform init` and `terraform plan`); the outputs list what your organization may use.
+An instance is built from a region, an image and a size. The regions and the images have data sources. Put this in an empty directory as `main.tf` and run `tofu init` and `tofu plan` (or `terraform init` and `terraform plan`); the outputs list what your organization may use.
 
 ```terraform
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
@@ -41,32 +41,46 @@ output "regions" {
   value = [for r in data.virtscale_regions.all.regions : "${r.id}: ${r.status}, entitled ${r.entitled}"]
 }
 
-data "virtscale_instance_types" "gro" {
-  region = "gro"
-}
-
 output "images" {
-  value = [for i in data.virtscale_images.gro.images : "${i.name} (${i.id}), at least ${i.min_ram_mb} MB and ${i.min_disk_gb} GB"]
-}
-
-output "instance_types" {
-  value = [for t in data.virtscale_instance_types.gro.instance_types : "${t.id}: ${t.vcpus} vCPU, ${t.memory_mb} MB, ${t.disk_gb} GB disk"]
+  value = [for i in data.virtscale_images.gro.images : "${i.name} (${i.id})"]
 }
 ```
 
-Take a region with status `active` and `entitled` true. The examples in this guide use `gro`; use a region from your own list. Take an instance type that is listed for that region, and one whose memory and disk are not below the image's minimum. The guide uses `g1-small`; use a type from your own list.
+Take a region with status `active` and `entitled` true. The examples in this guide use `gro`; use a region from your own list.
 
-You never need a storage pool or a network profile id. Left out, the platform uses the type's own storage pool and the first network profile your organization may use in the region. `virtscale_instance` has the optional `storage_pool` and `network_profile` attributes for the rare case where you want to name one; the state holds the pool and the profile the instance is on either way.
+## Choose a size
+
+Today an instance is sized with `vcpus`, `memory_mb`, `disk_gb` and `storage_pool`. The catalogue of instance types is empty in production: `virtscale_instance_types` returns nothing, and an `instance_type` such as `g1-small` is refused with `422 instance_type_unpriced`. The API takes a size that is on this grid:
+
+| Attribute | Allowed |
+| --- | --- |
+| `vcpus` | 1, 2, 4, 8, 16 or 32 |
+| `memory_mb` | whole gigabytes from 1 to 128, written in megabytes: gigabytes times 1024, so 1024 for 1 GB, 4096 for 4 GB, 131072 for 128 GB |
+| `disk_gb` | 10 to 2000, in steps of 10 |
+| `storage_pool` | required with the three sizes; in `gro` it is `gro-ceph` |
+| `network_profile` | optional; in `gro` the platform uses `gro-tenant-default` when you leave it out |
+
+Your organization's quota must have room for the size, whatever the grid says. The API lists the limits, the storage pools and the network profiles your organization may use:
+
+```shell
+API="https://api.virtscale.nl/v1/orgs/$VIRTSCALE_ORGANIZATION/compute"
+for what in limits storage-pools network-profiles; do
+  curl -sSf -H "Authorization: Bearer $VIRTSCALE_API_KEY" "$API/$what"
+  echo
+done
+```
+
+The `min_disk_gb` and `min_ram_mb` of an image are 0 today: they say nothing about a size, so do not use them to choose one. A size off the grid is refused at apply with `422 invalid_spec`, and the message lists every violation.
 
 ## The configuration
 
-Replace `main.tf` with the whole configuration. The variables for the region and the instance type have to match what you found above; `ssh_cidr` has no default, so that a run never opens SSH to an address you did not choose.
+Replace `main.tf` with the whole configuration. The variables for the region and the storage pool have to match what you found above; `ssh_cidr` has no default, so that a run never opens SSH to an address you did not choose.
 
 ```terraform
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
@@ -80,10 +94,10 @@ variable "region" {
   default     = "gro"
 }
 
-variable "instance_type" {
+variable "storage_pool" {
   type        = string
-  description = "An instance type listed for that region by the virtscale_instance_types data source."
-  default     = "g1-small"
+  description = "A storage pool of that region: gro-ceph in gro."
+  default     = "gro-ceph"
 }
 
 variable "ssh_cidr" {
@@ -116,12 +130,17 @@ resource "virtscale_ssh_key" "me" {
   public_key = file(var.public_key_path)
 }
 
+# 1 vCPU, 1 GB of memory (1024 MB) and a 10 GB disk: the smallest size on the grid. network_profile is left out, so
+# the platform picks the first profile your organization may use in the region (gro-tenant-default in gro).
 resource "virtscale_instance" "first" {
-  name          = "first-vm"
-  region        = var.region
-  image         = local.image_id
-  instance_type = var.instance_type
-  ssh_keys      = [virtscale_ssh_key.me.name]
+  name         = "first-vm"
+  region       = var.region
+  image        = local.image_id
+  vcpus        = 1
+  memory_mb    = 1024
+  disk_gb      = 10
+  storage_pool = var.storage_pool
+  ssh_keys     = [virtscale_ssh_key.me.name]
 }
 
 # The whole rule set of the instance: SSH in from your own network.
@@ -168,7 +187,7 @@ output "ssh" {
 What each part does:
 
 - `virtscale_ssh_key` imports the public key under a name. The instance takes the key by that name, and cloud-init installs it for the image's default user (`debian` on the Debian images) the first time the instance boots.
-- `virtscale_instance` is the VM. `instance_type` sets its vCPUs, memory and disk; the type's memory and disk must not be below the image's `min_ram_mb` and `min_disk_gb`, and your organization's quota must have room for them. The storage pool and the network profile are the platform's choice and are read back into the state. Its project is the default project, which `data.virtscale_project.default` reads.
+- `virtscale_instance` is the VM. `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` size it (the grid above), and your organization's quota must have room for them. The network profile is the platform's choice and is read back into the state, like the pool. Its project is the default project, which `data.virtscale_project.default` reads.
 - `virtscale_instance_firewall` owns the whole rule set of the instance: a rule you leave out of it is removed, and destroying the resource clears the rules.
 - `virtscale_public_ip` allocates an address in the region and associates it with the instance. Take `instance_id` out and the address stays allocated without an instance.
 
@@ -190,7 +209,7 @@ tofu apply
 Answer `yes`. What happens, in order:
 
 1. The key is imported.
-2. The instance is created. The API answers at once with an operation, and the platform builds the VM in the background. The provider asks for the instance every 5 seconds and waits, for up to 20 minutes, until its state is `running`. If the build ends in state `error`, apply stops with `Instance Failed to Build` and the platform's `error_class` and `error_detail`; the instance stays in the state as failed, and the next `apply` replaces it.
+2. The instance is created. The API answers at once with an operation, and the platform builds the VM in the background. The provider asks for the instance every 5 seconds and waits until its state is `running`; that takes about 30 to 60 seconds, and the provider gives up after 20 minutes. If the build ends in state `error`, apply stops with `Instance Failed to Build` and the platform's `error_class` and `error_detail`; the instance stays in the state as failed, and the next `apply` replaces it.
 3. The firewall and the public IP are created at the same time. The firewall is applied asynchronously, so apply waits until its state is `applied`; the public IP waits up to 10 minutes for each step.
 4. The outputs are printed.
 
@@ -206,13 +225,13 @@ If the connection times out, check that `ssh_cidr` is the address you connect fr
 
 ## Change and destroy
 
-Most attributes of an instance cannot be changed in place: a different `name`, `region`, `image`, `instance_type` or `ssh_keys` replaces the instance, which is destroyed and built again. So does a different `storage_pool`, `network_profile` or size, if you set one in the configuration; a value you leave out is the platform's choice and is never a change. The plan shows that as `must be replaced`: read it before you apply. The `hostname`, the firewall rules and the public IP's `instance_id` change in place.
+Most attributes of an instance cannot be changed in place: a different `name`, `region`, `image`, size (`vcpus`, `memory_mb` or `disk_gb`) or `ssh_keys` replaces the instance, which is destroyed and built again. So does a different `storage_pool` or `network_profile`, if you set one in the configuration; a value you leave out is the platform's choice and is never a change. The plan shows that as `must be replaced`: read it before you apply. The `hostname`, the firewall rules and the public IP's `instance_id` change in place.
 
 ```shell
 tofu destroy
 ```
 
-Destroy removes everything in reverse order. Deleting the instance waits up to 10 minutes. The firewall rules are cleared, the public IP is released and the key is removed.
+Destroy removes everything in reverse order. Deleting the instance takes about 15 seconds; the provider waits up to 10 minutes. The firewall rules are cleared, the public IP is released and the key is removed.
 
 ## Common errors
 
@@ -224,20 +243,22 @@ Every error shows the API's status, its code and its message, then your request 
 | `403 permission_denied` | The key's scopes do not cover the call. The message names the permission. | Create a key with the scope the provider names in its hint (`compute:write` or `network:write`, or Full access). |
 | `403 source_address_not_allowed` | The key is limited to networks and this is not one. | Run from an allowed address. |
 | `404 not_found`, `no organization matching that identifier` | `VIRTSCALE_ORGANIZATION` is wrong, or the key belongs to another organization. | Check both. |
+| `404 not_found: Not Found`, and nothing more | The request did not reach the VirtScale API: `VIRTSCALE_ENDPOINT` (or `endpoint`) is mistyped. The error carries no hint for it. | Unset `VIRTSCALE_ENDPOINT`, which defaults to `https://api.virtscale.nl`, or correct it. |
 | `409 compute_not_enabled`, `the organization is not enrolled in the compute service` | Compute is not switched on for your organization. | Ask VirtScale to enable it, then apply again. |
 | `409 region_not_ready` | Your project in this region is still being prepared. | Wait a while and apply again. |
 | `422 region_unavailable`, `region '...' is not accepting instances` | The region does not exist, is not active, or is restricted and your organization has no access. | Use a region that `virtscale_regions` shows as `active` and `entitled`. Access to a restricted region is granted by VirtScale. |
 | `422 quota_exceeded`, for example `instances: 1 in use plus 1 requested exceeds the limit of 1 for this account` | Your organization's limit is reached. The text names what: `instances`, `vcpus`, `ram_mb`, `disk_gb`, or `public IPs` for an address (the limit is one per region by default). | Delete what you no longer use, ask VirtScale for a higher limit, or ask for less. The same request is refused again until then. |
-| `422 instance_type_unavailable`, `instance type '...' is not available in gro` | The type does not exist, is not offered to your organization, or cannot be ordered in that region. The API gives the same answer for all three. | Take a type from `virtscale_instance_types` with `region` set: its `regions` list shows where it can be ordered. |
-| `422 instance_type_unpriced` | The type is sold in the region, but its price is not published yet. | Take another type, or order this one once VirtScale has published its price. |
+| `422 instance_type_unavailable`, `instance type '...' is not available in gro` | The type does not exist, is not offered to your organization, or cannot be ordered in that region. The API gives the same answer for all three. | Give the sizes instead (see Choose a size), or take a type from `virtscale_instance_types` with `region` set: its `regions` list shows where it can be ordered. |
+| `422 instance_type_unpriced`, `instance type 'g1-small' cannot be ordered in gro yet` | The type has no published price, so it cannot be ordered. Production has no orderable instance types today, so every `instance_type` ends here. | Remove `instance_type` and give `vcpus`, `memory_mb`, `disk_gb` and `storage_pool` (see Choose a size). |
 | `422 instance_type_required` | This deployment of the platform only creates instances from an instance type, and the configuration gave `vcpus`, `memory_mb` and `disk_gb`. | Set `instance_type` and remove the three sizes. |
 | `422 public_ips_not_offered`, `region '...' attaches instances straight to a public network, so it has no public IPs to allocate` | A `virtscale_public_ip` in a region that attaches its instances straight to a public network, for example `fsn`: it has no public IPs to allocate. | Remove the `virtscale_public_ip`, or build in a region that offers public IPs (`gro` in this guide). |
 | `422 image_not_usable` | The image is not offered in that region. | Take an image from `virtscale_images` for the same region. |
-| `422 invalid_spec` | The instance is smaller than the image allows (`<image> needs at least N GB of disk and M MB of memory`), or the request mixes things the API does not take together: an instance type with sizes, or sizes without a storage pool. The message says which. | Take an instance type whose memory and disk reach `min_ram_mb` and `min_disk_gb` of the image, or another image. The provider already refuses the mixed requests at plan time. |
+| `422 invalid_spec` | The size is off the grid: `vcpus` is not 1, 2, 4, 8, 16 or 32, `memory_mb` is not a whole number of gigabytes from 1 to 128, or `disk_gb` is not a multiple of 10 from 10 to 2000. The message lists every violation. The same code answers a request that mixes things the API does not take together (an instance type with sizes, or sizes without a storage pool), and an image that states a larger minimum than the size. | Use a size from the grid (see Choose a size). The provider already refuses the mixed requests at plan time. |
 | `409 name_taken`, `409 hostname_taken` | A live instance already has that name (names are unique per region) or hostname (unique per organization). | Choose another. The name of a deleted instance can be reused. |
 | `422 ssh_key_not_found`, `422 invalid_public_key` | The instance names a key that was never imported, or the key is not one the platform accepts. | Import a supported key (see above) and reference the `virtscale_ssh_key` by its name. |
+| `422 access_key_limit_reached` | An organization holds at most 5 active S3 access keys (`virtscale_s3_access_key`). | Revoke one (destroy its resource) before creating another. |
 | `422 billing_state_blocks_provisioning` | The billing account is not in a state that allows new resources. Existing ones stay readable and deletable. | Settle the billing account, then apply again. |
-| `503 not_ready` | The feature behind the call, for example SSH keys, is not switched on in this deployment yet. | Try again later: the provider does not retry it. |
+| `503 not_ready` | The feature behind the call is not switched on in this deployment yet. Production does not switch on VPCs (`virtscale_vpc`) yet, so a VPC always ends here. | Try again later: the provider does not retry it. |
 | `Instance Failed to Build`, `error_class=no_valid_host` | No host in the pool could take that size right now. | Ask for less, or build in another region, then apply again. |
 | `Instance Failed to Build`, `error_class=capacity`, `internal` or `openstack_unreachable` | The platform could not finish the build: no capacity left, or an unclassified or temporary fault. | Apply again, which replaces the failed instance. If it fails the same way, report the request id and the `error_detail`. |
 

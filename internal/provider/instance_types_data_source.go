@@ -56,7 +56,7 @@ func (d *InstanceTypesDataSource) Schema(_ context.Context, _ datasource.SchemaR
 		return schema.Int64Attribute{Computed: true, Description: desc}
 	}
 	resp.Schema = schema.Schema{
-		Description: "The public instance types, in the order the API lists them (by sort order, then id).",
+		Description: "The public instance types, in the order the API lists them (by sort order, then id). The catalogue is empty in production today, so the list is empty there and an instance is sized with vcpus, memory_mb, disk_gb and storage_pool instead.",
 		Attributes: map[string]schema.Attribute{
 			"region": schema.StringAttribute{Optional: true, Description: "Keep only the types that can be ordered in this region now."},
 			"id":     str("Always instance-types."),

@@ -178,7 +178,7 @@ func cleanEnv() []string {
 }
 
 // preamble is the required_providers block a snippet gets when it has none of its own.
-const preamble = "terraform {\n  required_providers {\n    virtscale = {\n      source = \"virtscale/virtscale\"\n    }\n  }\n}\n"
+const preamble = "terraform {\n  required_providers {\n    virtscale = {\n      source = \"registry.terraform.io/virtscale/virtscale\"\n    }\n  }\n}\n"
 
 // devProvider builds the provider from this tree into work/bin and returns a CLI config that points OpenTofu and Terraform
 // at it (dev_overrides, no init).
@@ -319,6 +319,53 @@ func TestThePagesStateWhatTheValidatorsEnforce(t *testing.T) {
 				t.Errorf("%s does not say %q", page, want)
 			}
 		}
+	}
+}
+
+// The short source "virtscale/virtscale" is a 404 for OpenTofu (registry.opentofu.org does not list the provider), so no
+// example, guide or README block may use it: they name the registry, which Terraform and OpenTofu both resolve.
+func TestNoShortSourceInTheDocsAndExamples(t *testing.T) {
+	short := regexp.MustCompile(`source\s*=\s*"virtscale/virtscale"`)
+	n := 0
+	for _, root := range []string{"README.md", "docs", "examples"} {
+		_ = filepath.WalkDir(filepath.Join(repoRoot, root), func(path string, d os.DirEntry, err error) error {
+			if err != nil || d.IsDir() || (!strings.HasSuffix(path, ".md") && !strings.HasSuffix(path, ".tf")) {
+				return nil
+			}
+			n++
+			if b, err := os.ReadFile(path); err == nil && short.Match(b) {
+				t.Errorf("%s uses source = \"virtscale/virtscale\"; write registry.terraform.io/virtscale/virtscale", path)
+			}
+			return nil
+		})
+	}
+	if n < 20 {
+		t.Errorf("looked at %d files, want the README, the docs and the examples: the walk may have matched nothing", n)
+	}
+}
+
+// What production does today is on the page of the resource it concerns: the size grid, that the provider leaves the
+// power state alone, that VPCs are off, the limit of access keys and the young bucket that nothing protects.
+func TestThePagesSayWhatProductionDoes(t *testing.T) {
+	pages, err := Generate(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for page, wants := range map[string][]string{
+		"docs/resources/instance.md":      {"1, 2, 4, 8, 16 or 32", "gigabytes times 1024", "10 to 2000 in steps of 10", "does not manage power state", "instance_type_unpriced", "compute/limits"},
+		"docs/resources/vpc.md":           {"not switched on in production", "503 not_ready"},
+		"docs/resources/s3_access_key.md": {"at most 5 active access keys", "access_key_limit_reached"},
+		"docs/resources/s3_bucket.md":     {"young bucket"},
+		"docs/resources/ssh_key.md":       {"first plan after an import"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(pages[page], want) {
+				t.Errorf("%s does not say %q", page, want)
+			}
+		}
+	}
+	if strings.Contains(pages["docs/resources/ssh_key.md"], "never show up as a difference") {
+		t.Error("the ssh_key page says a comment never shows up as a difference: a comment-only edit plans an in-place public_key change")
 	}
 }
 

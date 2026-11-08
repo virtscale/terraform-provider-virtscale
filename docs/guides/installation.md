@@ -2,12 +2,12 @@
 page_title: "Installation - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  Install the virtscale provider from the Terraform or OpenTofu registry, pin and lock its version, verify the release signature, or build it locally.
+  Install the virtscale provider with Terraform or OpenTofu, pin and lock its version, verify the release signature, or build it locally.
 ---
 
 # Installation
 
-The VirtScale provider is published as `virtscale/virtscale` on [registry.terraform.io](https://registry.terraform.io/providers/virtscale/virtscale) and on registry.opentofu.org. Terraform and OpenTofu download it when you run `init`; there is nothing to build or copy by hand.
+The VirtScale provider is published as `virtscale/virtscale` on [registry.terraform.io](https://registry.terraform.io/providers/virtscale/virtscale). Terraform and OpenTofu both download it from there when you run `init`; there is nothing to build or copy by hand. registry.opentofu.org does not list it yet, so write the source with the registry host, as below.
 
 ## Requirements
 
@@ -17,13 +17,15 @@ The VirtScale provider is published as `virtscale/virtscale` on [registry.terraf
 
 ## Install from the registry
 
-Declare the provider in `required_providers` and run `init`. Terraform and OpenTofu use the same block: the source `virtscale/virtscale` resolves to registry.terraform.io for Terraform and to registry.opentofu.org for OpenTofu.
+Declare the provider in `required_providers` and run `init`. Terraform and OpenTofu use the same block, with the full source address `registry.terraform.io/virtscale/virtscale`.
+
+Write the registry host in the source. A short source, `virtscale/virtscale`, means the default registry of the CLI, and for OpenTofu that is registry.opentofu.org, which answers 404 until the provider is added there (the requests are opentofu/registry #6388 and #6396): `tofu init` then stops with `provider registry registry.opentofu.org does not have a provider named registry.opentofu.org/virtscale/virtscale`. With the host written out, `tofu init` fetches the provider from registry.terraform.io, and Terraform does the same. If you only use the Terraform CLI you may shorten the source to `virtscale/virtscale`; this guide and the other pages keep the long form so that one configuration works with both CLIs.
 
 ```terraform
 terraform {
   required_providers {
     virtscale = {
-      source  = "virtscale/virtscale"
+      source  = "registry.terraform.io/virtscale/virtscale"
       version = "~> 0.1"
     }
   }
@@ -70,7 +72,7 @@ provider "registry.terraform.io/virtscale/virtscale" {
 }
 ```
 
-OpenTofu records the provider under `registry.opentofu.org`, Terraform under `registry.terraform.io`; a configuration used with both CLIs ends up with both entries.
+With the full source address both CLIs record the provider under `registry.terraform.io`, so one lock file serves both.
 
 ```shell
 # Move to the newest release the constraint allows, and rewrite the lock file.
@@ -95,7 +97,7 @@ To check a release by hand, for an audit or before you put it in a mirror, you n
 
 ```shell
 VERSION=0.1.0
-REGISTRY=registry.terraform.io   # or registry.opentofu.org
+REGISTRY=registry.terraform.io   # registry.opentofu.org answers 404 for this provider until it is added there
 mkdir virtscale-verify && cd virtscale-verify
 
 curl -sSf "https://$REGISTRY/v1/providers/virtscale/virtscale/$VERSION/download/linux/amd64" -o download.json
@@ -141,7 +143,7 @@ provider_installation {
 }
 ```
 
-List both hostnames, pointing at the same directory: OpenTofu resolves `virtscale/virtscale` against registry.opentofu.org and Terraform against registry.terraform.io, and a block that names only one fails with `Inconsistent dependency lock file` when you use the other CLI. `direct {}` leaves every other provider on the registry.
+A configuration with the full source address needs only the `registry.terraform.io` line. List both hostnames, pointing at the same directory, when some configuration uses the short source `virtscale/virtscale`: OpenTofu resolves that against registry.opentofu.org and Terraform against registry.terraform.io, and a block that names only one fails with `Inconsistent dependency lock file` when you use the other CLI. `direct {}` leaves every other provider on the registry.
 
 Point the CLI at the file and run your configuration; the `examples/complete` directory of the repository is a complete one:
 

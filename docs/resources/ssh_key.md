@@ -29,7 +29,7 @@ variable "public_key_path" {
 ### Required
 
 - `name` (String) The key's name, unique within the organization and case-sensitive: 1 to 64 characters from letters, digits, '.', '_', '@' and '-', starting with a letter or digit. Instances name the key by this. Changing it replaces the key. **Forces replacement.**
-- `public_key` (String) The OpenSSH public key: one line, "<type> <base64> [comment]", for example file("~/.ssh/id_ed25519.pub"). Types: ssh-ed25519, ecdsa-sha2-nistp256, ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, and ssh-rsa of 2048 to 16384 bits. The API stores the key without its comment. Two texts are the same key when the key type and the key bytes are the same, so a comment, surrounding whitespace, a trailing newline or CRLF never show up as a difference. A different key replaces the resource; a change that leaves the key alone is applied in place, without calling the API. **Forces replacement.**
+- `public_key` (String) The OpenSSH public key: one line, "<type> <base64> [comment]", for example file("~/.ssh/id_ed25519.pub"). Types: ssh-ed25519, ecdsa-sha2-nistp256, ecdsa-sha2-nistp384, ecdsa-sha2-nistp521, and ssh-rsa of 2048 to 16384 bits. The API stores the key without its comment. Two texts are the same key when the key type and the key bytes are the same, so a comment, surrounding whitespace, a trailing newline or CRLF never replace the resource. They do show up as an in-place change of public_key: editing only the comment does, and so does the first plan after an import, where the state holds the API's comment-less text and the configuration holds the file. Applying it stores your text and makes no API call. A different key replaces the resource. **Forces replacement.**
 
 ### Read-Only
 

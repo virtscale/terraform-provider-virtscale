@@ -151,8 +151,9 @@ func (r *S3BucketResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Optional: true, Computed: true, Default: booldefault.StaticBool(false),
 				Description: "Acknowledge, when the bucket is destroyed, that it may still hold objects. The API judges that from the " +
 					"bucket's last metering sample, not from a fresh look: it refuses the delete with 409 bucket_not_empty when that " +
-					"sample saw objects or bytes, and lets it through when there is no sample. The provider's own: not stored by the " +
-					"API, so import leaves it false.",
+					"sample saw objects or bytes, and lets it through when there is no sample. Samples come every 10 minutes, so " +
+					"a young bucket that holds objects has none yet and is soft-deleted with force_destroy = false (recoverable " +
+					"for 7 days). The provider's own: not stored by the API, so import leaves it false.",
 			},
 			"max_size_bytes": schema.Int64Attribute{
 				Optional: true, Description: "The most bytes this bucket may hold, inside the organization's ceiling. Leave it out for " +

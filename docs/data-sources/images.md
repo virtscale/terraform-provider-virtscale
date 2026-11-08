@@ -37,8 +37,8 @@ output "image_names" {
 #### Read-Only
 
 - `id` (String) The image id, for use as a virtscale_instance's image attribute.
-- `min_disk_gb` (Number) The minimum boot disk size, in gigabytes, this image requires.
-- `min_ram_mb` (Number) The minimum memory, in megabytes, this image requires.
+- `min_disk_gb` (Number) The minimum boot disk size, in gigabytes, this image requires. 0 today for every image: not a guide to choosing a size.
+- `min_ram_mb` (Number) The minimum memory, in megabytes, this image requires. 0 today for every image: not a guide to choosing a size.
 - `name` (String) The image's display name.
 - `os_distro` (String) The OS distribution, e.g. debian. Null when unknown.
 - `os_version` (String) The OS version, e.g. 12. Null when unknown.

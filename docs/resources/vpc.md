@@ -2,18 +2,19 @@
 page_title: "virtscale_vpc Resource - terraform-provider-virtscale"
 subcategory: ""
 description: |-
-  A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source).
+  A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source). VPCs are not switched on in production yet: a plan succeeds, but every call, apply included, answers 503 not_ready.
 ---
 
 # virtscale_vpc (Resource)
 
-A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source).
+A VPC: a private address space in one project and one region. It is built and deleted asynchronously; apply waits until it is active, and destroy until it is gone. A VPC cannot be changed after it is created, so a change to any attribute replaces it. Needs an API key with the network:write scope (and compute:read to find the project, for example with the virtscale_project data source). VPCs are not switched on in production yet: a plan succeeds, but every call, apply included, answers 503 not_ready.
 
 ## Example Usage
 
 ```terraform
 data "virtscale_project" "default" {}
 
+# VPCs are not switched on in production yet: plan succeeds, apply answers 503 not_ready.
 resource "virtscale_vpc" "net" {
   project_id    = data.virtscale_project.default.id
   name          = "net"

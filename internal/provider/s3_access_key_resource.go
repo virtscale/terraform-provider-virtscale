@@ -56,7 +56,8 @@ func (r *S3AccessKeyResource) Schema(_ context.Context, _ resource.SchemaRequest
 			"credential and must be protected (an encrypted backend, or OpenTofu state encryption). It cannot be read back, " +
 			"so an imported key has none. Destroying the resource revokes the key. Note that the key is a key on the " +
 			"organization's own storage owner: it can delete the organization's buckets and objects directly over S3, " +
-			"bypassing the soft-delete window. Needs an API key with the storage:write (or write) scope.",
+			"bypassing the soft-delete window. An organization holds at most 5 active access keys: a sixth is refused " +
+			"with 422 access_key_limit_reached until one is revoked. Needs an API key with the storage:write (or write) scope.",
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed: true, Description: "The key's id (a UUID), assigned by the API.",
