@@ -186,8 +186,11 @@ func dataSourceFields(attrs map[string]dsschema.Attribute) []field {
 	var out []field
 	for _, name := range sorted(attrs) {
 		f := toField(name, attrs[name])
-		if a, ok := attrs[name].(dsschema.ListNestedAttribute); ok {
+		switch a := attrs[name].(type) {
+		case dsschema.ListNestedAttribute:
 			f.typ, f.nestedTitle, f.nested = "Attributes List", name, dataSourceFields(a.NestedObject.Attributes)
+		case dsschema.SingleNestedAttribute:
+			f.typ, f.nestedTitle, f.nested = "Attributes", name, dataSourceFields(a.Attributes)
 		}
 		out = append(out, f)
 	}

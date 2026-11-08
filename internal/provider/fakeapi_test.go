@@ -901,7 +901,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 		key, param, id = "compute/instances/{vm_id}/firewall", "vm_id", parts[2]
 	case rest == "compute/images":
 		key = "compute/images"
-	case rest == "compute/regions", rest == "compute/plans", rest == "instance-types", rest == "projects":
+	case rest == "compute/regions", rest == "compute/plans", rest == "compute/limits", rest == "instance-types", rest == "projects":
 		key = rest
 	case rest == "s3/buckets", rest == "s3/access-keys":
 		key = rest
@@ -929,7 +929,7 @@ func parseRoute(method, rest string) (key, param, id string, ok bool) {
 	switch method + " " + key {
 	case "POST compute/instances", "GET compute/instances/{vm_id}",
 		"DELETE compute/instances/{vm_id}", "PATCH compute/instances/{vm_id}",
-		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET instance-types",
+		"GET compute/images", "GET compute/regions", "GET compute/plans", "GET compute/limits", "GET instance-types",
 		"GET compute/instances/{vm_id}/firewall", "PUT compute/instances/{vm_id}/firewall",
 		"GET s3/buckets", "POST s3/buckets", "GET s3/buckets/{bucket_id}", "DELETE s3/buckets/{bucket_id}", "PUT s3/buckets/{bucket_id}/quota",
 		"GET s3/access-keys", "POST s3/access-keys", "DELETE s3/access-keys/{key_id}",
@@ -1133,6 +1133,8 @@ func (f *fakeAPI) serve(rc *reqCtx) {
 		f.listRegions(rc)
 	case "GET compute/plans":
 		f.listPlans(rc)
+	case "GET compute/limits":
+		f.getLimits(rc)
 	case "GET instance-types":
 		f.listInstanceTypes(rc)
 	case "POST s3/buckets":

@@ -89,6 +89,20 @@ type Plan struct {
 	BackupPolicy      *string `json:"backup_policy"`
 }
 
+// Range is the RangeOut representation: an inclusive range and the step values on it snap to.
+type Range struct {
+	Min  int `json:"min"`
+	Max  int `json:"max"`
+	Step int `json:"step"`
+}
+
+// ComputeLimits is the LimitsOut representation returned by GET compute/limits: the sizes a new instance may take.
+type ComputeLimits struct {
+	VCPUsSteps []int `json:"vcpus_steps"`
+	MemoryGB   Range `json:"memory_gb"`
+	DiskGB     Range `json:"disk_gb"`
+}
+
 // GetMe sends GET /v1/me. It names no organization: the credential's own are in the answer.
 func (c *Client) GetMe(ctx context.Context) (*Me, error) {
 	var out Me
@@ -128,4 +142,13 @@ func (c *Client) ListPlans(ctx context.Context) ([]Plan, error) {
 		return nil, err
 	}
 	return out.Items, nil
+}
+
+// GetComputeLimits sends GET /v1/orgs/{org}/compute/limits: the size grid a new instance must sit on.
+func (c *Client) GetComputeLimits(ctx context.Context) (*ComputeLimits, error) {
+	var out ComputeLimits
+	if err := c.doJSON(ctx, http.MethodGet, c.orgPath("compute/limits"), nil, "", &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }

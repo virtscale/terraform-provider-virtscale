@@ -60,11 +60,21 @@ Today an instance is sized with `vcpus`, `memory_mb`, `disk_gb` and `storage_poo
 | `storage_pool` | required with the three sizes; in `gro` it is `gro-ceph` |
 | `network_profile` | optional; in `gro` the platform uses `gro-tenant-default` when you leave it out |
 
-Your organization's quota must have room for the size, whatever the grid says. The API lists the limits, the storage pools and the network profiles your organization may use:
+The data source `virtscale_compute_limits` reads this grid from the API, so a configuration can check its sizes against it (`vcpus_steps`, and `memory_gb` and `disk_gb` with their `min`, `max` and `step`; `memory_mb` is `memory_gb` times 1024):
+
+```hcl
+data "virtscale_compute_limits" "grid" {}
+
+output "vcpus_allowed" {
+  value = data.virtscale_compute_limits.grid.vcpus_steps
+}
+```
+
+Your organization's quota must have room for the size, whatever the grid says. The API also lists the storage pools and the network profiles your organization may use:
 
 ```shell
 API="https://api.virtscale.nl/v1/orgs/$VIRTSCALE_ORGANIZATION/compute"
-for what in limits storage-pools network-profiles; do
+for what in storage-pools network-profiles; do
   curl -sSf -H "Authorization: Bearer $VIRTSCALE_API_KEY" "$API/$what"
   echo
 done
@@ -243,7 +253,7 @@ Every error shows the API's status, its code and its message, then your request 
 | `403 permission_denied` | The key's scopes do not cover the call. The message names the permission. | Create a key with the scope the provider names in its hint (`compute:write` or `network:write`, or Full access). |
 | `403 source_address_not_allowed` | The key is limited to networks and this is not one. | Run from an allowed address. |
 | `404 not_found`, `no organization matching that identifier` | `VIRTSCALE_ORGANIZATION` is wrong, or the key belongs to another organization. | Check both. |
-| `404 not_found: Not Found`, and nothing more | The request did not reach the VirtScale API: `VIRTSCALE_ENDPOINT` (or `endpoint`) is mistyped. The error carries no hint for it. | Unset `VIRTSCALE_ENDPOINT`, which defaults to `https://api.virtscale.nl`, or correct it. |
+| `404 not_found: Not Found`, or a 404 that is not a VirtScale answer (a web page, `{"detail":"Not Found"}`); the provider adds `check VIRTSCALE_ENDPOINT (or the provider's endpoint): the request did not reach the VirtScale API, whose address is https://api.virtscale.nl` | The request did not reach the VirtScale API: `VIRTSCALE_ENDPOINT` (or `endpoint`) is mistyped. A 404 that names a resource (`no vm matching that identifier ...`) is the API's own and gets no such hint. | Unset `VIRTSCALE_ENDPOINT`, which defaults to `https://api.virtscale.nl`, or correct it. |
 | `409 compute_not_enabled`, `the organization is not enrolled in the compute service` | Compute is not switched on for your organization. | Ask VirtScale to enable it, then apply again. |
 | `409 region_not_ready` | Your project in this region is still being prepared. | Wait a while and apply again. |
 | `422 region_unavailable`, `region '...' is not accepting instances` | The region does not exist, is not active, or is restricted and your organization has no access. | Use a region that `virtscale_regions` shows as `active` and `entitled`. Access to a restricted region is granted by VirtScale. |
@@ -255,7 +265,7 @@ Every error shows the API's status, its code and its message, then your request 
 | `422 image_not_usable` | The image is not offered in that region. | Take an image from `virtscale_images` for the same region. |
 | `422 invalid_spec` | The size is off the grid: `vcpus` is not 1, 2, 4, 8, 16 or 32, `memory_mb` is not a whole number of gigabytes from 1 to 128, or `disk_gb` is not a multiple of 10 from 10 to 2000. The message lists every violation. The same code answers a request that mixes things the API does not take together (an instance type with sizes, or sizes without a storage pool), and an image that states a larger minimum than the size. | Use a size from the grid (see Choose a size). The provider already refuses the mixed requests at plan time. |
 | `409 name_taken`, `409 hostname_taken` | A live instance already has that name (names are unique per region) or hostname (unique per organization). | Choose another. The name of a deleted instance can be reused. |
-| `422 ssh_key_not_found`, `422 invalid_public_key` | The instance names a key that was never imported, or the key is not one the platform accepts. | Import a supported key (see above) and reference the `virtscale_ssh_key` by its name. |
+| `422 ssh_key_not_found`, `422 invalid_public_key` | The instance names a key that was never imported, or the key is not one the platform accepts. The API words the first as an import with `POST .../compute/ssh-keys`; the provider adds `create the key with a virtscale_ssh_key resource and name it in ssh_keys`. | Import a supported key (see above) and reference the `virtscale_ssh_key` by its name. |
 | `422 access_key_limit_reached` | An organization holds at most 5 active S3 access keys (`virtscale_s3_access_key`). | Revoke one (destroy its resource) before creating another. |
 | `422 billing_state_blocks_provisioning` | The billing account is not in a state that allows new resources. Existing ones stay readable and deletable. | Settle the billing account, then apply again. |
 | `503 not_ready` | The feature behind the call is not switched on in this deployment yet. Production does not switch on VPCs (`virtscale_vpc`) yet, so a VPC always ends here. | Try again later: the provider does not retry it. |

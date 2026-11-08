@@ -235,7 +235,8 @@ func (e *APIError) Error() string {
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
 	}
-	if e.Attempts > 1 {
+	// Only an error that was itself worth retrying "gave up": a definitive answer (a 422 after a 429) is just the answer.
+	if e.Attempts > 1 && e.transient() {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
 	if e.MayHaveBeenApplied {
@@ -249,6 +250,20 @@ func (e *APIError) Error() string {
 		msg += "; " + hint
 	}
 	return msg
+}
+
+// transient reports whether the error is one the client retries when it can: a 429, a 5xx other than the 503 not_ready of
+// a feature that is switched off, or a 409 idempotency_in_progress.
+func (e *APIError) transient() bool {
+	switch {
+	case e.Status == http.StatusTooManyRequests:
+		return true
+	case e.Status == http.StatusServiceUnavailable && e.Code == "not_ready":
+		return false
+	case e.Status >= 500:
+		return true
+	}
+	return e.Status == http.StatusConflict && e.Code == "idempotency_in_progress"
 }
 
 // permissionNameRE finds the permission a 403 permission_denied names: "this
@@ -274,6 +289,14 @@ func (e *APIError) hint() string {
 	case isOrganizationNotVisible(e):
 		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
 			"or VIRTSCALE_API_KEY belongs to another organization"
+	case e.Status == http.StatusNotFound && (e.Code == "" || (e.Code == "not_found" && e.Detail == unknownRouteDetail)):
+		// Not a problem answer of the API, or the answer of its router for a path it does not have: a proxy's or
+		// another service's page, or an endpoint with a wrong host or path. A 404 about a resource has a code and a sentence.
+		return "check VIRTSCALE_ENDPOINT (or the provider's endpoint): the request did not reach the VirtScale API, " +
+			"whose address is " + DefaultEndpoint + "; unset it to use that"
+	case e.Code == "ssh_key_not_found":
+		// The API tells a client to import the key with a POST; a Terraform user makes it a resource.
+		return "create the key with a virtscale_ssh_key resource and name it in ssh_keys"
 	}
 	return ""
 }
@@ -322,6 +345,9 @@ func scopeHint(detail string) string {
 // 404, so the detail is the only thing that tells them apart. It only decides
 // which hint an error gets: IsNotFound has its own, stricter rule.
 const organizationNotVisiblePrefix = "no organization matching that identifier"
+
+// unknownRouteDetail is the detail of the not_found the API's router gives a path it does not have.
+const unknownRouteDetail = "Not Found"
 
 func isOrganizationNotVisible(e *APIError) bool {
 	return e.Status == http.StatusNotFound && strings.HasPrefix(e.Detail, organizationNotVisiblePrefix)
