@@ -151,6 +151,7 @@ func (p *VirtscaleProvider) DataSources(_ context.Context) []func() datasource.D
 		NewRegionsDataSource,
 		NewInstanceTypesDataSource,
 		NewPlansDataSource,
+		NewComputeLimitsDataSource,
 		NewProjectDataSource,
 	}
 }

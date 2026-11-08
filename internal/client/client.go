@@ -169,6 +169,11 @@ type APIError struct {
 	// have made.
 	MayHaveBeenApplied bool
 
+	// retryable is what retryable() said about the attempt that produced this error: the suffix "gave up after N
+	// attempts" is only true when the client stopped at its limits (attempts, Retry-After, deadline) and not because the
+	// answer was final.
+	retryable bool
+
 	// recovery is the sentence Error() appends for MayHaveBeenApplied, set by
 	// giveUp from the request method (lostCreateHint for a create, otherwise the
 	// change's own hint). Empty on a hand-built APIError, which keeps the create
@@ -235,7 +240,9 @@ func (e *APIError) Error() string {
 	if e.RequestID != "" {
 		msg += fmt.Sprintf(" (request %s)", e.RequestID)
 	}
-	if e.Attempts > 1 {
+	// Only an error the client would have retried "gave up": any other answer (a 422, a 500, a 502 to a request that cannot
+	// be repeated) is just the answer, however many throttled attempts came before it.
+	if e.Attempts > 1 && e.retryable {
 		msg += fmt.Sprintf("; gave up after %d attempts", e.Attempts)
 	}
 	if e.MayHaveBeenApplied {
@@ -274,6 +281,14 @@ func (e *APIError) hint() string {
 	case isOrganizationNotVisible(e):
 		return "check VIRTSCALE_ORGANIZATION: the organization id may be wrong, " +
 			"or VIRTSCALE_API_KEY belongs to another organization"
+	case e.Status == http.StatusNotFound && (e.Code == "" || (e.Code == "not_found" && e.Detail == unknownRouteDetail)):
+		// Not a problem answer of the API, or the answer of its router for a path it does not have: a proxy's or
+		// another service's page, or an endpoint with a wrong host or path. A 404 about a resource has a code and a sentence.
+		return "check VIRTSCALE_ENDPOINT (or the provider's endpoint): the request did not reach the VirtScale API, " +
+			"whose address is " + DefaultEndpoint + "; unset it to use that"
+	case e.Code == "ssh_key_not_found":
+		// The API tells a client to import the key with a POST; a Terraform user makes it a resource.
+		return "create the key with a virtscale_ssh_key resource and name it in ssh_keys"
 	}
 	return ""
 }
@@ -322,6 +337,9 @@ func scopeHint(detail string) string {
 // 404, so the detail is the only thing that tells them apart. It only decides
 // which hint an error gets: IsNotFound has its own, stricter rule.
 const organizationNotVisiblePrefix = "no organization matching that identifier"
+
+// unknownRouteDetail is the detail of the not_found the API's router gives a path it does not have.
+const unknownRouteDetail = "Not Found"
 
 func isOrganizationNotVisible(e *APIError) bool {
 	return e.Status == http.StatusNotFound && strings.HasPrefix(e.Detail, organizationNotVisiblePrefix)
@@ -547,6 +565,7 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 		default:
 			apiErr = c.newAPIError(ex.status, ex.body)
 			apiErr.Attempts = attempt
+			apiErr.retryable = retryable(method, idempotencyKey, ex, apiErr, nil)
 			lastErr = apiErr
 		}
 

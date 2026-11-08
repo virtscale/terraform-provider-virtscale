@@ -148,6 +148,22 @@ func TestAccPlansDataSource(t *testing.T) {
 	))
 }
 
+func TestAccComputeLimitsDataSource(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	dataSourceTest(t, fake, `data "virtscale_compute_limits" "grid" {}`, resource.ComposeAggregateTestCheckFunc(
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "id", "compute-limits"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "vcpus_steps.#", "6"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "vcpus_steps.0", "1"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "vcpus_steps.5", "32"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "memory_gb.min", "1"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "memory_gb.max", "128"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "memory_gb.step", "1"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "disk_gb.min", "10"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "disk_gb.max", "2000"),
+		resource.TestCheckResourceAttr("data.virtscale_compute_limits.grid", "disk_gb.step", "10"),
+	))
+}
+
 // A key without the read scope gets the API's own refusal and the scope to add, for each catalogue.
 func TestAccCatalogueDataSources_AKeyWithoutTheScopeIsToldWhichToAdd(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)

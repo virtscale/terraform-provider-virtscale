@@ -27,6 +27,8 @@ signs and publishes a release when a `v*` tag arrives; see [RELEASING.md](RELEAS
 - Data source `virtscale_images`: the image catalogue for a region.
 - Data sources `virtscale_regions`, `virtscale_instance_types` and `virtscale_plans`: the catalogues a configuration
   chooses from.
+- Data source `virtscale_compute_limits`: the size grid of an instance (vCPU counts, memory and disk ranges with their
+  steps), which is where to look up what `vcpus`, `memory_mb` and `disk_gb` may be.
 - Data source `virtscale_caller`: who the API key is (`GET /v1/me`): its organization, scopes and permissions.
 
 See [examples/complete/main.tf](examples/complete/main.tf) for a complete, runnable configuration, and [docs/](docs/) for one page per resource and data source.

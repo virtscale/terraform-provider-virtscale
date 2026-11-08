@@ -190,6 +190,16 @@ func (f *fakeAPI) listPlans(rc *reqCtx) {
 	rc.json(http.StatusOK, wireList[wirePlanOut]{Items: fakePlans()})
 }
 
+// getLimits is GET compute/limits (LimitsOut): the grid the production API enforces, from config/compute-platform.yaml.
+// It needs no permission (permissions.py has no entry for it), so routePermissions has none either.
+func (f *fakeAPI) getLimits(rc *reqCtx) {
+	rc.json(http.StatusOK, map[string]any{
+		"vcpus_steps": []int{1, 2, 4, 8, 16, 32},
+		"memory_gb":   map[string]int{"min": 1, "max": 128, "step": 1},
+		"disk_gb":     map[string]int{"min": 10, "max": 2000, "step": 10},
+	})
+}
+
 func containsString(list []string, s string) bool {
 	for _, e := range list {
 		if e == s {

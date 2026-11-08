@@ -54,6 +54,7 @@ provider "virtscale" {}
 ## Data Sources
 
 - [`virtscale_caller`](data-sources/caller.md): Who the API key (or other credential) is, from GET /v1/me: its organization, scopes and permissions.
+- [`virtscale_compute_limits`](data-sources/compute_limits.md): The size grid a new instance must sit on: the vCPU counts, and the memory and disk ranges with their steps.
 - [`virtscale_images`](data-sources/images.md): The catalogue of images available to boot a virtscale_instance from, in a given region.
 - [`virtscale_instance_types`](data-sources/instance_types.md): The public instance types, in the order the API lists them (by sort order, then id).
 - [`virtscale_plans`](data-sources/plans.md): The Managed VPS plans of the price book, cheapest first.

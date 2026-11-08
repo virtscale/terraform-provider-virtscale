@@ -167,6 +167,7 @@ If a key leaked, revoke it first and create the replacement afterwards.
 | `403 permission_denied` | The key's scopes do not cover the call. The message names the permission, and the provider adds the scope that grants it, for example `the API key needs the 'compute:write' scope`. |
 | `403 source_address_not_allowed` | The key is limited to networks and you are not on one of them. |
 | `404 not_found` with `no organization matching that identifier` | `VIRTSCALE_ORGANIZATION` is wrong, or the key belongs to another organization. |
+| `404 not_found: Not Found`, or a 404 that is a web page or `{"detail":"Not Found"}` | The request did not reach the VirtScale API. The provider adds `check VIRTSCALE_ENDPOINT (or the provider's endpoint)`: unset it to use the default `https://api.virtscale.nl`. |
 | `400 invalid_request` with `org: Input should be a valid UUID` | `VIRTSCALE_ORGANIZATION` is not a UUID: use the id, not the organization's name. |
 
 Every error carries the API's own message and a request id: quote the request id when you ask VirtScale for help.
