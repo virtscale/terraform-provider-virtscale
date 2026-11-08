@@ -5382,6 +5382,23 @@
             ],
             "title": "Disk Type"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Place the instance on this host, as AWS's Dedicated Host `host_id` does: one plain host name, letters, digits and hyphens, not case sensitive. Only for VirtScale's own organizations: any other organization is refused with 422 host_placement_not_allowed, whatever host it names and whether or not it exists. A host that cannot take the instance (it does not exist, is in another region, is out of service, or is not one this instance can be placed on) is refused with 422 host_unavailable, one sentence for all of them. A storage pool that keeps the disk on the host the instance runs on needs it (422 host_required). The instance is built on that host in one attempt, and is not resized in place afterwards (409 resize_not_available): replace it.",
+            "examples": [
+              "IKVM-AMS1-01"
+            ],
+            "title": "Host Id"
+          },
           "hostname": {
             "anyOf": [
               {
@@ -5600,6 +5617,18 @@
             "title": "Generation",
             "type": "integer"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host the instance was placed on at create (`host_id` in the create request), or null when it was placed on no named host. An instance with a host is not resized in place.",
+            "title": "Host Id"
+          },
           "host_keys": {
             "description": "The pinned host keys, one per key type, by type. Empty while `host_keys_state` is `unknown` or `gave_up`.",
             "items": {
@@ -5780,6 +5809,7 @@
           "disk_gb",
           "instance_type",
           "hostname",
+          "host_id",
           "storage_pool_id",
           "workload_type",
           "network_profile_id",

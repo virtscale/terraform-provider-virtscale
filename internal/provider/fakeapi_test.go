@@ -157,6 +157,7 @@ type wireVmOut struct {
 	Name              string           `json:"name"`
 	FQDN              *string          `json:"fqdn"`
 	Hostname          *string          `json:"hostname"`
+	HostID            *string          `json:"host_id"`
 	InstanceType      *string          `json:"instance_type"`
 	Image             wireImageRef     `json:"image"`
 	VCPUs             int              `json:"vcpus"`
@@ -1492,7 +1493,7 @@ func (b *bodyCheck) finish() []wireFieldError {
 // named; no test sends one, and the client leaves a zero value out of the body.)
 type vmCreateIn struct {
 	Name, Image, StoragePool, Region, NetworkProfile, WorkloadType string
-	Hostname, InstanceType                                         string
+	Hostname, InstanceType, HostID                                 string
 	VCPUs, MemoryMB, DiskGB                                        int
 	SSHKeys                                                        []string
 	UserData                                                       string
@@ -1513,6 +1514,7 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 		WorkloadType:   b.str("workload_type", false, 0, 0),
 		Hostname:       strOrEmpty(b.nullableStr("hostname")),
 		InstanceType:   strOrEmpty(b.nullableStr("instance_type")),
+		HostID:         strOrEmpty(b.nullableStr("host_id")),
 		SSHKeys:        b.strList("ssh_keys"),
 	}
 	if ud := b.nullableStr("user_data"); ud != nil {
@@ -1523,6 +1525,9 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 	}
 	if in.Hostname != "" {
 		b.checkHostname("hostname", in.Hostname)
+	}
+	if in.HostID != "" && !hostIDRE.MatchString(in.HostID) {
+		b.fail("host_id", fmt.Sprintf("String should match pattern '%s'", hostIDPattern))
 	}
 	return in, b.finish()
 }
@@ -1607,7 +1612,9 @@ func (f *fakeAPI) checkUserData(rc *reqCtx, req vmCreateIn) bool {
 // also before the key), then the Idempotency-Key claim, then
 // create_vm_request's own checks, which resolve ssh_keys against the keystore.
 func (f *fakeAPI) createVm(rc *reqCtx) {
-	req, errs := decodeVmCreate(rc.r.Body)
+	raw, _ := io.ReadAll(rc.r.Body)
+	f.recordBody("POST compute/instances", raw)
+	req, errs := decodeVmCreate(bytes.NewReader(raw))
 	if len(errs) > 0 {
 		rc.invalid(errs...)
 		return
@@ -1649,6 +1656,12 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		}
 	}
 
+	// Who is asking, before anything about where: one sentence for every organization that is not internal.
+	if req.HostID != "" && !f.internalOrg {
+		rc.unprocessable("host_placement_not_allowed", detailHostPlacementNotAllowed)
+		return
+	}
+
 	name, ok := canonicalVmName(req.Name)
 	if !ok {
 		rc.unprocessable("invalid_name", "name must be 1-63 characters of a-z, 0-9 and '-', not starting or ending with '-'")
@@ -1667,6 +1680,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 	}
 	// What the type or the defaults fill in, decided before the name is judged like create_vm_request does.
 	sizes, ok := resolveCreateSizes(rc, req)
+	if !ok {
+		return
+	}
+	host, ok := resolveHost(rc, req, sizes.pool)
 	if !ok {
 		return
 	}
@@ -1719,6 +1736,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 			RegionID:         req.Region,
 			Name:             name,
 			Hostname:         hostname,
+			HostID:           host,
 			InstanceType:     instanceType,
 			Image:            wireImageRef{ImageID: imageID, Name: req.Image},
 			VCPUs:            sizes.vcpus,
@@ -1759,6 +1777,49 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		}
 	}
 	rc.json(http.StatusAccepted, payload, "Location", location, "ETag", generationETag(vm.Generation))
+}
+
+// The compute hosts of the fake's regions, in the spelling the API stores (compute_hosts.hostname; a create names one
+// without regard to case), and the storage pools that keep the disk on the host the instance runs on, with the hosts
+// that have a volume type for them (config/compute-platform.yaml: ams1-local and its host_volume_types).
+var (
+	fakeHosts          = map[string]string{"IKVM-AMS1-01": "ams", "IKVM-AMS1-02": "ams", "IKVM-AMS1-03": "ams", "IKVM-GRO1-01": "gro"}
+	fakeHostLocalPools = map[string][]string{"ams1-local": {"IKVM-AMS1-01", "IKVM-AMS1-02", "IKVM-AMS1-03"}}
+)
+
+// hostIDPattern is the API's rule for host_id: one plain host name.
+const hostIDPattern = `^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`
+
+var hostIDRE = regexp.MustCompile(hostIDPattern)
+
+// The sentences of the host refusals (domain/compute/vms.py): fixed, whatever the caller named, so that they cannot be
+// used to list hosts.
+const (
+	detailHostPlacementNotAllowed = "placing an instance on a named host is not available to this organization"
+	detailHostUnavailable         = "the named host is not available for this instance"
+	detailHostRequired            = "instances on this storage pool keep their disk on the host they run on; name that host with host_id"
+	detailResizeNotAvailable      = "an instance placed on a named host is not resized in place; replace it"
+)
+
+// resolveHost is the host part of create_vm_request, decided after the pool is: a host-local pool needs a host, and a
+// host named must be one of the create's region (and of the pool's hosts, for a host-local pool). It answers the 422
+// itself and returns the host in the API's spelling, nil when none was named.
+func resolveHost(rc *reqCtx, req vmCreateIn, pool string) (*string, bool) {
+	local, isLocal := fakeHostLocalPools[pool]
+	if isLocal && req.HostID == "" {
+		rc.unprocessable("host_required", detailHostRequired)
+		return nil, false
+	}
+	if req.HostID == "" {
+		return nil, true
+	}
+	for name, region := range fakeHosts {
+		if strings.EqualFold(name, req.HostID) && region == req.Region && (!isLocal || containsString(local, name)) {
+			return &name, true
+		}
+	}
+	rc.unprocessable("host_unavailable", detailHostUnavailable)
+	return nil, false
 }
 
 // createChoices is what a create ends up with after the API has applied its defaults.
@@ -2188,6 +2249,10 @@ func (f *fakeAPI) resizeVm(rc *reqCtx, id string) {
 	vm, ok := f.vms[id]
 	if !ok || vm.deletedAt != nil {
 		rc.notFound("vm")
+		return
+	}
+	if vm.HostID != nil { // not here rather than not now: a cold resize may land on another host (_refuse_unless_resizable)
+		rc.conflict("resize_not_available", detailResizeNotAvailable)
 		return
 	}
 	if vm.State != "running" && vm.State != "stopped" {
@@ -2896,7 +2961,7 @@ const (
 // sees is exactly this.
 var (
 	specVmOutKeys = []string{
-		"id", "org_id", "region_id", "name", "fqdn", "hostname", "instance_type", "image", "vcpus",
+		"id", "org_id", "region_id", "name", "fqdn", "hostname", "host_id", "instance_type", "image", "vcpus",
 		"memory_mb", "disk_gb", "storage_pool_id", "workload_type", "network_profile_id", "state",
 		"status", "desired_state", "private_ip", "addresses", "generation", "error_class",
 		"error_detail", "observed_status", "observed_addresses", "observed_at", "ssh_key_names",

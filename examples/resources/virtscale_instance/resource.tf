@@ -30,3 +30,26 @@ resource "virtscale_instance" "web" {
   # apply first. Changing it is an in-place update.
   disable_api_termination = true
 }
+
+# Internal organizations only (VirtScale's own): any other organization is refused with 422 host_placement_not_allowed.
+# The instance is placed on a named host (host_id, not case sensitive) and boots from a root volume on that host's local
+# storage: root_block_device is another spelling of storage_pool and disk_gb (volume_type is the storage pool,
+# volume_size the disk in GB), and a host-local pool such as ams1-local needs host_id. An instance with a host_id is never
+# resized in place: a different vcpus or memory_mb replaces it.
+data "virtscale_images" "debian_ams" {
+  region = "ams"
+}
+
+resource "virtscale_instance" "dns" {
+  name      = "dns-01"
+  region    = "ams"
+  image     = [for i in data.virtscale_images.debian_ams.images : i.id if startswith(i.name, "Debian 12")][0]
+  vcpus     = 2
+  memory_mb = 2048
+  host_id   = "IKVM-AMS1-01"
+
+  root_block_device {
+    volume_type = "ams1-local"
+    volume_size = 40
+  }
+}
