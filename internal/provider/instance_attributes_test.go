@@ -145,10 +145,20 @@ func TestAccInstanceResource_UserDataSizeIsCheckedAtPlanTime(t *testing.T) {
 			{Config: cfg(strings.Repeat("a", 32*1024+1)), ExpectError: wrapSafe("32 KiB")},
 			{Config: cfg(""), ExpectError: wrapSafe("at least 1")},
 			{
+				// CreateCount only counts creates the fake accepted, which would also hide a request the fake refused: the POSTs
+				// that reached the route are what proves the plan-time validator, not the API, turned the two values away.
+				PreConfig: func() {
+					if n := fake.CallCount("POST compute/instances"); n != 0 {
+						t.Fatalf("POST compute/instances calls = %d after the two refused values, want 0: they must be refused at plan time, not by the API", n)
+					}
+				},
 				Config: cfg(strings.Repeat("a", 32*1024)),
 				Check: func(s *terraform.State) error {
 					if n := fake.CreateCount(); n != 1 {
 						return fmt.Errorf("creates = %d, want 1: only the 32 KiB value was sent (the refused ones must not reach the API)", n)
+					}
+					if n := fake.CallCount("POST compute/instances"); n != 1 {
+						return fmt.Errorf("POST compute/instances calls = %d, want 1: only the 32 KiB value was sent", n)
 					}
 					return nil
 				},

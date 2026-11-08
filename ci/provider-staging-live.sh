@@ -18,13 +18,15 @@
 #      protected main, API pipelines only, token 300 s / 4 uses),
 #   4. read kv/platform/s3-staging/test-keys (the one path the role's policy allows), keep stg-org-a's id and key in
 #      shell variables, and revoke the OpenBao token,
-#   5. run the live tests one after another, each in its own `go test` process with the key in that process's
+#   5. run the sweeper first (TestLiveSweepLeftovers: it removes tf-live-* instances an earlier run left behind, a
+#      protected one included), then count the tf-live-* objects the org holds (the run refuses to start if any are
+#      left), then run the live tests one after another, each in its own `go test` process with the key in that process's
 #      environment and the Go module proxy switched off (SSH keys, the catalogue data sources, projects, VPCs, an
 #      instance with its firewall, S3): apply, an empty second plan, an update, import, destroy,
 #   6. withhold a test's log if it contains the key (checked after every test; the artifact is updated every time),
 #      require `--- PASS` for every test (a failed test does not stop the others, so one run shows which families work),
-#      and count the tf-live-* objects the org holds before (the run refuses to start if there are any) and after (the
-#      run must leave none behind). The S3 test runs only with PROVIDER_STAGING_LIVE_S3=1.
+#      and count the tf-live-* objects again afterwards (the run must leave none behind). The S3 test runs only with
+#      PROVIDER_STAGING_LIVE_S3=1.
 #
 # Not coverable here: the id_token is also in the environment of the runner's own shell, which any process of the
 # job can read. The role limits what it opens (this project, protected main, API pipelines, the staging document).
@@ -57,8 +59,11 @@ BAO_CA_FILE="ci/bao-ca.pem"
 BAO_ROLE="provider-staging-live"
 KEYS_PATH="kv/data/platform/s3-staging/test-keys"
 ENDPOINT="http://s3-staging-customer-api.s3-staging.svc.cluster.local"
-# The live tests, in the order they run. An instance is the heaviest and the staging host is small: the two instance tests
-# run last, one after the other, never together.
+# The sweeper runs first of all, before the clean-start count: it removes the tf-live-* instances an earlier run left behind
+# (a protected one that its destroy refused, a killed job), which that count would otherwise refuse for good.
+TESTS_SWEEP="TestLiveSweepLeftovers"
+# The live tests, in the order they run, after the sweeper. An instance is the heaviest and the staging host is small: the
+# two instance tests run last, one after the other, never together.
 # The S3 test needs an object store behind the API, which staging has not, and every bucket it creates is soft-deleted and,
 # while the platform's purge worker is off, never purged (it keeps its name and a retention row for good): it runs only when
 # the pipeline is started with PROVIDER_STAGING_LIVE_S3=1.
@@ -161,6 +166,56 @@ vsk_?*) ;;
 *) fail "the key document has no usable S3CP_STAGING_ORG_A_KEY" ;;
 esac
 
+# One live test in its own `go test` process, its log scanned for the key, then recorded in $results (and $rc when it did not
+# pass). A prefix assignment gives the key to this one command and its children only, and GOPROXY=off keeps the Go
+# toolchain off the network while the key is in the environment (the modules were fetched and verified above). tofu itself
+# does go out in TestLiveRegistryRelease_SshKeyProof: it installs the pinned release from registry.terraform.io and GitHub,
+# checked against the signed SHA256SUMS.
+rc=0
+results=""
+: >"$work/go-test.log"
+run_live_test() { # run_live_test NAME
+  name=$1
+  trc=0
+  TF_ACC=1 \
+    TF_ACC_TERRAFORM_PATH="$work/bin/tofu" \
+    TF_ACC_PROVIDER_NAMESPACE=virtscale \
+    TF_ACC_PROVIDER_HOST=registry.terraform.io \
+    VIRTSCALE_LIVE=1 \
+    VIRTSCALE_LIVE_S3="$live_s3" \
+    VIRTSCALE_ENDPOINT="$ENDPOINT" \
+    VIRTSCALE_ORGANIZATION="$org" \
+    VIRTSCALE_API_KEY="$api_key" \
+    GOPROXY=off \
+    go test ./internal/provider -run "^${name}\$" -count=1 -v -timeout 30m >"$work/test.log" 2>&1 || trc=$?
+  # 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
+  # it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
+  # It is done after every test, and the artifact is updated every time, so that a job that is killed by its timeout
+  # still leaves the log of the tests that ran.
+  # grep says 0 for a match and 1 for none; anything else (2: it could not read) is as bad as a match.
+  scan=0
+  printf '%s' "$api_key" | grep -qF -f - "$work/test.log" || scan=$?
+  case "$scan" in
+  0) fail "the API key appears in the output of $name: the log is withheld" ;;
+  1) ;;
+  *) fail "scanning the output of $name for the API key failed (grep status $scan): the log is withheld" ;;
+  esac
+  cat "$work/test.log"
+  cat "$work/test.log" >>"$work/go-test.log"
+  cp "$work/go-test.log" provider-staging-live.log
+  if [ "$trc" -eq 0 ] && grep -q -- "--- PASS: ${name}" "$work/test.log" && ! grep -q -- "--- SKIP: ${name}" "$work/test.log"; then
+    results="$results $name=PASS"
+  else
+    results="$results $name=FAIL"
+    rc=1
+  fi
+}
+
+# The sweeper runs before anything is counted: an instance left behind by an earlier run (a protected one its destroy
+# refused) would make the clean-start guard below stop every later run. It removes instances named tf-live-* and nothing
+# else; if it cannot remove one, the guard below says so.
+run_live_test "$TESTS_SWEEP"
+
 # GET path (below the API root) into a file; the key goes to curl on stdin. Prints the HTTP status only.
 api_get() {
   code=$(printf 'header = "Authorization: Bearer %s"\n' "$api_key" |
@@ -209,48 +264,10 @@ echo "the staging org before the run: $before"
 [ "$before" = "ssh_keys=0 projects=0 instances=0 buckets=0 vpcs=0" ] ||
   fail "the staging org already holds tf-live-* objects from an earlier run: remove them first (before: $before)"
 
-# 5. The tests, one `go test` process each. A prefix assignment gives the key to this one command and its children only,
-# and GOPROXY=off keeps the Go toolchain off the network while the key is in the environment (the modules were fetched
-# and verified above). tofu itself does go out in TestLiveRegistryRelease_SshKeyProof: it installs the pinned release
-# from registry.terraform.io and GitHub, checked against the signed SHA256SUMS. A test that fails or skips is recorded
-# and the next one still runs.
-rc=0
-results=""
-: >"$work/go-test.log"
+# 5. The tests, one `go test` process each (run_live_test, above). A failed or skipped test is recorded and the next one
+# still runs.
 for name in $TESTS; do
-  trc=0
-  TF_ACC=1 \
-    TF_ACC_TERRAFORM_PATH="$work/bin/tofu" \
-    TF_ACC_PROVIDER_NAMESPACE=virtscale \
-    TF_ACC_PROVIDER_HOST=registry.terraform.io \
-    VIRTSCALE_LIVE=1 \
-    VIRTSCALE_LIVE_S3="$live_s3" \
-    VIRTSCALE_ENDPOINT="$ENDPOINT" \
-    VIRTSCALE_ORGANIZATION="$org" \
-    VIRTSCALE_API_KEY="$api_key" \
-    GOPROXY=off \
-    go test ./internal/provider -run "^${name}\$" -count=1 -v -timeout 30m >"$work/test.log" 2>&1 || trc=$?
-  # 6. Withhold the log if it holds the key as clear text (grep reads the key on stdin). This catches an accidental print;
-  # it is not a defence against code that encodes the key, which is why only reviewed code on protected main can run here.
-  # It is done after every test, and the artifact is updated every time, so that a job that is killed by its timeout
-  # still leaves the log of the tests that ran.
-  # grep says 0 for a match and 1 for none; anything else (2: it could not read) is as bad as a match.
-  scan=0
-  printf '%s' "$api_key" | grep -qF -f - "$work/test.log" || scan=$?
-  case "$scan" in
-  0) fail "the API key appears in the output of $name: the log is withheld" ;;
-  1) ;;
-  *) fail "scanning the output of $name for the API key failed (grep status $scan): the log is withheld" ;;
-  esac
-  cat "$work/test.log"
-  cat "$work/test.log" >>"$work/go-test.log"
-  cp "$work/go-test.log" provider-staging-live.log
-  if [ "$trc" -eq 0 ] && grep -q -- "--- PASS: ${name}" "$work/test.log" && ! grep -q -- "--- SKIP: ${name}" "$work/test.log"; then
-    results="$results $name=PASS"
-  else
-    results="$results $name=FAIL"
-    rc=1
-  fi
+  run_live_test "$name"
 done
 
 after=$(leftovers)

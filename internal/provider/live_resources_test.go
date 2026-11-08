@@ -7,7 +7,8 @@ package provider
 // live_ssh_key_test.go), refuse the production API, and name everything they create tf-live-<random>.
 //
 // Optional settings of a live run (the staging values are the defaults): VIRTSCALE_LIVE_REGION,
-// VIRTSCALE_LIVE_STORAGE_POOL and VIRTSCALE_LIVE_NETWORK_PROFILE.
+// VIRTSCALE_LIVE_STORAGE_POOL and VIRTSCALE_LIVE_NETWORK_PROFILE; VIRTSCALE_LIVE_RESIZE=1 adds the in-place resize to
+// the instance attributes proof (off by default: staging is a fenced deployment and refuses every resize).
 
 import (
 	"context"
@@ -49,6 +50,10 @@ func liveParamsFromEnv() liveParams {
 	}
 }
 
+// liveNamePrefix starts the name of everything a live run creates (ci/provider-staging-live.sh counts it too); the
+// sweeper (live_sweep_test.go) removes instances with this prefix and nothing else.
+const liveNamePrefix = "tf-live-"
+
 // liveName is a throwaway name: tf-live- and 8 random lower-case hex characters, so that a sweep finds only what a
 // run made.
 func liveName(t *testing.T) string {
@@ -57,7 +62,7 @@ func liveName(t *testing.T) string {
 	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("generate a random name: %v", err)
 	}
-	return "tf-live-" + hex.EncodeToString(b[:])
+	return liveNamePrefix + hex.EncodeToString(b[:])
 }
 
 // liveClient is the API client of the destroy checks.
@@ -391,11 +396,13 @@ func TestLiveInstanceFirewallResource_LifecycleProof(t *testing.T) {
 // --- an instance with user_data, protection and a resize in place --------------------------------------------------
 
 // runInstanceAttributesProof is one sequential proof of the attributes of an internal VM, on one small server: it is
-// created with user_data and disable_api_termination = true, a destroy is refused while it is protected, it is resized
-// in place (1 vCPU, 1024 MB to 1 vCPU, 2048 MB: the instance restarts), the protection is lifted and the destroy works.
-func runInstanceAttributesProof(t *testing.T, providerBlock string, p liveParams, c *client.Client) {
+// created with user_data and disable_api_termination = true, a destroy is refused while it is protected, the protection
+// is lifted, and, when resize is true, it is resized in place (1 vCPU, 1024 MB to 1 vCPU, 2048 MB: the instance
+// restarts); the destroy at the end works. The protection is lifted before the resize, so a step that fails for a
+// reason outside protection (a deployment that refuses resizes) cannot leave a protected instance that no destroy can
+// remove. A fenced deployment such as staging refuses every resize: its live run leaves resize off.
+func runInstanceAttributesProof(t *testing.T, providerBlock, name string, p liveParams, c *client.Client, resize bool) {
 	t.Helper()
-	name := liveName(t)
 	config := func(protected bool, memoryMB int) string {
 		return providerBlock + fmt.Sprintf(`
 data "virtscale_images" "r" {
@@ -432,72 +439,87 @@ resource "virtscale_instance" "i" {
 	inPlace := resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{
 		plancheck.ExpectResourceAction("virtscale_instance.i", plancheck.ResourceActionUpdate),
 	}}
+	steps := []resource.TestStep{
+		{
+			Config: config(true, 1024),
+			Check: resource.ComposeAggregateTestCheckFunc(
+				func(s *terraform.State) error {
+					rs := s.RootModule().Resources["virtscale_instance.i"]
+					if rs == nil {
+						return fmt.Errorf("virtscale_instance.i not found in state")
+					}
+					id = rs.Primary.ID
+					return nil
+				},
+				resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
+				resource.TestCheckResourceAttr("virtscale_instance.i", "disable_api_termination", "true"),
+				resource.TestCheckResourceAttr("virtscale_instance.i", "workload_type", "customer"),
+				api(func(vm *client.Vm) error {
+					if !vm.Protected || !vm.UserDataPresent {
+						return fmt.Errorf("the API reports protected = %v, user_data_present = %v, want both true", vm.Protected, vm.UserDataPresent)
+					}
+					return nil
+				}),
+			),
+		},
+		{Config: config(true, 1024), ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}},
+		{ // A protected instance cannot be destroyed, and the error says how to go on.
+			Config:      config(true, 1024),
+			Destroy:     true,
+			ExpectError: wrapSafeInOrder("vm_protected", "set disable_api_termination = false and apply first"),
+		},
+		{ // Lifting the protection is an update in place. It comes before anything that can fail for another reason.
+			Config:           config(false, 1024),
+			ConfigPlanChecks: inPlace,
+			Check: api(func(vm *client.Vm) error {
+				if vm.Protected {
+					return fmt.Errorf("the API still reports the instance protected")
+				}
+				return nil
+			}),
+		},
+	}
+	if resize {
+		steps = append(steps, resource.TestStep{ // The resize is in place: the same instance, the new memory, running again.
+			Config:           config(false, 2048),
+			ConfigPlanChecks: inPlace,
+			Check: resource.ComposeAggregateTestCheckFunc(
+				resource.TestCheckResourceAttr("virtscale_instance.i", "memory_mb", "2048"),
+				resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
+				resource.TestCheckResourceAttrPtr("virtscale_instance.i", "id", &id),
+				api(func(vm *client.Vm) error {
+					if vm.MemoryMB != 2048 || vm.VCPUs != 1 || vm.State != "running" {
+						return fmt.Errorf("the API reports %d vcpus, %d MB, state %s, want 1, 2048, running", vm.VCPUs, vm.MemoryMB, vm.State)
+					}
+					return nil
+				}),
+			),
+		})
+	}
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { testAccPreCheck(t) },
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
 		CheckDestroy:             destroyCheckFor("virtscale_instance", instanceGone(c)),
-		Steps: []resource.TestStep{
-			{
-				Config: config(true, 1024),
-				Check: resource.ComposeAggregateTestCheckFunc(
-					func(s *terraform.State) error {
-						rs := s.RootModule().Resources["virtscale_instance.i"]
-						if rs == nil {
-							return fmt.Errorf("virtscale_instance.i not found in state")
-						}
-						id = rs.Primary.ID
-						return nil
-					},
-					resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
-					resource.TestCheckResourceAttr("virtscale_instance.i", "disable_api_termination", "true"),
-					resource.TestCheckResourceAttr("virtscale_instance.i", "workload_type", "customer"),
-					api(func(vm *client.Vm) error {
-						if !vm.Protected || !vm.UserDataPresent {
-							return fmt.Errorf("the API reports protected = %v, user_data_present = %v, want both true", vm.Protected, vm.UserDataPresent)
-						}
-						return nil
-					}),
-				),
-			},
-			{Config: config(true, 1024), ConfigPlanChecks: resource.ConfigPlanChecks{PreApply: []plancheck.PlanCheck{plancheck.ExpectEmptyPlan()}}},
-			{ // A protected instance cannot be destroyed, and the error says how to go on.
-				Config:      config(true, 1024),
-				Destroy:     true,
-				ExpectError: wrapSafeInOrder("vm_protected", "set disable_api_termination = false and apply first"),
-			},
-			{ // The resize is in place: the same instance, the new memory, running again.
-				Config:           config(true, 2048),
-				ConfigPlanChecks: inPlace,
-				Check: resource.ComposeAggregateTestCheckFunc(
-					resource.TestCheckResourceAttr("virtscale_instance.i", "memory_mb", "2048"),
-					resource.TestCheckResourceAttr("virtscale_instance.i", "state", "running"),
-					resource.TestCheckResourceAttrPtr("virtscale_instance.i", "id", &id),
-					api(func(vm *client.Vm) error {
-						if vm.MemoryMB != 2048 || vm.VCPUs != 1 || vm.State != "running" {
-							return fmt.Errorf("the API reports %d vcpus, %d MB, state %s, want 1, 2048, running", vm.VCPUs, vm.MemoryMB, vm.State)
-						}
-						return nil
-					}),
-				),
-			},
-			{ // Lifting the protection is an update in place, and then the destroy at the end works.
-				Config:           config(false, 2048),
-				ConfigPlanChecks: inPlace,
-				Check: api(func(vm *client.Vm) error {
-					if vm.Protected {
-						return fmt.Errorf("the API still reports the instance protected")
-					}
-					return nil
-				}),
-			},
-		},
+		Steps:                    steps,
 	})
 }
 
 func TestAccInstanceAttributes_LiveProofAgainstTheFake(t *testing.T) {
 	fake := newFakeAPI(t, "test-api-key", testOrgID)
 	c, _ := liveClient(fake.URL(), "test-api-key", fake.org)
-	runInstanceAttributesProof(t, testAccProviderBlock(fake), fakeParams(), c)
+	runInstanceAttributesProof(t, testAccProviderBlock(fake), liveName(t), fakeParams(), c, true)
+}
+
+// The live default: a fenced deployment (staging) refuses every resize, so the proof runs without the resize step, ends
+// with the instance destroyed and never asks for a resize.
+func TestAccInstanceAttributes_LiveProofWithoutResizeOnADeploymentThatRefusesResizes(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetResizeOff(true)
+	c, _ := liveClient(fake.URL(), "test-api-key", fake.org)
+	runInstanceAttributesProof(t, testAccProviderBlock(fake), liveName(t), fakeParams(), c, false)
+	if n := fake.CallCount("POST compute/instances/{vm_id}/resize"); n != 0 {
+		t.Errorf("resize calls = %d, want 0: the proof without resize must not ask for one", n)
+	}
 }
 
 func TestLiveInstanceAttributesProof(t *testing.T) {
@@ -506,7 +528,16 @@ func TestLiveInstanceAttributesProof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build the API client: %v", err)
 	}
-	runInstanceAttributesProof(t, liveProviderBlock, liveParamsFromEnv(), c)
+	// Whatever step fails, the instance and its protection must not outlive the test: the staging host fits one small
+	// server, and a protected leftover blocks the next run. This also runs after a failed post-test destroy.
+	name := liveName(t)
+	t.Cleanup(func() {
+		if err := liveSweepInstances(t, c, func(n string) bool { return n == name }, liveSweepTimeout); err != nil {
+			t.Errorf("removing the test instance %s: %v", name, err)
+		}
+	})
+	// The in-place resize needs a deployment that allows resizes; fenced ones (staging) refuse it by design.
+	runInstanceAttributesProof(t, liveProviderBlock, name, liveParamsFromEnv(), c, os.Getenv("VIRTSCALE_LIVE_RESIZE") == "1")
 }
 
 // --- S3: a bucket and an access key ----------------------------------------------------------------------------------
