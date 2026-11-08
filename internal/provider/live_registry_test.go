@@ -8,9 +8,14 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 )
 
-// TestLiveRegistryRelease_SshKeyProof runs a short SSH key proof with the provider as a user gets it: the newest
-// release on registry.terraform.io, which tofu init downloads and checks against the signed SHA256SUMS, not the
-// build of this checkout. It skips like the other live tests (liveSshKeyEnv).
+// TestLiveRegistryRelease_SshKeyProof runs a short SSH key proof with the provider as a user gets it: a release from
+// registry.terraform.io, which tofu init downloads and checks against the signed SHA256SUMS, not the build of this
+// checkout. It skips like the other live tests (liveSshKeyEnv).
+//
+// The staging API key reaches the downloaded binary, so the version is pinned exactly (like tofu in the live script):
+// a new release is tested by bumping registryReleaseVersion in a reviewed change, never by a range.
+const registryReleaseVersion = "0.1.0"
+
 func TestLiveRegistryRelease_SshKeyProof(t *testing.T) {
 	endpoint, apiKey, org := liveSshKeyEnv(t)
 	key := newLiveSshKey(t)
@@ -19,7 +24,7 @@ func TestLiveRegistryRelease_SshKeyProof(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck: func() { testAccPreCheck(t) },
 		ExternalProviders: map[string]resource.ExternalProvider{
-			"virtscale": {Source: "registry.terraform.io/virtscale/virtscale", VersionConstraint: ">= 0.1.0"},
+			"virtscale": {Source: "registry.terraform.io/virtscale/virtscale", VersionConstraint: "= " + registryReleaseVersion},
 		},
 		CheckDestroy: liveSshKeyDestroyCheck(endpoint, apiKey, org),
 		Steps: []resource.TestStep{
