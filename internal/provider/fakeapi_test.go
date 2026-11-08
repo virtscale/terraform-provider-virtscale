@@ -143,38 +143,47 @@ type wireImageRef struct {
 	Name    string `json:"name"`
 }
 
+// wireHostKeyOut is HostKeyOut: one pinned SSH host key, as a fingerprint only.
+type wireHostKeyOut struct {
+	KeyType           string    `json:"key_type"`
+	FingerprintSHA256 string    `json:"fingerprint_sha256"`
+	FirstSeenAt       time.Time `json:"first_seen_at"`
+}
+
 type wireVmOut struct {
-	ID                string         `json:"id"`
-	OrgID             string         `json:"org_id"`
-	RegionID          string         `json:"region_id"`
-	Name              string         `json:"name"`
-	FQDN              *string        `json:"fqdn"`
-	Hostname          *string        `json:"hostname"`
-	InstanceType      *string        `json:"instance_type"`
-	Image             wireImageRef   `json:"image"`
-	VCPUs             int            `json:"vcpus"`
-	MemoryMB          int            `json:"memory_mb"`
-	DiskGB            int            `json:"disk_gb"`
-	StoragePoolID     string         `json:"storage_pool_id"`
-	WorkloadType      string         `json:"workload_type"`
-	NetworkProfileID  string         `json:"network_profile_id"`
-	State             string         `json:"state"`
-	Status            string         `json:"status"`
-	DesiredState      string         `json:"desired_state"`
-	PrivateIP         *string        `json:"private_ip"`
-	Addresses         []string       `json:"addresses"`
-	Generation        int64          `json:"generation"`
-	ErrorClass        *string        `json:"error_class"`
-	ErrorDetail       *string        `json:"error_detail"`
-	ObservedStatus    *string        `json:"observed_status"`
-	ObservedAddresses map[string]any `json:"observed_addresses"`
-	ObservedAt        *time.Time     `json:"observed_at"`
-	SSHKeyNames       []string       `json:"ssh_key_names"`
-	UserDataPresent   bool           `json:"user_data_present"`
-	Protected         bool           `json:"protected"`
-	AllowedActions    []string       `json:"allowed_actions"`
-	CreatedAt         time.Time      `json:"created_at"`
-	UpdatedAt         time.Time      `json:"updated_at"`
+	ID                string           `json:"id"`
+	OrgID             string           `json:"org_id"`
+	RegionID          string           `json:"region_id"`
+	Name              string           `json:"name"`
+	FQDN              *string          `json:"fqdn"`
+	Hostname          *string          `json:"hostname"`
+	InstanceType      *string          `json:"instance_type"`
+	Image             wireImageRef     `json:"image"`
+	VCPUs             int              `json:"vcpus"`
+	MemoryMB          int              `json:"memory_mb"`
+	DiskGB            int              `json:"disk_gb"`
+	StoragePoolID     string           `json:"storage_pool_id"`
+	WorkloadType      string           `json:"workload_type"`
+	NetworkProfileID  string           `json:"network_profile_id"`
+	State             string           `json:"state"`
+	Status            string           `json:"status"`
+	DesiredState      string           `json:"desired_state"`
+	PrivateIP         *string          `json:"private_ip"`
+	Addresses         []string         `json:"addresses"`
+	Generation        int64            `json:"generation"`
+	ErrorClass        *string          `json:"error_class"`
+	ErrorDetail       *string          `json:"error_detail"`
+	ObservedStatus    *string          `json:"observed_status"`
+	ObservedAddresses map[string]any   `json:"observed_addresses"`
+	ObservedAt        *time.Time       `json:"observed_at"`
+	SSHKeyNames       []string         `json:"ssh_key_names"`
+	UserDataPresent   bool             `json:"user_data_present"`
+	HostKeysState     string           `json:"host_keys_state"`
+	HostKeys          []wireHostKeyOut `json:"host_keys"`
+	Protected         bool             `json:"protected"`
+	AllowedActions    []string         `json:"allowed_actions"`
+	CreatedAt         time.Time        `json:"created_at"`
+	UpdatedAt         time.Time        `json:"updated_at"`
 }
 
 // wireActionAvailability is ActionAvailabilityOut: whether one action can be asked of the VM right now.
@@ -208,6 +217,13 @@ func (v wireVmOut) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
+// withHostKeysDefaults fills VmOut's host-key fields the way the platform answers for an instance whose keys it
+// never pinned: state unknown, no keys (the fake reads no console).
+func withHostKeysDefaults(v *wireVmOut) {
+	v.HostKeysState = "unknown"
+	v.HostKeys = []wireHostKeyOut{}
+}
+
 type wireOperationRef struct {
 	ID           string     `json:"id"`
 	Type         string     `json:"type"`
@@ -233,12 +249,13 @@ type wirePublicIpOut struct {
 }
 
 type wireImageOut struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	OSDistro  *string `json:"os_distro"`
-	OSVersion *string `json:"os_version"`
-	MinDiskGB int     `json:"min_disk_gb"`
-	MinRAMMB  int     `json:"min_ram_mb"`
+	ID         string  `json:"id"`
+	Name       string  `json:"name"`
+	OSDistro   *string `json:"os_distro"`
+	OSVersion  *string `json:"os_version"`
+	MinDiskGB  int     `json:"min_disk_gb"`
+	MinRAMMB   int     `json:"min_ram_mb"`
+	DiskFormat *string `json:"disk_format"`
 }
 
 // wireSshKeyOut is SshKeyOut (TF7 plan §4): the key as the keystore holds it,
@@ -724,7 +741,7 @@ func (f *fakeAPI) SeedForeignInstance(hostname string) {
 	id := fakeUUID(1, f.vmSeq)
 	h := hostname
 	now := time.Now().UTC()
-	f.vms[id] = &fakeVm{wireVmOut: wireVmOut{
+	vm := &fakeVm{wireVmOut: wireVmOut{
 		ID:               id,
 		OrgID:            testOtherOrg,
 		RegionID:         "gro",
@@ -746,6 +763,8 @@ func (f *fakeAPI) SeedForeignInstance(hostname string) {
 		CreatedAt:        now,
 		UpdatedAt:        now,
 	}}
+	withHostKeysDefaults(&vm.wireVmOut)
+	f.vms[id] = vm
 }
 
 // mutating filters calls down to those that can change something: anything
@@ -1721,6 +1740,7 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		},
 		inFlight: true,
 	}
+	withHostKeysDefaults(&vm.wireVmOut)
 	f.vms[id] = vm
 	if req.HasUserData {
 		f.userDataSent[id] = req.UserData
@@ -2790,9 +2810,10 @@ func (f *fakeAPI) listImages(rc *reqCtx) {
 
 	debianDistro, debianVersion := "debian", "12"
 	ubuntuDistro, ubuntuVersion := "ubuntu", "22.04"
+	qcow2 := "qcow2"
 	rc.json(http.StatusOK, wireList[wireImageOut]{Items: []wireImageOut{
-		{ID: "image-debian-12", Name: "Debian 12", OSDistro: &debianDistro, OSVersion: &debianVersion, MinDiskGB: 10, MinRAMMB: 512},
-		{ID: "image-ubuntu-2204", Name: "Ubuntu 22.04", OSDistro: &ubuntuDistro, OSVersion: &ubuntuVersion, MinDiskGB: 10, MinRAMMB: 512},
+		{ID: "image-debian-12", Name: "Debian 12", OSDistro: &debianDistro, OSVersion: &debianVersion, MinDiskGB: 10, MinRAMMB: 512, DiskFormat: &qcow2},
+		{ID: "image-ubuntu-2204", Name: "Ubuntu 22.04", OSDistro: &ubuntuDistro, OSVersion: &ubuntuVersion, MinDiskGB: 10, MinRAMMB: 512, DiskFormat: &qcow2},
 	}})
 }
 
@@ -2879,14 +2900,15 @@ var (
 		"memory_mb", "disk_gb", "storage_pool_id", "workload_type", "network_profile_id", "state",
 		"status", "desired_state", "private_ip", "addresses", "generation", "error_class",
 		"error_detail", "observed_status", "observed_addresses", "observed_at", "ssh_key_names",
-		"user_data_present", "protected", "allowed_actions", "available_actions", "created_at", "updated_at",
+		"user_data_present", "host_keys_state", "host_keys", "protected", "allowed_actions",
+		"available_actions", "created_at", "updated_at",
 	}
 	specOperationRefKeys = []string{
 		"id", "type", "state", "resource_type", "resource_id", "attempt", "max_attempts",
 		"created_at", "error_class", "error_detail", "finished_at",
 	}
 	specPublicIpOutKeys = []string{"id", "region_id", "address", "vm_id", "state", "error", "created_at"}
-	specImageOutKeys    = []string{"id", "name", "os_distro", "os_version", "min_disk_gb", "min_ram_mb"}
+	specImageOutKeys    = []string{"id", "name", "os_distro", "os_version", "min_disk_gb", "min_ram_mb", "disk_format"}
 	specProblemKeys     = []string{"type", "title", "status", "detail", "instance", "code", "request_id"}
 	specListKeys        = []string{"items", "next_cursor"}
 )

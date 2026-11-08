@@ -3,6 +3,6 @@
 # docs/plans/terraform-provider-virtscale.md).
 project: virtscale/virtscale-platform/apps/s3-control-plane
 path: docs/openapi/generated/customer-v1.json
-commit: 87607618
-sha256: 4278131f3f5bf39ac719e84775abbf5d0bb48a2ddf3f84de0b0394d98d09ddfd
+commit: d0f66b37
+sha256: 13813f7435e95e5350b0dc310f0ded25931e82202fb90591d9e50604e091eaee
 update: git -C <s3-control-plane clone> show <commit>:docs/openapi/generated/customer-v1.json > internal/contract/customer-v1.json && sha256sum internal/contract/customer-v1.json, then edit commit and sha256 here
