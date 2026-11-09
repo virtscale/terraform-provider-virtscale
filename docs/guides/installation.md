@@ -26,7 +26,7 @@ terraform {
   required_providers {
     virtscale = {
       source  = "registry.terraform.io/virtscale/virtscale"
-      version = "~> 0.2"
+      version = "~> 0.3"
     }
   }
 }
