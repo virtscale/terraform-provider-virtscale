@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
@@ -257,8 +259,132 @@ type instanceResourceModel struct {
 
 	// HostID and RootBlockDevice are for internal organizations (host placement and a host-local volume); an instance
 	// that uses neither has a null host_id and an empty root_block_device.
-	HostID          types.String `tfsdk:"host_id"`
-	RootBlockDevice types.List   `tfsdk:"root_block_device"`
+	HostID           types.String `tfsdk:"host_id"`
+	RootBlockDevice  types.List   `tfsdk:"root_block_device"`
+	NetworkInterface types.List   `tfsdk:"network_interface"`
+}
+
+// networkInterfaceModel is one network_interface block: what the create asked for on interface i of the network profile.
+// Entries are the API's, so they are optional only: what a block leaves out the platform chooses, and is read back as null.
+type networkInterfaceModel struct {
+	PrivateIP           types.String `tfsdk:"private_ip"`
+	MACAddress          types.String `tfsdk:"mac_address"`
+	SecondaryPrivateIPs types.Set    `tfsdk:"secondary_private_ips"`
+	SourceDestCheck     types.Bool   `tfsdk:"source_dest_check"`
+}
+
+var networkInterfaceAttrTypes = map[string]attr.Type{
+	"private_ip":            types.StringType,
+	"mac_address":           types.StringType,
+	"secondary_private_ips": types.SetType{ElemType: types.StringType},
+	"source_dest_check":     types.BoolType,
+}
+
+var networkInterfaceObjectType = types.ObjectType{AttrTypes: networkInterfaceAttrTypes}
+
+// networkInterfacesOf is the blocks of list, in order; none for a list that is null or unknown.
+func networkInterfacesOf(ctx context.Context, list types.List) ([]networkInterfaceModel, diag.Diagnostics) {
+	if list.IsNull() || list.IsUnknown() {
+		return nil, nil
+	}
+	var blocks []networkInterfaceModel
+	diags := list.ElementsAs(ctx, &blocks, false)
+	return blocks, diags
+}
+
+// macAddressRegexp is a MAC address as the provider keeps it, six pairs split by colons: the API also takes hyphens but
+// stores colons, which would come back different from the configuration.
+var macAddressRegexp = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
+
+// networkInterfacesReplace replaces the instance when the blocks differ from the ones the state holds: the API sets the
+// interfaces at create and never changes them. Blocks taken out of the configuration keep the instance, as for any
+// optional value (the state forgets them), and blocks added to an instance that has none replace it. Values are compared
+// as the API reads them back: a MAC without regard to case, the secondary addresses as a set, source_dest_check true
+// when the block leaves it out.
+type networkInterfacesReplace struct{}
+
+func (networkInterfacesReplace) Description(context.Context) string {
+	return "Replaces the instance when the network interfaces differ from the instance's."
+}
+
+func (m networkInterfacesReplace) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (networkInterfacesReplace) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	configured, diags := networkInterfacesOf(ctx, req.ConfigValue)
+	resp.Diagnostics.Append(diags...)
+	held, diags := networkInterfacesOf(ctx, req.StateValue)
+	resp.Diagnostics.Append(diags...)
+	if len(configured) == 0 {
+		return
+	}
+	resp.RequiresReplace = len(configured) != len(held)
+	for i := 0; i < len(configured) && i < len(held) && !resp.RequiresReplace; i++ {
+		resp.RequiresReplace = networkInterfaceDiffers(configured[i], held[i])
+	}
+}
+
+// networkInterfaceDiffers compares a configured block with the one in state; a value that is not known yet differs.
+func networkInterfaceDiffers(c, h networkInterfaceModel) bool {
+	if c.PrivateIP.IsUnknown() || c.MACAddress.IsUnknown() || c.SecondaryPrivateIPs.IsUnknown() || c.SourceDestCheck.IsUnknown() {
+		return true
+	}
+	secondary := len(c.SecondaryPrivateIPs.Elements()) != 0 || len(h.SecondaryPrivateIPs.Elements()) != 0
+	return !c.PrivateIP.Equal(h.PrivateIP) ||
+		c.MACAddress.IsNull() != h.MACAddress.IsNull() || !strings.EqualFold(c.MACAddress.ValueString(), h.MACAddress.ValueString()) ||
+		(secondary && !c.SecondaryPrivateIPs.Equal(h.SecondaryPrivateIPs)) ||
+		(c.SourceDestCheck.IsNull() || c.SourceDestCheck.ValueBool()) != h.SourceDestCheck.ValueBool()
+}
+
+// networkInterfacesFromAPI is network_interface as the model should hold it, given the blocks it has now and the
+// interfaces the API reports (what the create asked for). Like root_block_device it is filled in only when the model has
+// blocks, so an instance that does not use them -- and an import -- has none to differ. A MAC the model holds in another
+// case keeps its spelling, and a secondary list the API reports empty stays null (or empty) as the model has it.
+func networkInterfacesFromAPI(current types.List, api []client.NetworkInterface) types.List {
+	if current.IsNull() || current.IsUnknown() || len(current.Elements()) == 0 {
+		return types.ListValueMust(networkInterfaceObjectType, []attr.Value{})
+	}
+	held := current.Elements()
+	blocks := make([]attr.Value, len(api))
+	for i, nic := range api {
+		var heldAttrs map[string]attr.Value
+		if i < len(held) {
+			if obj, ok := held[i].(types.Object); ok {
+				heldAttrs = obj.Attributes()
+			}
+		}
+		privateIP, mac := types.StringNull(), types.StringNull()
+		if nic.PrivateIP != "" {
+			privateIP = types.StringValue(nic.PrivateIP)
+		}
+		if nic.MACAddress != "" {
+			mac = types.StringValue(nic.MACAddress)
+			if heldMAC, ok := heldAttrs["mac_address"].(types.String); ok && strings.EqualFold(heldMAC.ValueString(), nic.MACAddress) {
+				mac = heldMAC
+			}
+		}
+		secondary := types.SetNull(types.StringType)
+		if len(nic.SecondaryPrivateIPs) > 0 {
+			values := make([]attr.Value, len(nic.SecondaryPrivateIPs))
+			for j, address := range nic.SecondaryPrivateIPs {
+				values[j] = types.StringValue(address)
+			}
+			secondary = types.SetValueMust(types.StringType, values)
+		} else if heldSet, ok := heldAttrs["secondary_private_ips"].(types.Set); ok && !heldSet.IsNull() && !heldSet.IsUnknown() {
+			secondary = heldSet
+		}
+		blocks[i] = types.ObjectValueMust(networkInterfaceAttrTypes, map[string]attr.Value{
+			"private_ip":            privateIP,
+			"mac_address":           mac,
+			"secondary_private_ips": secondary,
+			"source_dest_check":     types.BoolValue(nic.SourceDestCheck),
+		})
+	}
+	return types.ListValueMust(networkInterfaceObjectType, blocks)
 }
 
 // rootBlockDeviceModel is one root_block_device block: another spelling of storage_pool and disk_gb, like AWS's
@@ -668,6 +794,53 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					},
 				},
 			},
+			"network_interface": schema.ListNestedBlock{
+				Description: "The instance's network interfaces, for organizations of kind internal only (any other is " +
+					"refused with 422 network_interface_not_allowed): like AWS's private_ip, secondary_private_ips and " +
+					"source_dest_check, and a fixed MAC. Block i describes interface i of the network profile, in order, " +
+					"and there can be no more blocks than the profile has interfaces (422 invalid_spec, which also names a " +
+					"bad address or MAC, one used twice and more than 8 secondary addresses). An address or MAC already in " +
+					"use on the network fails the create. They are set at create and read back as asked (what a block " +
+					"leaves out is the platform's choice and stays null): a different block replaces the instance, and " +
+					"so do blocks added to an instance that has none; taking them out keeps the instance. State has the " +
+					"blocks only when the configuration did, so an imported instance has none.",
+				PlanModifiers: []planmodifier.List{networkInterfacesReplace{}},
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"private_ip": schema.StringAttribute{
+							Optional:    true,
+							Description: "The IPv4 address the interface gets, instead of one the platform picks. It must belong to the network the interface is on.",
+							Validators:  []validator.String{stringvalidator.LengthAtLeast(1)},
+						},
+						"mac_address": schema.StringAttribute{
+							Optional: true,
+							Description: "The MAC address the interface gets: a unicast address, six pairs of hex digits split by " +
+								"colons (aa:bb:cc:dd:ee:ff). The API stores it in lower case and state keeps the spelling of the " +
+								"configuration, so a configuration in upper case plans no difference; a change of case alone is " +
+								"an update in place that changes nothing, never a replacement.",
+							Validators: []validator.String{
+								stringvalidator.RegexMatches(macAddressRegexp, "six pairs of hex digits split by colons, aa:bb:cc:dd:ee:ff"),
+							},
+						},
+						"secondary_private_ips": schema.SetAttribute{
+							ElementType: types.StringType,
+							Optional:    true,
+							Description: "Up to 8 more IPv4 addresses the interface may use besides private_ip, for example the " +
+								"shared address of a VRRP or keepalived pair (allowed address pairs). None twice, none equal to " +
+								"private_ip. Needs source_dest_check true. A set: the order means nothing.",
+							Validators: []validator.Set{setvalidator.SizeAtMost(8)},
+						},
+						"source_dest_check": schema.BoolAttribute{
+							Optional: true,
+							Computed: true,
+							Default:  booldefault.StaticBool(true),
+							Description: "True (the default): the interface only sends and receives traffic for its own addresses, " +
+								"and the organization's firewall applies to it. False: it is not filtered and carries no firewall, " +
+								"as a router or a VRRP pair needs; it takes no secondary_private_ips.",
+						},
+					},
+				},
+			},
 		},
 	}
 }
@@ -681,6 +854,19 @@ func (r *InstanceResource) ValidateConfig(ctx context.Context, req resource.Vali
 	resp.Diagnostics.Append(req.Config.Get(ctx, &c)...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+
+	// An interface that is not filtered takes no secondary address (the API: allowed address pairs exist only on a
+	// filtered port); said here with the field, before anything is sent.
+	nics, diags := networkInterfacesOf(ctx, c.NetworkInterface)
+	resp.Diagnostics.Append(diags...)
+	for i, nic := range nics {
+		if !nic.SourceDestCheck.IsNull() && !nic.SourceDestCheck.IsUnknown() && !nic.SourceDestCheck.ValueBool() &&
+			!nic.SecondaryPrivateIPs.IsNull() && !nic.SecondaryPrivateIPs.IsUnknown() && len(nic.SecondaryPrivateIPs.Elements()) > 0 {
+			resp.Diagnostics.AddAttributeError(path.Root("network_interface").AtListIndex(i).AtName("secondary_private_ips"),
+				"Secondary addresses on an interface that is not filtered",
+				"secondary_private_ips needs source_dest_check = true: an interface that is not filtered takes no secondary addresses")
+		}
 	}
 
 	// The block is another spelling of storage_pool and disk_gb: the two are the same fields, so it does not go with them.
@@ -801,6 +987,27 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		pool, diskGB = block.VolumeType.ValueString(), int(block.VolumeSize.ValueInt64())
 	}
 
+	// One entry per network_interface block, in order; the API stores a MAC in lower case.
+	nicModels, diags := networkInterfacesOf(ctx, plan.NetworkInterface)
+	resp.Diagnostics.Append(diags...)
+	var nics []client.NetworkInterface
+	for _, n := range nicModels {
+		var secondary []string
+		if !n.SecondaryPrivateIPs.IsNull() && !n.SecondaryPrivateIPs.IsUnknown() {
+			resp.Diagnostics.Append(n.SecondaryPrivateIPs.ElementsAs(ctx, &secondary, false)...)
+			slices.Sort(secondary)
+		}
+		nics = append(nics, client.NetworkInterface{
+			PrivateIP:           n.PrivateIP.ValueString(),
+			MACAddress:          strings.ToLower(n.MACAddress.ValueString()),
+			SecondaryPrivateIPs: secondary,
+			SourceDestCheck:     n.SourceDestCheck.ValueBool(),
+		})
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// The optional attributes the configuration left out are unknown in the plan, and read as "" or 0 here: the client
 	// leaves those out of the body, and the API chooses them.
 	vm, _, err := r.client.CreateVm(ctx, client.VmCreateRequest{
@@ -818,6 +1025,8 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		UserData:       userData,
 		WorkloadType:   plan.WorkloadType.ValueString(),
 		HostID:         plan.HostID.ValueString(),
+
+		NetworkInterfaces: nics,
 	}, idempotencyKey)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Create Instance", apiErrorDetail(err))
@@ -1239,6 +1448,8 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 		}))
 	}
 	model.RootBlockDevice = types.ListValueMust(rootBlockDeviceObjectType, blocks)
+
+	model.NetworkInterface = networkInterfacesFromAPI(model.NetworkInterface, vm.NetworkInterfaces)
 }
 
 func ptrOrEmpty(s *string) string {

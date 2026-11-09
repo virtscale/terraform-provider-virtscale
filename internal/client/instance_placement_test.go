@@ -62,7 +62,7 @@ func TestVm_DecodesHostID(t *testing.T) {
 }
 
 // Each refusal keeps the API's own sentence and adds the next step; the codes are matched, whatever the status says.
-func TestAPIError_HostRefusalsSayWhatToChange(t *testing.T) {
+func TestAPIError_PlacementRefusalsSayWhatToChange(t *testing.T) {
 	for _, tc := range []struct {
 		status int
 		code   string
@@ -75,14 +75,72 @@ func TestAPIError_HostRefusalsSayWhatToChange(t *testing.T) {
 			"check host_id: the host must exist, be in the instance's region and be in service"},
 		{422, "host_required", "instances on this storage pool keep their disk on the host they run on; name that host with host_id",
 			"set host_id to the host the volume lives on"},
+		{422, "network_interface_not_allowed", "setting a private IP address, MAC address or secondary IP addresses on a network interface is not available to this organization",
+			"host_id, network_interface and internal instance types are for VirtScale's internal organizations"},
 		{409, "resize_not_available", "an instance placed on a named host is not resized in place; replace it",
-			"an instance with host_id is replaced, not resized: the provider plans a replacement when host_id is set"},
+			"an instance with host_id or of an internal instance type is replaced, not resized: the provider plans a replacement when host_id is set, and tofu apply -replace replaces any other"},
 	} {
 		c := failWith(t, tc.status, tc.code, tc.detail)
 		_, err := c.GetVm(context.Background(), "vm-1")
 		want := "virtscale API " + strconv.Itoa(tc.status) + " " + tc.code + ": " + tc.detail + " (request req-7); " + tc.hint
 		if err == nil || err.Error() != want {
 			t.Errorf("%s: Error() = %v\nwant %q", tc.code, err, want)
+		}
+	}
+}
+
+// network_interfaces is in the body only when the caller gave entries; entry i is interface i, an empty value is left
+// out (the platform's choice) and source_dest_check is always said.
+func TestCreateVm_SendsNetworkInterfacesOnlyWhenSet(t *testing.T) {
+	var body string
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(testVmAcceptedJSON))
+	})
+
+	req := VmCreateRequest{Name: "dns-01", NetworkInterfaces: []NetworkInterface{
+		{PrivateIP: "10.20.30.40", MACAddress: "fa:16:3e:aa:bb:cc", SecondaryPrivateIPs: []string{"10.20.30.41"}, SourceDestCheck: true},
+		{SourceDestCheck: false},
+	}}
+	if _, _, err := c.CreateVm(context.Background(), req, ""); err != nil {
+		t.Fatalf("CreateVm() error = %v", err)
+	}
+	want := `"network_interfaces":[{"private_ip":"10.20.30.40","mac_address":"fa:16:3e:aa:bb:cc","secondary_private_ips":["10.20.30.41"],"source_dest_check":true},{"source_dest_check":false}]`
+	if !strings.Contains(body, want) {
+		t.Errorf("body = %s, want it to hold %s", body, want)
+	}
+
+	if _, _, err := c.CreateVm(context.Background(), VmCreateRequest{Name: "web-01"}, ""); err != nil {
+		t.Fatalf("CreateVm() without interfaces: error = %v", err)
+	}
+	if strings.Contains(body, "network_interfaces") {
+		t.Errorf("body = %s, want no network_interfaces key when there are none", body)
+	}
+}
+
+// VmOut.network_interfaces is what the create asked for, one entry per interface, or null.
+func TestVm_DecodesNetworkInterfaces(t *testing.T) {
+	c, _, _ := newScriptedClient(t,
+		jsonStep(http.StatusOK, `{"id":"vm-1","addresses":[],"network_interfaces":[{"private_ip":"10.20.30.40","mac_address":null,"secondary_private_ips":["10.20.30.41","10.20.30.42"],"source_dest_check":false}]}`),
+		jsonStep(http.StatusOK, `{"id":"vm-2","addresses":[],"network_interfaces":null}`),
+		jsonStep(http.StatusOK, `{"id":"vm-3","addresses":[]}`),
+	)
+
+	vm, err := c.GetVm(context.Background(), "vm-1")
+	if err != nil || len(vm.NetworkInterfaces) != 1 {
+		t.Fatalf("GetVm() = %+v, %v, want one interface", vm, err)
+	}
+	got := vm.NetworkInterfaces[0]
+	if got.PrivateIP != "10.20.30.40" || got.MACAddress != "" || strings.Join(got.SecondaryPrivateIPs, ",") != "10.20.30.41,10.20.30.42" || got.SourceDestCheck {
+		t.Errorf("interface = %+v, want 10.20.30.40, no MAC, two secondary addresses, source_dest_check false", got)
+	}
+	for _, id := range []string{"vm-2", "vm-3"} {
+		vm, err := c.GetVm(context.Background(), id)
+		if err != nil || len(vm.NetworkInterfaces) != 0 {
+			t.Errorf("GetVm(%s) = %+v, %v, want no interfaces for null and for absent", id, vm, err)
 		}
 	}
 }

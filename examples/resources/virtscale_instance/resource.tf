@@ -31,25 +31,36 @@ resource "virtscale_instance" "web" {
   disable_api_termination = true
 }
 
-# Internal organizations only (VirtScale's own): any other organization is refused with 422 host_placement_not_allowed.
+# Internal organizations only (VirtScale's own): any other organization is refused with 422 host_placement_not_allowed
+# (host_id) or network_interface_not_allowed (network_interface).
 # The instance is placed on a named host (host_id, not case sensitive) and boots from a root volume on that host's local
 # storage: root_block_device is another spelling of storage_pool and disk_gb (volume_type is the storage pool,
-# volume_size the disk in GB), and a host-local pool such as ams1-local needs host_id. An instance with a host_id is never
-# resized in place: a different vcpus or memory_mb replaces it.
+# volume_size the disk in GB), and a host-local pool such as ams1-local needs host_id. network_interface block i sets
+# interface i of the network profile: a fixed private_ip and mac_address, and secondary_private_ips (the shared address
+# of a VRRP or keepalived pair; they need source_dest_check = true, the default). They are set at create: a different
+# block replaces the instance. An instance with a host_id is never resized in place either: a different vcpus or
+# memory_mb replaces it.
 data "virtscale_images" "debian_ams" {
   region = "ams"
 }
 
 resource "virtscale_instance" "dns" {
-  name      = "dns-01"
-  region    = "ams"
-  image     = [for i in data.virtscale_images.debian_ams.images : i.id if startswith(i.name, "Debian 12")][0]
-  vcpus     = 2
-  memory_mb = 2048
-  host_id   = "IKVM-AMS1-01"
+  name            = "dns-01"
+  region          = "ams"
+  image           = [for i in data.virtscale_images.debian_ams.images : i.id if startswith(i.name, "Debian 12")][0]
+  vcpus           = 2
+  memory_mb       = 2048
+  host_id         = "IKVM-AMS1-01"
+  network_profile = "ams-ssd-infra" # AMS1's k8s-geneve network, for internal organizations
 
   root_block_device {
     volume_type = "ams1-local"
     volume_size = 40
+  }
+
+  network_interface {
+    private_ip            = "10.20.30.40" # an address of that network's subnet
+    mac_address           = "fa:16:3e:aa:bb:cc"
+    secondary_private_ips = ["10.20.30.41"]
   }
 }

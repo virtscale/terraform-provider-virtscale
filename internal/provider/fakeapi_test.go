@@ -12,6 +12,7 @@ import (
 	"math/bits"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -151,43 +152,52 @@ type wireHostKeyOut struct {
 }
 
 type wireVmOut struct {
-	ID                string           `json:"id"`
-	OrgID             string           `json:"org_id"`
-	RegionID          string           `json:"region_id"`
-	Name              string           `json:"name"`
-	FQDN              *string          `json:"fqdn"`
-	Hostname          *string          `json:"hostname"`
-	HostID            *string          `json:"host_id"`
-	InstanceType      *string          `json:"instance_type"`
-	Image             wireImageRef     `json:"image"`
-	VCPUs             int              `json:"vcpus"`
-	MemoryMB          int              `json:"memory_mb"`
-	DiskGB            int              `json:"disk_gb"`
-	StoragePoolID     string           `json:"storage_pool_id"`
-	WorkloadType      string           `json:"workload_type"`
-	NetworkProfileID  string           `json:"network_profile_id"`
-	State             string           `json:"state"`
-	Status            string           `json:"status"`
-	DesiredState      string           `json:"desired_state"`
-	PrivateIP         *string          `json:"private_ip"`
-	Addresses         []string         `json:"addresses"`
-	Generation        int64            `json:"generation"`
-	ErrorClass        *string          `json:"error_class"`
-	ErrorDetail       *string          `json:"error_detail"`
-	ObservedStatus    *string          `json:"observed_status"`
-	ObservedAddresses map[string]any   `json:"observed_addresses"`
-	ObservedAt        *time.Time       `json:"observed_at"`
-	SSHKeyNames       []string         `json:"ssh_key_names"`
-	UserDataPresent   bool             `json:"user_data_present"`
-	HostKeysState     string           `json:"host_keys_state"`
-	HostKeys          []wireHostKeyOut `json:"host_keys"`
-	Protected         bool             `json:"protected"`
-	AllowedActions    []string         `json:"allowed_actions"`
-	CreatedAt         time.Time        `json:"created_at"`
-	UpdatedAt         time.Time        `json:"updated_at"`
+	ID                string                    `json:"id"`
+	OrgID             string                    `json:"org_id"`
+	RegionID          string                    `json:"region_id"`
+	Name              string                    `json:"name"`
+	FQDN              *string                   `json:"fqdn"`
+	Hostname          *string                   `json:"hostname"`
+	HostID            *string                   `json:"host_id"`
+	NetworkInterfaces []wireNetworkInterfaceOut `json:"network_interfaces"`
+	InstanceType      *string                   `json:"instance_type"`
+	Image             wireImageRef              `json:"image"`
+	VCPUs             int                       `json:"vcpus"`
+	MemoryMB          int                       `json:"memory_mb"`
+	DiskGB            int                       `json:"disk_gb"`
+	StoragePoolID     string                    `json:"storage_pool_id"`
+	WorkloadType      string                    `json:"workload_type"`
+	NetworkProfileID  string                    `json:"network_profile_id"`
+	State             string                    `json:"state"`
+	Status            string                    `json:"status"`
+	DesiredState      string                    `json:"desired_state"`
+	PrivateIP         *string                   `json:"private_ip"`
+	Addresses         []string                  `json:"addresses"`
+	Generation        int64                     `json:"generation"`
+	ErrorClass        *string                   `json:"error_class"`
+	ErrorDetail       *string                   `json:"error_detail"`
+	ObservedStatus    *string                   `json:"observed_status"`
+	ObservedAddresses map[string]any            `json:"observed_addresses"`
+	ObservedAt        *time.Time                `json:"observed_at"`
+	SSHKeyNames       []string                  `json:"ssh_key_names"`
+	UserDataPresent   bool                      `json:"user_data_present"`
+	HostKeysState     string                    `json:"host_keys_state"`
+	HostKeys          []wireHostKeyOut          `json:"host_keys"`
+	Protected         bool                      `json:"protected"`
+	AllowedActions    []string                  `json:"allowed_actions"`
+	CreatedAt         time.Time                 `json:"created_at"`
+	UpdatedAt         time.Time                 `json:"updated_at"`
 }
 
 // wireActionAvailability is ActionAvailabilityOut: whether one action can be asked of the VM right now.
+// wireNetworkInterfaceOut is NetworkInterfaceOut: one interface's settings as the create asked for them.
+type wireNetworkInterfaceOut struct {
+	PrivateIP           *string  `json:"private_ip"`
+	MACAddress          *string  `json:"mac_address"`
+	SecondaryPrivateIPs []string `json:"secondary_private_ips"`
+	SourceDestCheck     bool     `json:"source_dest_check"`
+}
+
 type wireActionAvailability struct {
 	Action    string  `json:"action"`
 	Available bool    `json:"available"`
@@ -1498,6 +1508,59 @@ type vmCreateIn struct {
 	SSHKeys                                                        []string
 	UserData                                                       string
 	HasUserData                                                    bool
+	NICs                                                           []fakeNICIn
+}
+
+// fakeNICIn is one entry of a create's network_interfaces (NetworkInterfaceIn); "" is no address and no MAC asked for.
+type fakeNICIn struct {
+	PrivateIP, MAC  string
+	Secondary       []string
+	SourceDestCheck bool
+}
+
+// nics reads network_interfaces: a list of objects that say private_ip, mac_address, secondary_private_ips and
+// source_dest_check (true when left out), and nothing else.
+func (b *bodyCheck) nics(name string) []fakeNICIn {
+	raw, ok := b.present(name, false)
+	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		b.fail(name, "Input should be a valid list")
+		return nil
+	}
+	var out []fakeNICIn
+	for i, entry := range entries {
+		nic := fakeNICIn{SourceDestCheck: true}
+		for key, value := range entry {
+			field := fmt.Sprintf("%s.%d.%s", name, i, key)
+			isNull := bytes.Equal(bytes.TrimSpace(value), []byte("null"))
+			var err error
+			switch key {
+			case "private_ip":
+				if !isNull {
+					err = json.Unmarshal(value, &nic.PrivateIP)
+				}
+			case "mac_address":
+				if !isNull {
+					err = json.Unmarshal(value, &nic.MAC)
+				}
+			case "secondary_private_ips":
+				err = json.Unmarshal(value, &nic.Secondary)
+			case "source_dest_check":
+				err = json.Unmarshal(value, &nic.SourceDestCheck)
+			default:
+				b.fail(field, "Extra inputs are not permitted")
+			}
+			if err != nil {
+				b.fail(field, "Input should be a valid "+map[string]string{"private_ip": "string", "mac_address": "string",
+					"secondary_private_ips": "list", "source_dest_check": "boolean"}[key])
+			}
+		}
+		out = append(out, nic)
+	}
+	return out
 }
 
 func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
@@ -1516,6 +1579,7 @@ func decodeVmCreate(r io.Reader) (vmCreateIn, []wireFieldError) {
 		InstanceType:   strOrEmpty(b.nullableStr("instance_type")),
 		HostID:         strOrEmpty(b.nullableStr("host_id")),
 		SSHKeys:        b.strList("ssh_keys"),
+		NICs:           b.nics("network_interfaces"),
 	}
 	if ud := b.nullableStr("user_data"); ud != nil {
 		in.UserData, in.HasUserData = *ud, true
@@ -1661,6 +1725,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		rc.unprocessable("host_placement_not_allowed", detailHostPlacementNotAllowed)
 		return
 	}
+	if len(req.NICs) > 0 && !f.internalOrg {
+		rc.unprocessable("network_interface_not_allowed", detailNetworkInterfaceNotAllowed)
+		return
+	}
 
 	name, ok := canonicalVmName(req.Name)
 	if !ok {
@@ -1684,6 +1752,10 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 		return
 	}
 	host, ok := resolveHost(rc, req, sizes.pool)
+	if !ok {
+		return
+	}
+	nics, ok := resolveNICs(rc, req, sizes.profile)
 	if !ok {
 		return
 	}
@@ -1731,30 +1803,31 @@ func (f *fakeAPI) createVm(rc *reqCtx) {
 
 	vm := &fakeVm{
 		wireVmOut: wireVmOut{
-			ID:               id,
-			OrgID:            f.org,
-			RegionID:         req.Region,
-			Name:             name,
-			Hostname:         hostname,
-			HostID:           host,
-			InstanceType:     instanceType,
-			Image:            wireImageRef{ImageID: imageID, Name: req.Image},
-			VCPUs:            sizes.vcpus,
-			MemoryMB:         sizes.memoryMB,
-			DiskGB:           sizes.diskGB,
-			StoragePoolID:    sizes.pool,
-			WorkloadType:     req.WorkloadType,
-			NetworkProfileID: sizes.profile,
-			UserDataPresent:  req.HasUserData,
-			State:            "pending",
-			Status:           "pending",
-			DesiredState:     "running",
-			Addresses:        []string{},
-			Generation:       1,
-			SSHKeyNames:      req.SSHKeys,
-			AllowedActions:   allVmActions,
-			CreatedAt:        now,
-			UpdatedAt:        now,
+			ID:                id,
+			OrgID:             f.org,
+			RegionID:          req.Region,
+			Name:              name,
+			Hostname:          hostname,
+			HostID:            host,
+			NetworkInterfaces: nics,
+			InstanceType:      instanceType,
+			Image:             wireImageRef{ImageID: imageID, Name: req.Image},
+			VCPUs:             sizes.vcpus,
+			MemoryMB:          sizes.memoryMB,
+			DiskGB:            sizes.diskGB,
+			StoragePoolID:     sizes.pool,
+			WorkloadType:      req.WorkloadType,
+			NetworkProfileID:  sizes.profile,
+			UserDataPresent:   req.HasUserData,
+			State:             "pending",
+			Status:            "pending",
+			DesiredState:      "running",
+			Addresses:         []string{},
+			Generation:        1,
+			SSHKeyNames:       req.SSHKeys,
+			AllowedActions:    allVmActions,
+			CreatedAt:         now,
+			UpdatedAt:         now,
 		},
 		inFlight: true,
 	}
@@ -1820,6 +1893,129 @@ func resolveHost(rc *reqCtx, req vmCreateIn, pool string) (*string, bool) {
 	}
 	rc.unprocessable("host_unavailable", detailHostUnavailable)
 	return nil, false
+}
+
+const detailNetworkInterfaceNotAllowed = "setting a private IP address, MAC address or secondary IP addresses on a network interface " +
+	"is not available to this organization"
+
+// fakeProfileNICs is, per network profile, the network interfaces it has and whether each filters (port security). The
+// profile of AMS1's k8s-geneve network has one that filters; any profile the fake does not list is a copy of it.
+// ams-dual is for the tests that need an interface that cannot take a secondary address.
+var fakeProfileNICs = map[string][]bool{"ams-ssd-infra": {true}, "ams-dual": {true, false}}
+
+// resolveNICs is network_interfaces.normalise of the API: what entries may say, judged once the profile is known, with
+// every problem reported at once as 422 invalid_spec. It returns what is stored (MAC in lower case with colons), nil
+// when the create asked for nothing.
+func resolveNICs(rc *reqCtx, req vmCreateIn, profile string) ([]wireNetworkInterfaceOut, bool) {
+	if len(req.NICs) == 0 {
+		return nil, true
+	}
+	ports, listed := fakeProfileNICs[profile]
+	if !listed {
+		ports = []bool{true}
+	}
+	var problems, repeated []string
+	if len(req.NICs) > len(ports) {
+		problems = append(problems, fmt.Sprintf("network_interfaces has %d entries and this network profile has %d network interface%s; send at most one entry per network interface",
+			len(req.NICs), len(ports), map[bool]string{true: "", false: "s"}[len(ports) == 1]))
+	}
+	addresses := map[string]int{}
+	macs := map[string]bool{}
+	var out []wireNetworkInterfaceOut
+	for i, nic := range req.NICs {
+		where := fmt.Sprintf("network_interfaces[%d]", i)
+		entry := wireNetworkInterfaceOut{SecondaryPrivateIPs: []string{}, SourceDestCheck: nic.SourceDestCheck}
+		private := fakeNICAddress(nic.PrivateIP, where+".private_ip", &problems)
+		if private != "" {
+			entry.PrivateIP = &private
+		}
+		if nic.MAC != "" {
+			if mac, ok := fakeNICMAC(nic.MAC); ok {
+				entry.MACAddress = &mac
+				if macs[mac] {
+					repeated = append(repeated, fmt.Sprintf("the MAC address %s is used more than once in network_interfaces", mac))
+				}
+				macs[mac] = true
+			} else {
+				problems = append(problems, where+".mac_address is not a unicast MAC address (aa:bb:cc:dd:ee:ff)")
+			}
+		}
+		if len(nic.Secondary) > 8 {
+			problems = append(problems, fmt.Sprintf("%s.secondary_private_ips has %d addresses; at most 8 are allowed", where, len(nic.Secondary)))
+		}
+		for j, raw := range nic.Secondary {
+			if j >= 8 {
+				break
+			}
+			address := fakeNICAddress(raw, fmt.Sprintf("%s.secondary_private_ips[%d]", where, j), &problems)
+			switch {
+			case address == "":
+				continue
+			case address == private:
+				problems = append(problems, where+".secondary_private_ips repeats the private_ip")
+			case containsString(entry.SecondaryPrivateIPs, address):
+				problems = append(problems, fmt.Sprintf("%s.secondary_private_ips lists %s more than once", where, address))
+			}
+			entry.SecondaryPrivateIPs = append(entry.SecondaryPrivateIPs, address)
+		}
+		if len(entry.SecondaryPrivateIPs) > 0 && i < len(ports) && !(nic.SourceDestCheck && ports[i]) {
+			problems = append(problems, where+".secondary_private_ips needs a filtered network interface (source_dest_check true, on a network that filters)")
+		}
+		for _, address := range append([]string{private}, entry.SecondaryPrivateIPs...) {
+			if address == "" {
+				continue
+			}
+			if at, seen := addresses[address]; seen && at != i {
+				repeated = append(repeated, fmt.Sprintf("the address %s is used more than once in network_interfaces", address))
+			}
+			if _, seen := addresses[address]; !seen {
+				addresses[address] = i
+			}
+		}
+		out = append(out, entry)
+	}
+	problems = append(problems, repeated...)
+	if len(problems) > 0 {
+		rc.unprocessable("invalid_spec", strings.Join(problems, "; "))
+		return nil, false
+	}
+	return out, true
+}
+
+// fakeNICAddress is one IPv4 address a port can hold ("" for none, or for one that is reported in problems).
+func fakeNICAddress(value, where string, problems *[]string) string {
+	if value == "" {
+		return ""
+	}
+	a, err := netip.ParseAddr(value)
+	if err != nil || !a.Is4() || a.IsUnspecified() || a.IsLoopback() || a.IsLinkLocalUnicast() || a.IsMulticast() || a.As4()[0] >= 240 {
+		*problems = append(*problems, where+" is not an IPv4 address a network interface can have")
+		return ""
+	}
+	return a.String()
+}
+
+// fakeNICMAC is a unicast MAC address that is not all zero, with its pairs split by colons or hyphens, as lower case
+// with colons.
+func fakeNICMAC(value string) (string, bool) {
+	if len(value) != 17 || (value[2] != ':' && value[2] != '-') {
+		return "", false
+	}
+	for i := 2; i < len(value); i += 3 {
+		if value[i] != value[2] {
+			return "", false
+		}
+	}
+	hexPairs := strings.ReplaceAll(value, string(value[2]), "")
+	octets, err := hex.DecodeString(hexPairs)
+	if err != nil || len(octets) != 6 || octets[0]&1 == 1 || strings.Trim(hexPairs, "0") == "" {
+		return "", false
+	}
+	parts := make([]string, 6)
+	for i, o := range octets {
+		parts[i] = fmt.Sprintf("%02x", o)
+	}
+	return strings.Join(parts, ":"), true
 }
 
 // createChoices is what a create ends up with after the API has applied its defaults.
@@ -2961,7 +3157,7 @@ const (
 // sees is exactly this.
 var (
 	specVmOutKeys = []string{
-		"id", "org_id", "region_id", "name", "fqdn", "hostname", "host_id", "instance_type", "image", "vcpus",
+		"id", "org_id", "region_id", "name", "fqdn", "hostname", "host_id", "network_interfaces", "instance_type", "image", "vcpus",
 		"memory_mb", "disk_gb", "storage_pool_id", "workload_type", "network_profile_id", "state",
 		"status", "desired_state", "private_ip", "addresses", "generation", "error_class",
 		"error_detail", "observed_status", "observed_addresses", "observed_at", "ssh_key_names",

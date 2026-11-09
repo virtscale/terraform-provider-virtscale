@@ -51,26 +51,37 @@ resource "virtscale_instance" "web" {
   disable_api_termination = true
 }
 
-# Internal organizations only (VirtScale's own): any other organization is refused with 422 host_placement_not_allowed.
+# Internal organizations only (VirtScale's own): any other organization is refused with 422 host_placement_not_allowed
+# (host_id) or network_interface_not_allowed (network_interface).
 # The instance is placed on a named host (host_id, not case sensitive) and boots from a root volume on that host's local
 # storage: root_block_device is another spelling of storage_pool and disk_gb (volume_type is the storage pool,
-# volume_size the disk in GB), and a host-local pool such as ams1-local needs host_id. An instance with a host_id is never
-# resized in place: a different vcpus or memory_mb replaces it.
+# volume_size the disk in GB), and a host-local pool such as ams1-local needs host_id. network_interface block i sets
+# interface i of the network profile: a fixed private_ip and mac_address, and secondary_private_ips (the shared address
+# of a VRRP or keepalived pair; they need source_dest_check = true, the default). They are set at create: a different
+# block replaces the instance. An instance with a host_id is never resized in place either: a different vcpus or
+# memory_mb replaces it.
 data "virtscale_images" "debian_ams" {
   region = "ams"
 }
 
 resource "virtscale_instance" "dns" {
-  name      = "dns-01"
-  region    = "ams"
-  image     = [for i in data.virtscale_images.debian_ams.images : i.id if startswith(i.name, "Debian 12")][0]
-  vcpus     = 2
-  memory_mb = 2048
-  host_id   = "IKVM-AMS1-01"
+  name            = "dns-01"
+  region          = "ams"
+  image           = [for i in data.virtscale_images.debian_ams.images : i.id if startswith(i.name, "Debian 12")][0]
+  vcpus           = 2
+  memory_mb       = 2048
+  host_id         = "IKVM-AMS1-01"
+  network_profile = "ams-ssd-infra" # AMS1's k8s-geneve network, for internal organizations
 
   root_block_device {
     volume_type = "ams1-local"
     volume_size = 40
+  }
+
+  network_interface {
+    private_ip            = "10.20.30.40" # an address of that network's subnet
+    mac_address           = "fa:16:3e:aa:bb:cc"
+    secondary_private_ips = ["10.20.30.41"]
   }
 }
 ```
@@ -97,6 +108,7 @@ resource "virtscale_instance" "dns" {
 - `user_data` (String) Plain cloud-init text for the first boot: a #cloud-config document, a script that starts with #!, or a MIME multipart document, at most 32 KiB (checked at plan time). The provider sends it as standard base64 and the API applies it after the platform's own part (the SSH keys of ssh_keys). It is read at the first boot only, so a different value replaces the instance. The API never returns it: state keeps the configured value, an imported instance has none, and a configuration that sets it after an import plans a replacement (use ignore_changes to avoid that). Marked sensitive, because cloud-init is where bootstrap secrets go; the state holds it as text. A 503 not_ready means cloud-init is not switched on for this API yet; a payload it cannot deliver is 422 user_data_invalid. **Forces replacement.** **Sensitive.** Validation: string length must be at least 1; at most 32 KiB of cloud-init text.
 - `vcpus` (Number) Number of virtual CPUs: 1, 2, 4, 8, 16 or 32. Taken from instance_type when one is named; otherwise give vcpus, memory_mb, disk_gb and storage_pool together. Changing it resizes the instance in place: THE INSTANCE RESTARTS, and apply waits until it reports the new size. Resizing may be switched off for your organization (503 not_ready). An instance with a host_id is never resized in place: a different value replaces it.
 - `workload_type` (String) Which hardware the instance runs on: customer (the API's default) or infra, VirtScale's own pools. Only an organization of kind internal may ask for infra; any other gets 422 workload_not_allowed. Read back from the API. A different value replaces the instance; removing the line keeps the value. **Forces replacement.** Validation: value must be one of: ['customer' 'infra'].
+- `network_interface` (Block List) The instance's network interfaces, for organizations of kind internal only (any other is refused with 422 network_interface_not_allowed): like AWS's private_ip, secondary_private_ips and source_dest_check, and a fixed MAC. Block i describes interface i of the network profile, in order, and there can be no more blocks than the profile has interfaces (422 invalid_spec, which also names a bad address or MAC, one used twice and more than 8 secondary addresses). An address or MAC already in use on the network fails the create. They are set at create and read back as asked (what a block leaves out is the platform's choice and stays null): a different block replaces the instance, and so do blocks added to an instance that has none; taking them out keeps the instance. State has the blocks only when the configuration did, so an imported instance has none.
 - `root_block_device` (Block List) The root volume, like AWS's root_block_device (at most one block): another spelling of storage_pool and disk_gb, so it does not go with them, and volume_size does not go with instance_type (volume_type does, as storage_pool does). A storage pool that keeps the disk on a host (for example ams1-local) is a volume type here, and needs host_id. Any change of the block replaces the instance. It is read back (and into storage_pool and disk_gb) only when the configuration or the state has it: an imported instance has no block, so a configuration that names the same pool and size as a block adopts it with an update in place. Validation: list must contain at most 1 elements.
 
 ### Read-Only
@@ -108,6 +120,15 @@ resource "virtscale_instance" "dns" {
 - `private_ipv4` (String) The instance's private IPv4 address, as reported by the platform; empty until it is known. An associated public IP is not the private address.
 - `state` (String) The instance's current lifecycle state, as reported by the API.
 - `status` (String) The instance's status word, as the API reports it.
+
+### Nested Schema for `network_interface`
+
+#### Optional
+
+- `mac_address` (String) The MAC address the interface gets: a unicast address, six pairs of hex digits split by colons (aa:bb:cc:dd:ee:ff). The API stores it in lower case and state keeps the spelling of the configuration, so a configuration in upper case plans no difference; a change of case alone is an update in place that changes nothing, never a replacement. Validation: six pairs of hex digits split by colons, aa:bb:cc:dd:ee:ff.
+- `private_ip` (String) The IPv4 address the interface gets, instead of one the platform picks. It must belong to the network the interface is on. Validation: string length must be at least 1.
+- `secondary_private_ips` (Set of String) Up to 8 more IPv4 addresses the interface may use besides private_ip, for example the shared address of a VRRP or keepalived pair (allowed address pairs). None twice, none equal to private_ip. Needs source_dest_check true. A set: the order means nothing. Validation: set must contain at most 8 elements.
+- `source_dest_check` (Boolean) True (the default): the interface only sends and receives traffic for its own addresses, and the organization's firewall applies to it. False: it is not filtered and carries no firewall, as a router or a VRRP pair needs; it takes no secondary_private_ips.
 
 ### Nested Schema for `root_block_device`
 

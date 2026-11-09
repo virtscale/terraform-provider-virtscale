@@ -33,6 +33,11 @@ func lastCreateBody(f *fakeAPI) string {
 // internalVM is an instance "test" in region ams (where the fake's hosts and the host-local pool ams1-local are), with
 // the given sizes and lines; the disk and the host are the caller's to say.
 func internalVM(fake *fakeAPI, name string, vcpus, memoryMB int, lines string) string {
+	return internalVMOn(fake, name, "net-1", vcpus, memoryMB, lines)
+}
+
+// internalVMOn is internalVM on the given network profile.
+func internalVMOn(fake *fakeAPI, name, profile string, vcpus, memoryMB int, lines string) string {
 	return testAccProviderBlock(fake) + fmt.Sprintf(`
 resource "virtscale_instance" "test" {
   name            = %q
@@ -40,10 +45,10 @@ resource "virtscale_instance" "test" {
   image           = "image-1"
   vcpus           = %d
   memory_mb       = %d
-  network_profile = "net-1"
+  network_profile = %q
   %s
 }
-`, name, vcpus, memoryMB, lines)
+`, name, vcpus, memoryMB, profile, lines)
 }
 
 // pinned is the lines of an instance on host with a plain disk.
@@ -407,7 +412,8 @@ func TestAccInstanceResource_ExistingConfigurationsSeeNoDifference(t *testing.T)
 				Config: cfg,
 				Check: tfresource.ComposeAggregateTestCheckFunc(
 					tfresource.TestCheckNoResourceAttr(instanceRes, "host_id"),
-					tfresource.TestCheckResourceAttr(instanceRes, "root_block_device.#", "0")),
+					tfresource.TestCheckResourceAttr(instanceRes, "root_block_device.#", "0"),
+					tfresource.TestCheckResourceAttr(instanceRes, "network_interface.#", "0")),
 			},
 			{Config: cfg, ConfigPlanChecks: planAction(plancheck.ExpectEmptyPlan())},
 			{
@@ -418,6 +424,9 @@ func TestAccInstanceResource_ExistingConfigurationsSeeNoDifference(t *testing.T)
 					a := states[0].Attributes
 					if v := a["root_block_device.#"]; v != "" && v != "0" {
 						return fmt.Errorf("an imported instance has root_block_device.# = %s, want no block", v)
+					}
+					if v := a["network_interface.#"]; v != "" && v != "0" {
+						return fmt.Errorf("an imported instance has network_interface.# = %s, want no block", v)
 					}
 					if v, has := a["host_id"]; has && v != "" {
 						return fmt.Errorf("an instance on no named host has host_id %q, want null", v)
