@@ -605,8 +605,7 @@ not know and an answer that lacks a required field all fail the test. This stand
 routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
 parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Its host
 placement (`host_id`, the host-local pool `ams1-local`, the refusals) and its network interfaces follow s3-control-plane
-`7198a821` (branch `feat/instance-network-interfaces`, with the host placement and the internal instance types), which is
-not deployed yet. Run
+`75d63a00` (main, with the host placement and the internal instance types), which is not deployed yet. Run
 everything with:
 
 ```bash
