@@ -4,10 +4,10 @@ Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virts
 
 ## Status
 
-Version 0.3.0 is released and published on registry.terraform.io, and it installs with Terraform and with OpenTofu when
-the source carries the registry host: `registry.terraform.io/virtscale/virtscale`. registry.opentofu.org does not list
-it yet, so the short source `virtscale/virtscale` fails in OpenTofu until the requests `opentofu/registry` #6388 and
-#6396 are merged. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is the
+Version 0.3.0 is released and published on registry.terraform.io and registry.opentofu.org. It installs with Terraform
+and with OpenTofu; write the source with the registry host, `registry.terraform.io/virtscale/virtscale`, so one lock
+file serves both CLIs (the short source `virtscale/virtscale` works in OpenTofu too, and records the provider under
+`registry.opentofu.org`). This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is the
 source of truth. GitLab push-mirrors to `github.com/virtscale/terraform-provider-virtscale`, where GitHub Actions builds,
 signs and publishes a release when a `v*` tag arrives; see [RELEASING.md](RELEASING.md).
 
@@ -64,11 +64,10 @@ terraform {
 }
 ```
 
-The short source `virtscale/virtscale` means the CLI's own default registry. For OpenTofu that is registry.opentofu.org,
-which answers 404 for this provider until it is added there, so `tofu init` fails with `provider registry
-registry.opentofu.org does not have a provider named registry.opentofu.org/virtscale/virtscale`. Terraform CLI users
-may shorten the source to `virtscale/virtscale`; every example and guide here keeps the long form so that one
-configuration serves both CLIs.
+The short source `virtscale/virtscale` means the CLI's own default registry: registry.opentofu.org for OpenTofu
+(it lists this provider since 2026-11-09) and registry.terraform.io for Terraform. Both work, but each CLI then records
+the provider under its own registry host, so two lock files would be needed; every example and guide here keeps the long
+form so that one configuration and one lock file serve both CLIs.
 
 Pin a release with `version = "..."` (the registry page lists them). Both CLIs verify the release's checksums and their
 GPG signature against the key the registry holds. `dev_overrides` stays the way to run a local build while developing.

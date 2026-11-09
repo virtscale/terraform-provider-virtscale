@@ -564,8 +564,19 @@ func (c *Client) doJSONWithHeaders(ctx context.Context, method, fullURL string, 
 			}
 			lastErr = transportErr
 		case ex.status >= 200 && ex.status < 300:
-			if out == nil || len(ex.body) == 0 {
+			if out == nil {
 				return nil
+			}
+			if trimmed := bytes.TrimSpace(ex.body); len(trimmed) == 0 || string(trimmed) == "null" {
+				// Nothing, or bare null, decodes into an empty struct: a create would "succeed" with a resource that
+				// has no id. Say the answer was not the one the call asked for, and, for a keyed create, how to find
+				// what the API made.
+				err := fmt.Errorf("client: the API answered %d with an empty body, where a JSON body was expected", ex.status)
+				if method == http.MethodPost && idempotencyKey != "" {
+					// The API answered 2xx, so it made the resource, but nothing here knows what: say how to find it.
+					err = fmt.Errorf("%w; %s", err, createRecoveryHint(createHint))
+				}
+				return err
 			}
 			if err := json.Unmarshal(ex.body, out); err != nil {
 				err = fmt.Errorf("client: decode response body: %w", err)

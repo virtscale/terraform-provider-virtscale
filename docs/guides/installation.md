@@ -7,7 +7,7 @@ description: |-
 
 # Installation
 
-The VirtScale provider is published as `virtscale/virtscale` on [registry.terraform.io](https://registry.terraform.io/providers/virtscale/virtscale). Terraform and OpenTofu both download it from there when you run `init`; there is nothing to build or copy by hand. registry.opentofu.org does not list it yet, so write the source with the registry host, as below.
+The VirtScale provider is published as `virtscale/virtscale` on [registry.terraform.io](https://registry.terraform.io/providers/virtscale/virtscale). Terraform and OpenTofu both download it from there when you run `init`; there is nothing to build or copy by hand. registry.opentofu.org lists it as well; write the source with the registry host, as below, so that one lock file serves both CLIs.
 
 ## Requirements
 
@@ -19,7 +19,7 @@ The VirtScale provider is published as `virtscale/virtscale` on [registry.terraf
 
 Declare the provider in `required_providers` and run `init`. Terraform and OpenTofu use the same block, with the full source address `registry.terraform.io/virtscale/virtscale`.
 
-Write the registry host in the source. A short source, `virtscale/virtscale`, means the default registry of the CLI, and for OpenTofu that is registry.opentofu.org, which answers 404 until the provider is added there (the requests are opentofu/registry #6388 and #6396): `tofu init` then stops with `provider registry registry.opentofu.org does not have a provider named registry.opentofu.org/virtscale/virtscale`. With the host written out, `tofu init` fetches the provider from registry.terraform.io, and Terraform does the same. If you only use the Terraform CLI you may shorten the source to `virtscale/virtscale`; this guide and the other pages keep the long form so that one configuration works with both CLIs.
+Write the registry host in the source. A short source, `virtscale/virtscale`, means the default registry of the CLI: registry.opentofu.org for OpenTofu, which lists this provider since 2026-11-09, and registry.terraform.io for Terraform. Both work, but each CLI then records the provider under its own registry host, so the two need separate lock files. With the host written out, `tofu init` fetches the provider from registry.terraform.io, and Terraform does the same; this guide and the other pages keep the long form so that one configuration and one lock file work with both CLIs.
 
 ```terraform
 terraform {
@@ -97,7 +97,7 @@ To check a release by hand, for an audit or before you put it in a mirror, you n
 
 ```shell
 VERSION=0.3.0
-REGISTRY=registry.terraform.io   # registry.opentofu.org answers 404 for this provider until it is added there
+REGISTRY=registry.terraform.io   # registry.opentofu.org lists it too
 mkdir virtscale-verify && cd virtscale-verify
 
 curl -sSf "https://$REGISTRY/v1/providers/virtscale/virtscale/$VERSION/download/linux/amd64" -o download.json
