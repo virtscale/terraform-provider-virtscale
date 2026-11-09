@@ -221,6 +221,21 @@ func (userDataSizeValidator) ValidateString(_ context.Context, req validator.Str
 	}
 }
 
+// onlyTrueValidator refuses, at plan time, delete_on_termination = false: the platform always deletes the root volume
+// with the instance, so there is nothing else to ask for.
+type onlyTrueValidator struct{}
+
+func (onlyTrueValidator) Description(context.Context) string { return "only true" }
+
+func (v onlyTrueValidator) MarkdownDescription(ctx context.Context) string { return v.Description(ctx) }
+
+func (onlyTrueValidator) ValidateBool(_ context.Context, req validator.BoolRequest, resp *validator.BoolResponse) {
+	if !req.ConfigValue.IsNull() && !req.ConfigValue.IsUnknown() && !req.ConfigValue.ValueBool() {
+		resp.Diagnostics.AddAttributeError(req.Path, "delete_on_termination must be true",
+			"delete_on_termination must be true: the platform always deletes the root volume with the instance")
+	}
+}
+
 // InstanceResource implements the virtscale_instance resource.
 type InstanceResource struct {
 	client *client.Client
@@ -340,15 +355,22 @@ func networkInterfaceDiffers(c, h networkInterfaceModel) bool {
 		(c.SourceDestCheck.IsNull() || c.SourceDestCheck.ValueBool()) != h.SourceDestCheck.ValueBool()
 }
 
-// networkInterfacesFromAPI is network_interface as the model should hold it, given the blocks it has now and the
-// interfaces the API reports (what the create asked for). Like root_block_device it is filled in only when the model has
-// blocks, so an instance that does not use them -- and an import -- has none to differ. A MAC the model holds in another
-// case keeps its spelling, and a secondary list the API reports empty stays null (or empty) as the model has it.
+// networkInterfacesFromAPI is network_interface as the model should hold it after a create, an update or a read, given
+// the blocks it has and the interfaces the API reports (what the create asked for). A model with no blocks keeps none:
+// its configuration names none, and blocks cannot be computed, so filling them in on every Read would plan their removal
+// on every run. An instance whose interfaces the API reports but whose configuration names none therefore plans no
+// replacement. The blocks the model has are refreshed from the API (see networkInterfaceBlocks).
 func networkInterfacesFromAPI(current types.List, api []client.NetworkInterface) types.List {
 	if current.IsNull() || current.IsUnknown() || len(current.Elements()) == 0 {
 		return types.ListValueMust(networkInterfaceObjectType, []attr.Value{})
 	}
-	held := current.Elements()
+	return networkInterfaceBlocks(current.Elements(), api)
+}
+
+// networkInterfaceBlocks builds the blocks from the interfaces the API reports. A MAC that the corresponding held block
+// has in another case keeps its spelling, and a secondary list the API reports empty stays null (or empty) as the held
+// block has it; with nothing held the API's values are used as they are.
+func networkInterfaceBlocks(held []attr.Value, api []client.NetworkInterface) types.List {
 	blocks := make([]attr.Value, len(api))
 	for i, nic := range api {
 		var heldAttrs map[string]attr.Value
@@ -787,9 +809,12 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 							Description: "The size of the root volume, in gigabytes: what disk_gb is. Does not go with instance_type.",
 						},
 						"delete_on_termination": schema.BoolAttribute{
-							Computed:    true,
-							Default:     booldefault.StaticBool(true),
-							Description: "Always true: the root volume is deleted with the instance.",
+							Optional: true,
+							Computed: true,
+							Default:  booldefault.StaticBool(true),
+							Description: "Always true, as aws_instance accepts it: the platform deletes the root volume with the " +
+								"instance. false is refused at plan time.",
+							Validators: []validator.Bool{onlyTrueValidator{}},
 						},
 					},
 				},
@@ -802,8 +827,10 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					"bad address or MAC, one used twice and more than 8 secondary addresses). An address or MAC already in " +
 					"use on the network fails the create. They are set at create and read back as asked (what a block " +
 					"leaves out is the platform's choice and stays null): a different block replaces the instance, and " +
-					"so do blocks added to an instance that has none; taking them out keeps the instance. State has the " +
-					"blocks only when the configuration did, so an imported instance has none.",
+					"so do blocks added to an instance whose state has none; taking them out keeps the instance. An import " +
+					"reads the interfaces back from the API, so a configuration that names the same ones plans no changes; " +
+					"for an instance that has interfaces but a configuration without blocks, one update in place forgets " +
+					"them in state, and later reads do not bring them back.",
 				PlanModifiers: []planmodifier.List{networkInterfacesReplace{}},
 				NestedObject: schema.NestedBlockObject{
 					Attributes: map[string]schema.Attribute{
@@ -1373,9 +1400,26 @@ func (r *InstanceResource) removalAlreadyUnderway(ctx context.Context, id string
 	return vm.DesiredState == "deleted" || vm.State == "deleting" || vm.State == "deleted"
 }
 
-// ImportState imports by id, passthrough.
+// ImportState imports by id, and reads the network interfaces back from the API: an import has no configuration to
+// compare with, so a configuration that names the same interfaces must find them in state to plan no changes (it would
+// plan a replacement). It is done here and not in Read, which cannot tell an import from a state whose blocks were
+// forgotten (the state stores no blocks as null): refilling them on every Read would plan their removal every run.
 func (r *InstanceResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	if resp.Diagnostics.HasError() || r.client == nil { // no client: the provider was not configured (Configure got no provider data)
+		return
+	}
+	vm, err := r.client.GetVm(ctx, req.ID)
+	if client.IsNotFound(err, client.ResourceVm) {
+		return // Read reports an instance that is not there
+	}
+	if err != nil {
+		resp.Diagnostics.AddError("Unable to Read Instance", apiErrorDetail(err))
+		return
+	}
+	if len(vm.NetworkInterfaces) > 0 {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("network_interface"), networkInterfaceBlocks(nil, vm.NetworkInterfaces))...)
+	}
 }
 
 // applyVmToModel copies observed API state into model. It never touches user_data (the API never returns it) or

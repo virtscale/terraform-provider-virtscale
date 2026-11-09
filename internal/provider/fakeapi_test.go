@@ -189,7 +189,6 @@ type wireVmOut struct {
 	UpdatedAt         time.Time                 `json:"updated_at"`
 }
 
-// wireActionAvailability is ActionAvailabilityOut: whether one action can be asked of the VM right now.
 // wireNetworkInterfaceOut is NetworkInterfaceOut: one interface's settings as the create asked for them.
 type wireNetworkInterfaceOut struct {
 	PrivateIP           *string  `json:"private_ip"`
@@ -198,6 +197,7 @@ type wireNetworkInterfaceOut struct {
 	SourceDestCheck     bool     `json:"source_dest_check"`
 }
 
+// wireActionAvailability is ActionAvailabilityOut: whether one action can be asked of the VM right now.
 type wireActionAvailability struct {
 	Action    string  `json:"action"`
 	Available bool    `json:"available"`
