@@ -14,7 +14,7 @@ import (
 //
 // The staging API key reaches the downloaded binary, so the version is pinned exactly (like tofu in the live script):
 // a new release is tested by bumping registryReleaseVersion in a reviewed change, never by a range.
-const registryReleaseVersion = "0.2.0"
+const registryReleaseVersion = "0.3.0"
 
 func TestLiveRegistryRelease_SshKeyProof(t *testing.T) {
 	endpoint, apiKey, org := liveSshKeyEnv(t)

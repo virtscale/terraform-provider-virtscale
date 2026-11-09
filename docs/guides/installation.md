@@ -26,7 +26,7 @@ terraform {
   required_providers {
     virtscale = {
       source  = "registry.terraform.io/virtscale/virtscale"
-      version = "~> 0.2"
+      version = "~> 0.3"
     }
   }
 }
@@ -52,19 +52,19 @@ The block holds no credentials: the API key and the organization come from the e
 
 | Constraint | Accepts |
 | --- | --- |
-| `"~> 0.2"` | 0.2.0 and every later 0.x release, never 1.0 |
-| `"~> 0.2.0"` | patch releases of 0.2 only |
-| `"0.2.0"` | exactly that release |
-| `">= 0.2.0, < 0.4.0"` | a range you choose |
+| `"~> 0.3"` | 0.3.0 and every later 0.x release, never 1.0 |
+| `"~> 0.3.0"` | patch releases of 0.3 only |
+| `"0.3.0"` | exactly that release |
+| `">= 0.3.0, < 0.5.0"` | a range you choose |
 
-Before 1.0, semantic versioning allows a minor release to change behavior, so `"~> 0.2.0"` is the safer choice for production. Raise it on purpose and run `plan` before `apply`.
+Before 1.0, semantic versioning allows a minor release to change behavior, so `"~> 0.3.0"` is the safer choice for production. Raise it on purpose and run `plan` before `apply`.
 
 `init` records the release it installed, and the checksums of its files, in `.terraform.lock.hcl` next to your configuration. Commit that file: it makes every machine and every CI run use the same release, and refuse a file whose checksum does not match.
 
 ```hcl
 provider "registry.terraform.io/virtscale/virtscale" {
-  version     = "0.2.0"
-  constraints = "~> 0.2"
+  version     = "0.3.0"
+  constraints = "~> 0.3"
   hashes = [
     "h1:...",
     "zh:...",
@@ -96,7 +96,7 @@ VirtScale Release Signing <noreply@virtscale.nl>
 To check a release by hand, for an audit or before you put it in a mirror, you need `gpg`, `curl` and `jq`. The registry answers with the files of one platform and the public key it lists; the commands below use a throwaway keyring, so nothing is added to yours:
 
 ```shell
-VERSION=0.2.0
+VERSION=0.3.0
 REGISTRY=registry.terraform.io   # registry.opentofu.org answers 404 for this provider until it is added there
 mkdir virtscale-verify && cd virtscale-verify
 
