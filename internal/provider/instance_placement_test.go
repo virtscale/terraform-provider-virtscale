@@ -74,8 +74,8 @@ func TestInstanceSchema_HostIDAndRootBlockDevice(t *testing.T) {
 			t.Errorf("root_block_device.%s must exist and be optional: %+v", name, a)
 		}
 	}
-	if a := block.NestedObject.Attributes["delete_on_termination"]; a == nil || !a.IsComputed() || a.IsOptional() {
-		t.Errorf("root_block_device.delete_on_termination must be computed only: %+v", a)
+	if a := block.NestedObject.Attributes["delete_on_termination"]; a == nil || !a.IsComputed() || !a.IsOptional() {
+		t.Errorf("root_block_device.delete_on_termination must be optional and computed (true, as aws_instance accepts it): %+v", a)
 	}
 }
 
@@ -329,6 +329,36 @@ func TestAccInstanceResource_RootBlockDeviceIsAnotherSpellingOfPoolAndDisk(t *te
 			{Config: vm(block("ams2-local", 50)), ConfigPlanChecks: planAction(plancheck.ExpectEmptyPlan())},
 		},
 	})
+}
+
+// delete_on_termination may be written down as aws_instance has it, but only as true: the platform always deletes the
+// root volume with the instance, so false is refused at plan time, before anything is sent.
+func TestAccInstanceResource_DeleteOnTerminationCanOnlyBeTrue(t *testing.T) {
+	fake := newFakeAPI(t, "test-api-key", testOrgID)
+	fake.SetInternalOrg(true)
+	cfg := func(value string) string {
+		return internalVM(fake, "dot-01", 2, 2048, fmt.Sprintf("host_id = \"IKVM-AMS1-01\"\n  root_block_device {\n    volume_type = \"ams1-local\"\n    volume_size = 40\n    delete_on_termination = %s\n  }", value))
+	}
+
+	tfresource.Test(t, tfresource.TestCase{
+		PreCheck:                 func() { testAccPreCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories(),
+		CheckDestroy:             testAccCheckInstanceDestroy(fake),
+		Steps: []tfresource.TestStep{
+			{
+				Config:      cfg("false"),
+				ExpectError: wrapSafe("delete_on_termination must be true: the platform always deletes the root volume with the instance"),
+			},
+			{
+				Config: cfg("true"),
+				Check:  tfresource.TestCheckResourceAttr(instanceRes, "root_block_device.0.delete_on_termination", "true"),
+			},
+			{Config: cfg("true"), ConfigPlanChecks: planAction(plancheck.ExpectEmptyPlan())},
+		},
+	})
+	if n := fake.CreateCount(); n != 1 {
+		t.Errorf("creates = %d, want 1: the false is refused at plan time and sends nothing", n)
+	}
 }
 
 // A volume_type alone goes with an instance type, as storage_pool does: the type sets the sizes, the block's
