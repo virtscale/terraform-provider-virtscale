@@ -4,7 +4,7 @@ Terraform/OpenTofu provider for the [VirtScale customer API](https://learn.virts
 
 ## Status
 
-Version 0.2.0 is released and published on registry.terraform.io, and it installs with Terraform and with OpenTofu when
+Version 0.3.0 is released and published on registry.terraform.io, and it installs with Terraform and with OpenTofu when
 the source carries the registry host: `registry.terraform.io/virtscale/virtscale`. registry.opentofu.org does not list
 it yet, so the short source `virtscale/virtscale` fails in OpenTofu until the requests `opentofu/registry` #6388 and
 #6396 are merged. This repository lives on GitLab (`virtscale/virtscale-platform/terraform-provider-virtscale`) and is the
