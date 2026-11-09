@@ -292,6 +292,17 @@ func (e *APIError) hint() string {
 	case e.Code == "ssh_key_not_found":
 		// The API tells a client to import the key with a POST; a Terraform user makes it a resource.
 		return "create the key with a virtscale_ssh_key resource and name it in ssh_keys"
+	case e.Code == "host_placement_not_allowed", e.Code == "network_interface_not_allowed":
+		return "host_id, network_interface and internal instance types are for VirtScale's internal organizations"
+	case e.Code == "host_unavailable":
+		// One sentence for every cause, so that the answer cannot be used to list hosts.
+		return "check host_id: the host must exist, be in the instance's region and be in service"
+	case e.Code == "host_required":
+		return "set host_id to the host the volume lives on"
+	case e.Code == "resize_not_available":
+		// A host-placed instance and one of an internal instance type: the provider knows only the first from its state.
+		return "an instance with host_id or of an internal instance type is replaced, not resized: " +
+			"the provider plans a replacement when host_id is set, and tofu apply -replace replaces any other"
 	}
 	return ""
 }
@@ -774,6 +785,14 @@ func (c *Client) orgPath(p string) string {
 // UserData is the cloud-init text as standard base64 (at most 32 KiB decoded); the API keeps only its presence and never
 // returns it. WorkloadType is "customer" (the API's default) or "infra", which only an internal organization may ask
 // for. Both are left out of the body when empty. disk_type is not represented: the provider names a storage pool.
+//
+// HostID is the compute host to place the instance on (AWS's Dedicated Host host_id): only an organization of kind
+// internal may name one, any other is refused 422 host_placement_not_allowed. A storage pool that keeps the disk on the
+// host it runs on needs it (422 host_required). Left out of the body when empty.
+//
+// NetworkInterfaces is what the instance's network interfaces should be: entry i describes interface i of the network
+// profile, in order. Only an organization of kind internal may set them (422 network_interface_not_allowed for any
+// other). Left out of the body when empty.
 type VmCreateRequest struct {
 	Name           string   `json:"name"`
 	Image          string   `json:"image"`
@@ -788,6 +807,20 @@ type VmCreateRequest struct {
 	SSHKeys        []string `json:"ssh_keys,omitempty"`
 	UserData       string   `json:"user_data,omitempty"`
 	WorkloadType   string   `json:"workload_type,omitempty"`
+	HostID         string   `json:"host_id,omitempty"`
+
+	NetworkInterfaces []NetworkInterface `json:"network_interfaces,omitempty"`
+}
+
+// NetworkInterface is one entry of a create's network_interfaces (NetworkInterfaceIn) and of an instance's
+// (NetworkInterfaceOut, as the create asked for it): empty PrivateIP and MACAddress are the platform's choice and are left
+// out of the body; the MAC is read back in lower case with colons. SourceDestCheck is always sent (false: the interface
+// is not filtered, carries no firewall and takes no secondary addresses), so a zero value asks for that.
+type NetworkInterface struct {
+	PrivateIP           string   `json:"private_ip,omitempty"`
+	MACAddress          string   `json:"mac_address,omitempty"`
+	SecondaryPrivateIPs []string `json:"secondary_private_ips,omitempty"`
+	SourceDestCheck     bool     `json:"source_dest_check"`
 }
 
 // ImageRef is the embedded image summary on a Vm.
@@ -807,37 +840,43 @@ type ImageRef struct {
 //   - PrivateIP is the instance's private IPv4, once it has been observed.
 //   - Addresses are the instance's addresses, once they have been observed.
 //   - Generation is the number the PATCH precondition (If-Match) uses.
+//   - NetworkInterfaces is what the create asked for on the interfaces, one entry each in order; none when it asked for
+//     nothing (the API sends null).
+//   - HostID is the host the instance was placed on at create, in the API's own spelling (the create takes it without
+//     regard to case), or nil when no host was named. An instance with a host is not resized in place.
 //
 // The API still publishes observed_status and observed_addresses, but they are
 // deprecated cloud vocabulary: this struct deliberately does not decode them.
 type Vm struct {
-	ID               string    `json:"id"`
-	OrgID            string    `json:"org_id"`
-	RegionID         string    `json:"region_id"`
-	Name             string    `json:"name"`
-	FQDN             *string   `json:"fqdn"`
-	Hostname         *string   `json:"hostname"`
-	InstanceType     *string   `json:"instance_type"`
-	Status           string    `json:"status"`
-	PrivateIP        *string   `json:"private_ip"`
-	Addresses        []string  `json:"addresses"`
-	Generation       int64     `json:"generation"`
-	Image            ImageRef  `json:"image"`
-	VCPUs            int       `json:"vcpus"`
-	MemoryMB         int       `json:"memory_mb"`
-	DiskGB           int       `json:"disk_gb"`
-	StoragePoolID    string    `json:"storage_pool_id"`
-	NetworkProfileID string    `json:"network_profile_id"`
-	State            string    `json:"state"`
-	DesiredState     string    `json:"desired_state"`
-	ErrorClass       *string   `json:"error_class"`
-	ErrorDetail      *string   `json:"error_detail"`
-	SSHKeyNames      []string  `json:"ssh_key_names"`
-	WorkloadType     string    `json:"workload_type"`
-	UserDataPresent  bool      `json:"user_data_present"`
-	Protected        bool      `json:"protected"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID                string             `json:"id"`
+	OrgID             string             `json:"org_id"`
+	RegionID          string             `json:"region_id"`
+	Name              string             `json:"name"`
+	FQDN              *string            `json:"fqdn"`
+	Hostname          *string            `json:"hostname"`
+	HostID            *string            `json:"host_id"`
+	InstanceType      *string            `json:"instance_type"`
+	NetworkInterfaces []NetworkInterface `json:"network_interfaces"`
+	Status            string             `json:"status"`
+	PrivateIP         *string            `json:"private_ip"`
+	Addresses         []string           `json:"addresses"`
+	Generation        int64              `json:"generation"`
+	Image             ImageRef           `json:"image"`
+	VCPUs             int                `json:"vcpus"`
+	MemoryMB          int                `json:"memory_mb"`
+	DiskGB            int                `json:"disk_gb"`
+	StoragePoolID     string             `json:"storage_pool_id"`
+	NetworkProfileID  string             `json:"network_profile_id"`
+	State             string             `json:"state"`
+	DesiredState      string             `json:"desired_state"`
+	ErrorClass        *string            `json:"error_class"`
+	ErrorDetail       *string            `json:"error_detail"`
+	SSHKeyNames       []string           `json:"ssh_key_names"`
+	WorkloadType      string             `json:"workload_type"`
+	UserDataPresent   bool               `json:"user_data_present"`
+	Protected         bool               `json:"protected"`
+	CreatedAt         time.Time          `json:"created_at"`
+	UpdatedAt         time.Time          `json:"updated_at"`
 }
 
 // Operation is the OperationRef representation returned alongside async

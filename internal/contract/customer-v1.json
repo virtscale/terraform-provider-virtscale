@@ -3237,6 +3237,114 @@
         "title": "MonthToDateOut",
         "type": "object"
       },
+      "NetworkInterfaceIn": {
+        "additionalProperties": false,
+        "description": "What a create asks for on one network interface of the instance.\n",
+        "properties": {
+          "mac_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The MAC address the interface gets, instead of one the platform picks: a unicast address, six pairs of hex digits (`aa:bb:cc:dd:ee:ff`), stored in lower case with colons.",
+            "examples": [
+              "fa:16:3e:aa:bb:cc"
+            ],
+            "title": "Mac Address"
+          },
+          "private_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The IPv4 address the interface gets, instead of one the platform picks. It must belong to the network the interface is on.",
+            "examples": [
+              "10.20.30.40"
+            ],
+            "title": "Private Ip"
+          },
+          "secondary_private_ips": {
+            "description": "Up to 8 more IPv4 addresses the interface may use besides `private_ip`, for example the shared address of a VRRP or keepalived pair. None twice, none equal to `private_ip`. Needs an interface that is filtered (`source_dest_check` true).",
+            "examples": [
+              [
+                "10.20.30.41"
+              ]
+            ],
+            "items": {
+              "type": "string"
+            },
+            "title": "Secondary Private Ips",
+            "type": "array"
+          },
+          "source_dest_check": {
+            "default": true,
+            "description": "True (the default): the interface only sends and receives traffic for its own addresses, and the organization's firewall applies to it. False: the interface is not filtered and carries no firewall, as a router or a VRRP pair needs.",
+            "title": "Source Dest Check",
+            "type": "boolean"
+          }
+        },
+        "title": "NetworkInterfaceIn",
+        "type": "object"
+      },
+      "NetworkInterfaceOut": {
+        "description": "One network interface's settings as the create asked for them (`network_interfaces`).",
+        "properties": {
+          "mac_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The MAC address asked for (lower case, colons), or null when the platform picked.",
+            "title": "Mac Address"
+          },
+          "private_ip": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The IPv4 address asked for, or null when the platform picked.",
+            "title": "Private Ip"
+          },
+          "secondary_private_ips": {
+            "description": "The secondary IPv4 addresses asked for.",
+            "items": {
+              "type": "string"
+            },
+            "title": "Secondary Private Ips",
+            "type": "array"
+          },
+          "source_dest_check": {
+            "default": true,
+            "description": "False when the interface is not filtered and carries no firewall.",
+            "title": "Source Dest Check",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "private_ip",
+          "mac_address",
+          "secondary_private_ips",
+          "source_dest_check"
+        ],
+        "title": "NetworkInterfaceOut",
+        "type": "object"
+      },
       "NetworkProfileOut": {
         "description": "A network profile this org may select.\n",
         "properties": {
@@ -5382,6 +5490,23 @@
             ],
             "title": "Disk Type"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "maxLength": 63,
+                "pattern": "^[A-Za-z0-9][A-Za-z0-9-]{0,62}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Place the instance on this host, as AWS's Dedicated Host `host_id` does: one plain host name, letters, digits and hyphens, not case sensitive. Only for VirtScale's own organizations: any other organization is refused with 422 host_placement_not_allowed, whatever host it names and whether or not it exists. A host that cannot take the instance (it does not exist, is in another region, is out of service, or is not one this instance can be placed on) is refused with 422 host_unavailable, one sentence for all of them. A storage pool that keeps the disk on the host the instance runs on needs it (422 host_required). The instance is built on that host in one attempt, and is not resized in place afterwards (409 resize_not_available): replace it.",
+            "examples": [
+              "IKVM-AMS1-01"
+            ],
+            "title": "Host Id"
+          },
           "hostname": {
             "anyOf": [
               {
@@ -5442,6 +5567,21 @@
             "minLength": 1,
             "title": "Name",
             "type": "string"
+          },
+          "network_interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/NetworkInterfaceIn"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the instance's network interfaces should be, as AWS's `private_ip`, `secondary_private_ips` and `source_dest_check` (and a fixed MAC): entry *i* describes interface *i* of the network profile, in order, and there can be no more entries than the profile has interfaces (422 invalid_spec, which also names a bad address or MAC, an address or MAC used twice and more than 8 secondary addresses). Only for VirtScale's own organizations: any other organization is refused with 422 network_interface_not_allowed, whatever it sends. An address or MAC that is already in use on the network fails the create (the instance's `error_detail` says so). The interfaces are set at create and read back as `network_interfaces` on the instance; changing them means replacing the instance.",
+            "title": "Network Interfaces"
           },
           "network_profile": {
             "anyOf": [
@@ -5600,6 +5740,18 @@
             "title": "Generation",
             "type": "integer"
           },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The host the instance was placed on at create (`host_id` in the create request), or null when it was placed on no named host. An instance with a host is not resized in place.",
+            "title": "Host Id"
+          },
           "host_keys": {
             "description": "The pinned host keys, one per key type, by type. Empty while `host_keys_state` is `unknown` or `gave_up`.",
             "items": {
@@ -5659,6 +5811,21 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "network_interfaces": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/components/schemas/NetworkInterfaceOut"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the create asked for on the instance's network interfaces (`network_interfaces` in the create request), one entry per interface in order, or null when it asked for nothing. Set at create; read here as it was asked, not as observed (`addresses` is that).",
+            "title": "Network Interfaces"
           },
           "network_profile_id": {
             "title": "Network Profile Id",
@@ -5780,6 +5947,8 @@
           "disk_gb",
           "instance_type",
           "hostname",
+          "host_id",
+          "network_interfaces",
           "storage_pool_id",
           "workload_type",
           "network_profile_id",

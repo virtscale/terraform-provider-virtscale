@@ -8,13 +8,19 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/setvalidator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listplanmodifier"
@@ -45,6 +51,10 @@ var (
 	createTimeout = 20 * time.Minute
 	deleteTimeout = 10 * time.Minute
 )
+
+const hostIDReplaceDescription = "If the configured value names another host (a different case of the same host does not count), Terraform will destroy and recreate the resource."
+
+const pinnedResizeDescription = "An instance placed on a host (host_id) is replaced, never resized in place."
 
 // errInstanceBuildFailed is the sentinel WaitVm's done callback returns when
 // the observed vm reaches state "error" during create.
@@ -246,6 +256,219 @@ type instanceResourceModel struct {
 	UserData              types.String `tfsdk:"user_data"`
 	WorkloadType          types.String `tfsdk:"workload_type"`
 	DisableAPITermination types.Bool   `tfsdk:"disable_api_termination"`
+
+	// HostID and RootBlockDevice are for internal organizations (host placement and a host-local volume); an instance
+	// that uses neither has a null host_id and an empty root_block_device.
+	HostID           types.String `tfsdk:"host_id"`
+	RootBlockDevice  types.List   `tfsdk:"root_block_device"`
+	NetworkInterface types.List   `tfsdk:"network_interface"`
+}
+
+// networkInterfaceModel is one network_interface block: what the create asked for on interface i of the network profile.
+// Entries are the API's, so they are optional only: what a block leaves out the platform chooses, and is read back as null.
+type networkInterfaceModel struct {
+	PrivateIP           types.String `tfsdk:"private_ip"`
+	MACAddress          types.String `tfsdk:"mac_address"`
+	SecondaryPrivateIPs types.Set    `tfsdk:"secondary_private_ips"`
+	SourceDestCheck     types.Bool   `tfsdk:"source_dest_check"`
+}
+
+var networkInterfaceAttrTypes = map[string]attr.Type{
+	"private_ip":            types.StringType,
+	"mac_address":           types.StringType,
+	"secondary_private_ips": types.SetType{ElemType: types.StringType},
+	"source_dest_check":     types.BoolType,
+}
+
+var networkInterfaceObjectType = types.ObjectType{AttrTypes: networkInterfaceAttrTypes}
+
+// networkInterfacesOf is the blocks of list, in order; none for a list that is null or unknown.
+func networkInterfacesOf(ctx context.Context, list types.List) ([]networkInterfaceModel, diag.Diagnostics) {
+	if list.IsNull() || list.IsUnknown() {
+		return nil, nil
+	}
+	var blocks []networkInterfaceModel
+	diags := list.ElementsAs(ctx, &blocks, false)
+	return blocks, diags
+}
+
+// macAddressRegexp is a MAC address as the provider keeps it, six pairs split by colons: the API also takes hyphens but
+// stores colons, which would come back different from the configuration.
+var macAddressRegexp = regexp.MustCompile(`^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$`)
+
+// networkInterfacesReplace replaces the instance when the blocks differ from the ones the state holds: the API sets the
+// interfaces at create and never changes them. Blocks taken out of the configuration keep the instance, as for any
+// optional value (the state forgets them), and blocks added to an instance that has none replace it. Values are compared
+// as the API reads them back: a MAC without regard to case, the secondary addresses as a set, source_dest_check true
+// when the block leaves it out.
+type networkInterfacesReplace struct{}
+
+func (networkInterfacesReplace) Description(context.Context) string {
+	return "Replaces the instance when the network interfaces differ from the instance's."
+}
+
+func (m networkInterfacesReplace) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (networkInterfacesReplace) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	configured, diags := networkInterfacesOf(ctx, req.ConfigValue)
+	resp.Diagnostics.Append(diags...)
+	held, diags := networkInterfacesOf(ctx, req.StateValue)
+	resp.Diagnostics.Append(diags...)
+	if len(configured) == 0 {
+		return
+	}
+	resp.RequiresReplace = len(configured) != len(held)
+	for i := 0; i < len(configured) && i < len(held) && !resp.RequiresReplace; i++ {
+		resp.RequiresReplace = networkInterfaceDiffers(configured[i], held[i])
+	}
+}
+
+// networkInterfaceDiffers compares a configured block with the one in state; a value that is not known yet differs.
+func networkInterfaceDiffers(c, h networkInterfaceModel) bool {
+	if c.PrivateIP.IsUnknown() || c.MACAddress.IsUnknown() || c.SecondaryPrivateIPs.IsUnknown() || c.SourceDestCheck.IsUnknown() {
+		return true
+	}
+	secondary := len(c.SecondaryPrivateIPs.Elements()) != 0 || len(h.SecondaryPrivateIPs.Elements()) != 0
+	return !c.PrivateIP.Equal(h.PrivateIP) ||
+		c.MACAddress.IsNull() != h.MACAddress.IsNull() || !strings.EqualFold(c.MACAddress.ValueString(), h.MACAddress.ValueString()) ||
+		(secondary && !c.SecondaryPrivateIPs.Equal(h.SecondaryPrivateIPs)) ||
+		(c.SourceDestCheck.IsNull() || c.SourceDestCheck.ValueBool()) != h.SourceDestCheck.ValueBool()
+}
+
+// networkInterfacesFromAPI is network_interface as the model should hold it, given the blocks it has now and the
+// interfaces the API reports (what the create asked for). Like root_block_device it is filled in only when the model has
+// blocks, so an instance that does not use them -- and an import -- has none to differ. A MAC the model holds in another
+// case keeps its spelling, and a secondary list the API reports empty stays null (or empty) as the model has it.
+func networkInterfacesFromAPI(current types.List, api []client.NetworkInterface) types.List {
+	if current.IsNull() || current.IsUnknown() || len(current.Elements()) == 0 {
+		return types.ListValueMust(networkInterfaceObjectType, []attr.Value{})
+	}
+	held := current.Elements()
+	blocks := make([]attr.Value, len(api))
+	for i, nic := range api {
+		var heldAttrs map[string]attr.Value
+		if i < len(held) {
+			if obj, ok := held[i].(types.Object); ok {
+				heldAttrs = obj.Attributes()
+			}
+		}
+		privateIP, mac := types.StringNull(), types.StringNull()
+		if nic.PrivateIP != "" {
+			privateIP = types.StringValue(nic.PrivateIP)
+		}
+		if nic.MACAddress != "" {
+			mac = types.StringValue(nic.MACAddress)
+			if heldMAC, ok := heldAttrs["mac_address"].(types.String); ok && strings.EqualFold(heldMAC.ValueString(), nic.MACAddress) {
+				mac = heldMAC
+			}
+		}
+		secondary := types.SetNull(types.StringType)
+		if len(nic.SecondaryPrivateIPs) > 0 {
+			values := make([]attr.Value, len(nic.SecondaryPrivateIPs))
+			for j, address := range nic.SecondaryPrivateIPs {
+				values[j] = types.StringValue(address)
+			}
+			secondary = types.SetValueMust(types.StringType, values)
+		} else if heldSet, ok := heldAttrs["secondary_private_ips"].(types.Set); ok && !heldSet.IsNull() && !heldSet.IsUnknown() {
+			secondary = heldSet
+		}
+		blocks[i] = types.ObjectValueMust(networkInterfaceAttrTypes, map[string]attr.Value{
+			"private_ip":            privateIP,
+			"mac_address":           mac,
+			"secondary_private_ips": secondary,
+			"source_dest_check":     types.BoolValue(nic.SourceDestCheck),
+		})
+	}
+	return types.ListValueMust(networkInterfaceObjectType, blocks)
+}
+
+// rootBlockDeviceModel is one root_block_device block: another spelling of storage_pool and disk_gb, like AWS's
+// root_block_device. delete_on_termination is always true: the API deletes the root volume with the instance.
+type rootBlockDeviceModel struct {
+	VolumeType          types.String `tfsdk:"volume_type"`
+	VolumeSize          types.Int64  `tfsdk:"volume_size"`
+	DeleteOnTermination types.Bool   `tfsdk:"delete_on_termination"`
+}
+
+var rootBlockDeviceAttrTypes = map[string]attr.Type{
+	"volume_type": types.StringType, "volume_size": types.Int64Type, "delete_on_termination": types.BoolType,
+}
+
+var rootBlockDeviceObjectType = types.ObjectType{AttrTypes: rootBlockDeviceAttrTypes}
+
+// rootBlockDeviceOf is the block of list, when there is one (the schema allows at most one).
+func rootBlockDeviceOf(ctx context.Context, list types.List) (rootBlockDeviceModel, bool, diag.Diagnostics) {
+	var blocks []rootBlockDeviceModel
+	if list.IsNull() || list.IsUnknown() {
+		return rootBlockDeviceModel{}, false, nil
+	}
+	diags := list.ElementsAs(ctx, &blocks, false)
+	if diags.HasError() || len(blocks) == 0 {
+		return rootBlockDeviceModel{}, false, diags
+	}
+	return blocks[0], true, diags
+}
+
+// hostIDRegexp is the API's rule for host_id: one plain host name, not case sensitive.
+var hostIDRegexp = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`)
+
+// replaceWhenPinned makes a different vcpus or memory_mb replace an instance that is placed on a host, in the
+// configuration or in state (a host line taken out keeps the host): the API never resizes such an instance in place,
+// because a cold resize may land on another host (409 resize_not_available). It reads config and state, not the plan,
+// where a host that the configuration leaves out is unknown while the resource changes.
+func replaceWhenPinned(ctx context.Context, req planmodifier.Int64Request, resp *int64planmodifier.RequiresReplaceIfFuncResponse) {
+	var configured, held types.String
+	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("host_id"), &configured)...)
+	resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("host_id"), &held)...)
+	resp.RequiresReplace = !configured.IsNull() || !held.IsNull()
+}
+
+// replaceWhenAnotherHost replaces the instance for a configured host_id that names another host than the one it is on.
+// The API takes a host without regard to case and answers in its own spelling, so a change of case alone is not another
+// host: it is an update in place that changes nothing.
+func replaceWhenAnotherHost(_ context.Context, req planmodifier.StringRequest, resp *stringplanmodifier.RequiresReplaceIfFuncResponse) {
+	resp.RequiresReplace = !req.ConfigValue.IsNull() && !strings.EqualFold(req.PlanValue.ValueString(), req.StateValue.ValueString())
+}
+
+// rootBlockDeviceReplaces decides when the block replaces the instance. It is another spelling of storage_pool and
+// disk_gb, which replace by themselves, so: no block in the configuration changes nothing (a block taken out for the
+// same two values is no new disk); a block replaces when a value it sets differs from the one the state's block holds,
+// or, when the state has no block (an import, or a configuration that used storage_pool and disk_gb until now), from the
+// instance's own storage_pool and disk_gb. A value the block leaves out is the API's choice and never a change.
+type rootBlockDeviceReplaces struct{}
+
+func (rootBlockDeviceReplaces) Description(context.Context) string {
+	return "Replaces the instance when the block names another storage pool or disk size than the instance has."
+}
+
+func (m rootBlockDeviceReplaces) MarkdownDescription(ctx context.Context) string {
+	return m.Description(ctx)
+}
+
+func (rootBlockDeviceReplaces) PlanModifyList(ctx context.Context, req planmodifier.ListRequest, resp *planmodifier.ListResponse) {
+	if req.State.Raw.IsNull() || req.Plan.Raw.IsNull() {
+		return
+	}
+	configured, ok, diags := rootBlockDeviceOf(ctx, req.ConfigValue)
+	resp.Diagnostics.Append(diags...)
+	if !ok {
+		return
+	}
+	held, hasHeld, diags := rootBlockDeviceOf(ctx, req.StateValue)
+	resp.Diagnostics.Append(diags...)
+	pool, size := held.VolumeType, held.VolumeSize
+	if !hasHeld {
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("storage_pool"), &pool)...)
+		resp.Diagnostics.Append(req.State.GetAttribute(ctx, path.Root("disk_gb"), &size)...)
+	}
+	poolDiffers := configured.VolumeType.IsUnknown() || (!configured.VolumeType.IsNull() && configured.VolumeType.ValueString() != pool.ValueString())
+	sizeDiffers := configured.VolumeSize.IsUnknown() || (!configured.VolumeSize.IsNull() && configured.VolumeSize.ValueInt64() != size.ValueInt64())
+	resp.RequiresReplace = poolDiffers || sizeDiffers
 }
 
 // Metadata sets the resource's type name to <provider type name>_instance.
@@ -350,9 +573,11 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Description: "Number of virtual CPUs: 1, 2, 4, 8, 16 or 32. Taken from instance_type when one is " +
 					"named; otherwise give vcpus, memory_mb, disk_gb and storage_pool together. Changing it resizes " +
 					"the instance in place: THE INSTANCE RESTARTS, and apply waits until it reports the new size. " +
-					"Resizing may be switched off for your organization (503 not_ready).",
+					"Resizing may be switched off for your organization (503 not_ready). An instance with a host_id " +
+					"is never resized in place: a different value replaces it.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
+					int64planmodifier.RequiresReplaceIf(replaceWhenPinned, pinnedResizeDescription, pinnedResizeDescription),
 				},
 			},
 			"memory_mb": schema.Int64Attribute{
@@ -361,9 +586,11 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				Description: "Memory, in megabytes: whole gigabytes from 1 to 128, so gigabytes times 1024 (1024 for " +
 					"1 GB, 131072 for 128 GB). Taken from instance_type when one is named. Changing it resizes the " +
 					"instance in place: THE INSTANCE RESTARTS, and apply waits until it reports the new size. " +
-					"Resizing may be switched off for your organization (503 not_ready).",
+					"Resizing may be switched off for your organization (503 not_ready). An instance with a host_id " +
+					"is never resized in place: a different value replaces it.",
 				PlanModifiers: []planmodifier.Int64{
 					int64planmodifier.UseStateForUnknown(),
+					int64planmodifier.RequiresReplaceIf(replaceWhenPinned, pinnedResizeDescription, pinnedResizeDescription),
 				},
 			},
 			"disk_gb": schema.Int64Attribute{
@@ -454,6 +681,27 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 					stringplanmodifier.RequiresReplaceIfConfigured(),
 				},
 			},
+			"host_id": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				Description: "Place the instance on this compute host, like AWS's Dedicated Host host_id (for example " +
+					"IKVM-AMS1-01): one plain host name, letters, digits and hyphens, not case sensitive. Only for " +
+					"VirtScale's own organizations (kind internal): any other organization is refused with 422 " +
+					"host_placement_not_allowed. A host that cannot take the instance is 422 host_unavailable (one " +
+					"sentence for a host that does not exist, is in another region or is out of service), and a " +
+					"storage pool that keeps the disk on the host the instance runs on needs it (422 host_required). The " +
+					"instance is built on that host in one attempt. Read back from the API, null for an instance on no " +
+					"named host. Naming another host replaces the instance (a different case of the same host does " +
+					"not), and so does a different vcpus or memory_mb: an instance with a host is never resized in " +
+					"place. Removing the line keeps the host.",
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(hostIDRegexp, "one plain host name: letters, digits and hyphens, at most 63 characters, starting with a letter or digit"),
+				},
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.RequiresReplaceIf(replaceWhenAnotherHost, hostIDReplaceDescription, hostIDReplaceDescription),
+				},
+			},
 			"disable_api_termination": schema.BoolAttribute{
 				Optional: true,
 				Computed: true,
@@ -511,6 +759,89 @@ func (r *InstanceResource) Schema(_ context.Context, _ resource.SchemaRequest, r
 				},
 			},
 		},
+		Blocks: map[string]schema.Block{
+			"root_block_device": schema.ListNestedBlock{
+				Description: "The root volume, like AWS's root_block_device (at most one block): another spelling of " +
+					"storage_pool and disk_gb, so it does not go with them, and volume_size does not go with " +
+					"instance_type (volume_type does, as storage_pool does). A storage pool that keeps the disk on a " +
+					"host (for example ams1-local) is a volume type here, and needs host_id. Any change of the block " +
+					"replaces the instance. It is read back (and into storage_pool and disk_gb) only when the " +
+					"configuration or the state has it: an imported instance has no block, so a configuration that " +
+					"names the same pool and size as a block adopts it with an update in place.",
+				Validators:    []validator.List{listvalidator.SizeAtMost(1)},
+				PlanModifiers: []planmodifier.List{rootBlockDeviceReplaces{}},
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						// No UseStateForUnknown on the three: for a block the state does not have yet (an import being
+						// adopted) it would copy a null, and the apply would answer with a value.
+						"volume_type": schema.StringAttribute{
+							Optional: true,
+							Computed: true,
+							Description: "The storage pool id the root volume is on, for example ams1-local: what " +
+								"storage_pool is. With an instance_type, left out, it is the type's own pool.",
+							Validators: []validator.String{stringvalidator.LengthAtLeast(1)},
+						},
+						"volume_size": schema.Int64Attribute{
+							Optional:    true,
+							Computed:    true,
+							Description: "The size of the root volume, in gigabytes: what disk_gb is. Does not go with instance_type.",
+						},
+						"delete_on_termination": schema.BoolAttribute{
+							Computed:    true,
+							Default:     booldefault.StaticBool(true),
+							Description: "Always true: the root volume is deleted with the instance.",
+						},
+					},
+				},
+			},
+			"network_interface": schema.ListNestedBlock{
+				Description: "The instance's network interfaces, for organizations of kind internal only (any other is " +
+					"refused with 422 network_interface_not_allowed): like AWS's private_ip, secondary_private_ips and " +
+					"source_dest_check, and a fixed MAC. Block i describes interface i of the network profile, in order, " +
+					"and there can be no more blocks than the profile has interfaces (422 invalid_spec, which also names a " +
+					"bad address or MAC, one used twice and more than 8 secondary addresses). An address or MAC already in " +
+					"use on the network fails the create. They are set at create and read back as asked (what a block " +
+					"leaves out is the platform's choice and stays null): a different block replaces the instance, and " +
+					"so do blocks added to an instance that has none; taking them out keeps the instance. State has the " +
+					"blocks only when the configuration did, so an imported instance has none.",
+				PlanModifiers: []planmodifier.List{networkInterfacesReplace{}},
+				NestedObject: schema.NestedBlockObject{
+					Attributes: map[string]schema.Attribute{
+						"private_ip": schema.StringAttribute{
+							Optional:    true,
+							Description: "The IPv4 address the interface gets, instead of one the platform picks. It must belong to the network the interface is on.",
+							Validators:  []validator.String{stringvalidator.LengthAtLeast(1)},
+						},
+						"mac_address": schema.StringAttribute{
+							Optional: true,
+							Description: "The MAC address the interface gets: a unicast address, six pairs of hex digits split by " +
+								"colons (aa:bb:cc:dd:ee:ff). The API stores it in lower case and state keeps the spelling of the " +
+								"configuration, so a configuration in upper case plans no difference; a change of case alone is " +
+								"an update in place that changes nothing, never a replacement.",
+							Validators: []validator.String{
+								stringvalidator.RegexMatches(macAddressRegexp, "six pairs of hex digits split by colons, aa:bb:cc:dd:ee:ff"),
+							},
+						},
+						"secondary_private_ips": schema.SetAttribute{
+							ElementType: types.StringType,
+							Optional:    true,
+							Description: "Up to 8 more IPv4 addresses the interface may use besides private_ip, for example the " +
+								"shared address of a VRRP or keepalived pair (allowed address pairs). None twice, none equal to " +
+								"private_ip. Needs source_dest_check true. A set: the order means nothing.",
+							Validators: []validator.Set{setvalidator.SizeAtMost(8)},
+						},
+						"source_dest_check": schema.BoolAttribute{
+							Optional: true,
+							Computed: true,
+							Default:  booldefault.StaticBool(true),
+							Description: "True (the default): the interface only sends and receives traffic for its own addresses, " +
+								"and the organization's firewall applies to it. False: it is not filtered and carries no firewall, " +
+								"as a router or a VRRP pair needs; it takes no secondary_private_ips.",
+						},
+					},
+				},
+			},
+		},
 	}
 }
 
@@ -525,9 +856,45 @@ func (r *InstanceResource) ValidateConfig(ctx context.Context, req resource.Vali
 		return
 	}
 
-	unknown := c.InstanceType.IsUnknown() || c.StoragePool.IsUnknown()
+	// An interface that is not filtered takes no secondary address (the API: allowed address pairs exist only on a
+	// filtered port); said here with the field, before anything is sent.
+	nics, diags := networkInterfacesOf(ctx, c.NetworkInterface)
+	resp.Diagnostics.Append(diags...)
+	for i, nic := range nics {
+		if !nic.SourceDestCheck.IsNull() && !nic.SourceDestCheck.IsUnknown() && !nic.SourceDestCheck.ValueBool() &&
+			!nic.SecondaryPrivateIPs.IsNull() && !nic.SecondaryPrivateIPs.IsUnknown() && len(nic.SecondaryPrivateIPs.Elements()) > 0 {
+			resp.Diagnostics.AddAttributeError(path.Root("network_interface").AtListIndex(i).AtName("secondary_private_ips"),
+				"Secondary addresses on an interface that is not filtered",
+				"secondary_private_ips needs source_dest_check = true: an interface that is not filtered takes no secondary addresses")
+		}
+	}
+
+	// The block is another spelling of storage_pool and disk_gb: the two are the same fields, so it does not go with them.
+	pool, disk := c.StoragePool, c.DiskGB
+	block, hasBlock, diags := rootBlockDeviceOf(ctx, c.RootBlockDevice)
+	resp.Diagnostics.Append(diags...)
+	if hasBlock {
+		root := path.Root("root_block_device")
+		switch {
+		case !c.StoragePool.IsNull():
+			resp.Diagnostics.AddAttributeError(root, "root_block_device and storage_pool together",
+				"root_block_device and storage_pool both name the disk's storage pool (volume_type is storage_pool): use one of them")
+		case !c.DiskGB.IsNull():
+			resp.Diagnostics.AddAttributeError(root, "root_block_device and disk_gb together",
+				"root_block_device and disk_gb both give the disk's size (volume_size is disk_gb): use one of them")
+		case !c.InstanceType.IsNull() && !block.VolumeSize.IsNull():
+			resp.Diagnostics.AddAttributeError(root, "root_block_device size and instance type together",
+				"root_block_device.volume_size and instance_type both size the disk: the type sets disk_gb. Use volume_type alone, or no instance_type")
+		}
+		if resp.Diagnostics.HasError() {
+			return
+		}
+		pool, disk = block.VolumeType, block.VolumeSize
+	}
+
+	unknown := c.InstanceType.IsUnknown() || pool.IsUnknown()
 	sizes := 0
-	for _, n := range []types.Int64{c.VCPUs, c.MemoryMB, c.DiskGB} {
+	for _, n := range []types.Int64{c.VCPUs, c.MemoryMB, disk} {
 		unknown = unknown || n.IsUnknown()
 		if !n.IsNull() && !n.IsUnknown() {
 			sizes++
@@ -543,9 +910,10 @@ func (r *InstanceResource) ValidateConfig(ctx context.Context, req resource.Vali
 	case sizes == 0:
 		resp.Diagnostics.AddAttributeError(path.Root("instance_type"), "No instance type or sizes",
 			"set instance_type (see the virtscale_instance_types data source), or vcpus, memory_mb, disk_gb and storage_pool")
-	case sizes < 3 || c.StoragePool.IsNull():
+	case sizes < 3 || pool.IsNull():
 		resp.Diagnostics.AddAttributeError(path.Root("vcpus"), "Incomplete sizes",
-			"vcpus, memory_mb, disk_gb and storage_pool are required together when no instance_type is set")
+			"vcpus, memory_mb, disk_gb and storage_pool are required together when no instance_type is set "+
+				"(root_block_device gives disk_gb and storage_pool as volume_size and volume_type)")
 	}
 }
 
@@ -607,6 +975,39 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		userData = base64.StdEncoding.EncodeToString([]byte(plan.UserData.ValueString()))
 	}
 
+	// The root_block_device block is another spelling of storage_pool and disk_gb (the configuration has one or the
+	// other, ValidateConfig); what it leaves out is unknown here, like any optional value.
+	pool, diskGB := plan.StoragePool.ValueString(), int(plan.DiskGB.ValueInt64())
+	block, hasBlock, diags := rootBlockDeviceOf(ctx, plan.RootBlockDevice)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	if hasBlock {
+		pool, diskGB = block.VolumeType.ValueString(), int(block.VolumeSize.ValueInt64())
+	}
+
+	// One entry per network_interface block, in order; the API stores a MAC in lower case.
+	nicModels, diags := networkInterfacesOf(ctx, plan.NetworkInterface)
+	resp.Diagnostics.Append(diags...)
+	var nics []client.NetworkInterface
+	for _, n := range nicModels {
+		var secondary []string
+		if !n.SecondaryPrivateIPs.IsNull() && !n.SecondaryPrivateIPs.IsUnknown() {
+			resp.Diagnostics.Append(n.SecondaryPrivateIPs.ElementsAs(ctx, &secondary, false)...)
+			slices.Sort(secondary)
+		}
+		nics = append(nics, client.NetworkInterface{
+			PrivateIP:           n.PrivateIP.ValueString(),
+			MACAddress:          strings.ToLower(n.MACAddress.ValueString()),
+			SecondaryPrivateIPs: secondary,
+			SourceDestCheck:     n.SourceDestCheck.ValueBool(),
+		})
+	}
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	// The optional attributes the configuration left out are unknown in the plan, and read as "" or 0 here: the client
 	// leaves those out of the body, and the API chooses them.
 	vm, _, err := r.client.CreateVm(ctx, client.VmCreateRequest{
@@ -615,14 +1016,17 @@ func (r *InstanceResource) Create(ctx context.Context, req resource.CreateReques
 		InstanceType:   plan.InstanceType.ValueString(),
 		VCPUs:          int(plan.VCPUs.ValueInt64()),
 		MemoryMB:       int(plan.MemoryMB.ValueInt64()),
-		DiskGB:         int(plan.DiskGB.ValueInt64()),
-		StoragePool:    plan.StoragePool.ValueString(),
+		DiskGB:         diskGB,
+		StoragePool:    pool,
 		Region:         plan.Region.ValueString(),
 		NetworkProfile: plan.NetworkProfile.ValueString(),
 		Hostname:       hostname,
 		SSHKeys:        sshKeys,
 		UserData:       userData,
 		WorkloadType:   plan.WorkloadType.ValueString(),
+		HostID:         plan.HostID.ValueString(),
+
+		NetworkInterfaces: nics,
 	}, idempotencyKey)
 	if err != nil {
 		resp.Diagnostics.AddError("Unable to Create Instance", apiErrorDetail(err))
@@ -1021,6 +1425,31 @@ func applyVmToModel(model *instanceResourceModel, vm *client.Vm) {
 	} else {
 		model.PrivateIPv4 = types.StringValue("")
 	}
+
+	// The API answers a host in its own spelling and takes it without regard to case: a host the model already holds
+	// in another case is the same host, and keeps the spelling it was configured with (a create must return what was
+	// planned).
+	switch {
+	case vm.HostID == nil:
+		model.HostID = types.StringNull()
+	case !model.HostID.IsNull() && !model.HostID.IsUnknown() && strings.EqualFold(model.HostID.ValueString(), *vm.HostID):
+	default:
+		model.HostID = types.StringValue(*vm.HostID)
+	}
+
+	// root_block_device is filled in only when the model has the block (the configuration uses it, or the state does):
+	// an imported instance has none, and a configuration that spells the disk as storage_pool and disk_gb stays as is.
+	blocks := []attr.Value{}
+	if !model.RootBlockDevice.IsNull() && !model.RootBlockDevice.IsUnknown() && len(model.RootBlockDevice.Elements()) > 0 {
+		blocks = append(blocks, types.ObjectValueMust(rootBlockDeviceAttrTypes, map[string]attr.Value{
+			"volume_type":           types.StringValue(vm.StoragePoolID),
+			"volume_size":           types.Int64Value(int64(vm.DiskGB)),
+			"delete_on_termination": types.BoolValue(true),
+		}))
+	}
+	model.RootBlockDevice = types.ListValueMust(rootBlockDeviceObjectType, blocks)
+
+	model.NetworkInterface = networkInterfacesFromAPI(model.NetworkInterface, vm.NetworkInterfaces)
 }
 
 func ptrOrEmpty(s *string) string {

@@ -14,7 +14,7 @@ signs and publishes a release when a `v*` tag arrives; see [RELEASING.md](RELEAS
 ## What it provides
 
 - Provider `virtscale`: configured with an API key and an organization id.
-- Resource `virtscale_instance`: a VirtScale compute instance (VM).
+- Resource `virtscale_instance`: a VirtScale compute instance (VM). VirtScale's own (internal) organizations can also place it on a named host (`host_id`), give it a host-local root volume (`root_block_device`) and fix its network interfaces (`network_interface`).
 - Resource `virtscale_ssh_key`: an SSH public key imported into the organization, which instances take by name.
 - Resource `virtscale_project`: a project, which groups servers, public IPs and networks. Data source
   `virtscale_project` finds one by name, or the organization's default project.
@@ -220,6 +220,10 @@ including the field list the API sends with a `400`. Where the fix is on your si
 | `404` about the organization | check `VIRTSCALE_ORGANIZATION`, or that the key belongs to that organization |
 | `412 generation_mismatch` | the resource was changed by something else while the change was made: apply again |
 | `409 vm_protected` | the instance is protected against deletion: set `disable_api_termination = false` and apply first, then destroy or replace it |
+| `422 host_placement_not_allowed`, `422 network_interface_not_allowed` | `host_id`, `network_interface` and internal instance types are for VirtScale's internal organizations |
+| `422 host_unavailable` | check `host_id`: the host must exist, be in the instance's region and be in service |
+| `422 host_required` | the storage pool keeps the disk on one host: set `host_id` to the host the volume lives on |
+| `409 resize_not_available` | an instance with `host_id` or of an internal instance type is replaced, not resized: the provider plans a replacement when `host_id` is set, and `tofu apply -replace` replaces any other |
 
 Only a `404` that says the resource itself is gone is read as "gone": its code is `not_found` and its detail is
 the API's sentence for that kind of resource (an instance, a public IP or an SSH key, as asked about). Every other
@@ -250,6 +254,9 @@ the API prints the request.
 | `user_data`       | string | Optional, Sensitive, forces replacement | Plain cloud-init text for the first boot: a `#cloud-config` document, a script that starts with `#!`, or a MIME multipart document, at most 32 KiB (checked at plan time; an empty value is refused too). The provider sends it as standard base64 and the API applies it after the platform's own part (the keys of `ssh_keys`). It is read at the first boot only, so a different value replaces the instance. **Never read back:** state keeps the value you configured, and an imported instance has none, so a configuration that sets `user_data` after `tofu import` plans a replacement (put `lifecycle { ignore_changes = [user_data] }` on it to avoid that). Sensitive, so plans hide it, but the state holds it as text. `503 not_ready` means cloud-init is not switched on for this API yet; a payload the API cannot deliver is `422 user_data_invalid`. |
 | `workload_type`   | string | Optional, Computed, forces replacement when set to a different value | `customer` (the API's default) or `infra`, VirtScale's own hardware pools; checked at plan time. Only an organization of kind internal may ask for `infra`: any other gets `422 workload_not_allowed`. Read back from the API (VmOut has `workload_type`). |
 | `disable_api_termination` | bool | Optional, Computed, changes in place | Protect the instance against deletion, like AWS's `DisableApiTermination`. Defaults to what the API reports, `false`. A create sets it once the instance runs; a change is one `PUT .../protection`, never a replacement; a refresh reads it back (`protected`). While it is `true`, a destroy or a replacement is refused with `409 vm_protected` and the provider adds "set disable_api_termination = false and apply first": it never lifts the protection for you. Changing it needs the `compute.instance.update` permission (`compute:write`). |
+| `host_id`         | string | Optional, Computed, forces replacement when set to a different host | Internal organizations only: place the instance on this compute host, like AWS's Dedicated Host `host_id` (for example `IKVM-AMS1-01`; one plain host name, not case sensitive: the API answers in its own spelling and a change of case alone is no change). Any other organization is refused with `422 host_placement_not_allowed`; a host that cannot take the instance is `422 host_unavailable` (one sentence for a host that does not exist, is in another region or is out of service); a storage pool that keeps the disk on the host the instance runs on needs it (`422 host_required`). Built on that host in one attempt. Read back from the API (null for an instance on no named host), so an import fills it. **An instance with a `host_id` is never resized in place:** a different `vcpus` or `memory_mb` plans a replacement (the API refuses the resize with `409 resize_not_available`). Taking the line out keeps the host. |
+| `root_block_device` | block (at most one) | Optional, forces replacement when it names a different pool or size | The root volume, like AWS's `root_block_device`: another spelling of `storage_pool` and `disk_gb`, with `volume_type` (the storage pool id, for example `ams1-local`) and `volume_size` (GB), and a computed `delete_on_termination` that is always `true`. It does not go with `storage_pool` or `disk_gb`, and `volume_size` does not go with `instance_type` (`volume_type` does, as `storage_pool` does): refused at plan time. A host-local pool such as `ams1-local` is a volume type here and needs `host_id`. Read back (also into `storage_pool` and `disk_gb`) only when the configuration or the state has the block, so a configuration that uses `storage_pool` and `disk_gb` sees no change, and neither does an imported instance; naming the same pool and size as a block on an instance that has none adopts it with an update in place, and taking the block out for the same two values changes nothing either. |
+| `network_interface` | block list | Optional, forces replacement when a block differs | Internal organizations only: the instance's network interfaces, like AWS's `private_ip`, `secondary_private_ips` and `source_dest_check`, plus a fixed MAC. Block *i* describes interface *i* of the network profile, in order (for example one block for `ams-ssd-infra`, AMS1's k8s-geneve network). Each block has `private_ip`, `mac_address` (six pairs of hex digits split by colons; the API stores it in lower case and state keeps your spelling, so upper case plans no difference, and a change of case alone is an update in place that changes nothing), `secondary_private_ips` (a set of at most 8, for example the shared address of a VRRP pair; they need `source_dest_check = true`, which is the default, checked at plan time) and `source_dest_check` (`false`: the interface is not filtered and carries no firewall). Any other organization is refused with `422 network_interface_not_allowed`; more blocks than the profile has interfaces, a bad address or MAC, or one used twice is `422 invalid_spec` naming the entry; an address or MAC already in use on the network fails the create. Read back as asked (what a block leaves out the platform chooses, and it stays null), and only when the configuration or state has blocks: an imported instance has none, so blocks added to it, or to any instance that has none, plan a replacement (the interfaces are set at create). Taking the blocks out keeps the instance. |
 | `hostname`        | string | Optional, Computed | The lower-case fully qualified name the instance is known by in your organization (for example `web.example.com`); checked at plan time (labels of lowercase letters, digits and hyphens, at least two labels, at most 253 characters). Unique among the organization's live instances: a duplicate is `409 hostname_taken`; another organization may use the same name. It is a handle only: the platform creates no DNS record for it. Changing it is an in-place update, not a replacement. It is read back on every refresh, so a change made elsewhere shows as a difference, and `tofu import` fills it. Removing the attribute from the configuration keeps the current hostname (this provider does not remove one). |
 | `id`              | string | Computed | |
 | `state`           | string | Computed | |
@@ -287,7 +294,8 @@ stopped instance stays stopped). Apply waits (up to 20 minutes) until the instan
 `memory_mb` and is `running` or `stopped` again. A resize the platform cannot complete is reverted: the instance keeps
 its size and apply fails with the operation's `error_class` and `error_detail`. The disk cannot change (a different
 `disk_gb` replaces the instance), and so does a different `instance_type`. Resizing is a feature that may be switched off
-for an organization: the API then answers `503 not_ready`, which is shown as it comes and not retried. A resize of an
+for an organization: the API then answers `503 not_ready`, which is shown as it comes and not retried. An instance with a `host_id` is never resized: the plan
+replaces it (above). A resize of an
 instance whose `instance_type` is set keeps that type in the API; to manage the sizes, give `vcpus`, `memory_mb`,
 `disk_gb` and `storage_pool` instead of the type.
 
@@ -590,12 +598,14 @@ tests (`terraform-plugin-testing`) against an in-process fake of the customer AP
 machines, the codes, sentences and order of the refusals, key scopes), not from the client's
 own types, so a wrong field name or status in the client fails a test instead of being mirrored back. On top of
 that, every request the client sends the fake and every answer it gets back is checked against the OpenAPI document
-the provider was written against, `internal/contract/customer-v1.json` (s3-control-plane `87607618`; `SOURCE` says
+the provider was written against, `internal/contract/customer-v1.json` (`SOURCE` names its s3-control-plane commit and says
 how to update it): a route the contract does not have, a deprecated `/compute/vms` route, a request field it does
 not know and an answer that lacks a required field all fail the test. This stands in for a generated client until
 `sdk-go` can be used (decision D12 in `docs/plans/terraform-provider-virtscale.md`). Its SSH-key
 routes follow the contract of the SSH-key release of s3-control-plane, which is not deployed yet; its key
-parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Run
+parsing and fingerprints are its own, checked against what `ssh-keygen -lf` prints for keys OpenSSH made. Its host
+placement (`host_id`, the host-local pool `ams1-local`, the refusals) and its network interfaces follow s3-control-plane
+`75d63a00` (main, with the host placement and the internal instance types), which is not deployed yet. Run
 everything with:
 
 ```bash
