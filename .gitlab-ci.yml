@@ -1,3 +1,11 @@
+# One pipeline per commit: the branch pipeline carries every job (incl. secret_detection), so skip the
+# merge-request pipeline that would run the same SHA a second time.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: never
+    - when: always
+
 stages:
   - test
 
