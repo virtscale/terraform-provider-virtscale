@@ -51,7 +51,7 @@ resource "virtscale_instance" "dns" {
   vcpus           = 2
   memory_mb       = 2048
   host_id         = "IKVM-AMS1-01"
-  network_profile = "ams-ssd-infra" # AMS1's k8s-geneve network, for internal organizations
+  network_profile = "<profile id>" # no default on the AMS1 hosts: list GET /v1/orgs/{org}/compute/network-profiles and name one
 
   root_block_device {
     volume_type = "ams1-local"
